@@ -1105,8 +1105,18 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
         # ── Post-placement verification via algo endpoint ──────────────
         _time.sleep(0.4)  # brief settle — testnet can lag slightly
         try:
-            verify = client.futures_get_algo_order(symbol=sym, algoId=algo_id)
-            # Response shape: {"algoId": ..., "algoStatus": "NEW"/"WORKING"/..., ...}
+            # NOTE: futures_get_algo_order(symbol=..., algoId=...) is broken on
+            # testnet — the symbol filter causes it to return an empty/null response
+            # even when the order exists. Query without symbol filter, then match
+            # by algoId client-side (same workaround used in cancel-all logic).
+            verify_resp = client.futures_get_algo_order(algoId=algo_id)
+            # Response may be a dict (single order) or a list
+            if isinstance(verify_resp, list):
+                matches = [o for o in verify_resp if str(o.get("algoId")) == str(algo_id)]
+                verify = matches[0] if matches else {}
+            else:
+                verify = verify_resp or {}
+
             v_status = (
                 verify.get("algoStatus")
                 or verify.get("status")
@@ -1118,12 +1128,20 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
                 print(f"  ✅ {label} algo order verified: algoStatus={v_status}")
                 return algo_id, True
             elif v_status.upper() in ("FILLED", "EXECUTED", "COMPLETED"):
-                # Immediately filled (e.g. market was already at trigger) — still valid
                 print(f"  ⚠  {label} algo order immediately executed: algoStatus={v_status}")
                 return algo_id, True
             else:
-                print(f"  ⚠  {label} algo order verification: unexpected algoStatus={v_status}. "
-                      f"Full response: {verify}")
+                # v_status UNKNOWN likely means symbol filter returned empty —
+                # fallback: check open orders list (no symbol filter)
+                all_open = client.futures_get_open_algo_orders()
+                if isinstance(all_open, dict):
+                    all_open = all_open.get("orders", [])
+                found = any(str(o.get("algoId")) == str(algo_id) for o in (all_open or []))
+                if found:
+                    print(f"  ✅ {label} algo order confirmed via open-orders list")
+                    return algo_id, True
+                print(f"  ⚠  {label} algo order verification: algoStatus={v_status}, "
+                      f"not found in open list. Full response: {verify}")
                 return algo_id, False
         except BinanceAPIException as ve:
             print(f"  ⚠  {label} algo order verification error: {ve}. "
