@@ -726,7 +726,8 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             )
         else:
             st.markdown(
-                f"<div style='background:#f5f5f5;border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<div style='background:rgba(255,127,14,0.12);border-left:3px solid #ff7f0e;"
+                f"border-radius:0 6px 6px 0;padding:6px 12px;margin-bottom:8px'>"
                 f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
                 f"</div>",
                 unsafe_allow_html=True,
@@ -937,7 +938,8 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
             )
         else:
             st.markdown(
-                f"<div style='background:#f5f5f5;border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<div style='background:rgba(255,127,14,0.12);border-left:3px solid #ff7f0e;"
+                f"border-radius:0 6px 6px 0;padding:6px 12px;margin-bottom:8px'>"
                 f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
                 f"</div>",
                 unsafe_allow_html=True,
