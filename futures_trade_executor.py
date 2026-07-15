@@ -995,12 +995,24 @@ def place_futures_limit_order(client, cand: dict) -> dict:
 
 def place_futures_exit_orders(client, trade: dict) -> dict:
     """
-    Place TP and SL as two separate orders after entry fills.
-    Futures has no OCO — uses TAKE_PROFIT_MARKET + STOP_MARKET.
+    Place TP and SL exit orders after entry fills.
 
-    Returns dict: {tp_order_id, sl_order_id, success}
+    Design: Binance Futures Testnet (and sometimes live) returns ONLY algoId
+    (no orderId) for TAKE_PROFIT_MARKET and STOP_MARKET conditional orders.
+    This is consistent behaviour — not a quirk. Therefore:
+      - We use futures_create_algo_order() with algoType=CONDITIONAL, which
+        always returns algoId as the primary identifier.
+      - algoId is stored as the authoritative key for both TP and SL orders.
+      - Verification uses futures_get_algo_order(algoId=...) not futures_get_order().
+      - Cancellation uses futures_cancel_algo_order(algoId=...).
+      - tp_order_id / sl_order_id fields are set to the algoId value so the
+        rest of the codebase (which reads those fields) continues to work.
+        They are intentionally the same as tp_algo_id / sl_algo_id.
+
+    Returns dict: {tp_order_id, sl_order_id, tp_algo_id, sl_algo_id, success}
     """
     from binance.exceptions import BinanceAPIException
+    import time as _time
 
     sym  = trade["symbol"]
     qty  = trade["entry_qty"]
@@ -1010,7 +1022,7 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
 
     # Fetch precision
     try:
-        info = client.futures_exchange_info()
+        info     = client.futures_exchange_info()
         sym_info = next(s for s in info["symbols"] if s["symbol"] == sym)
         tick = next(float(f["tickSize"]) for f in sym_info["filters"]
                     if f["filterType"] == "PRICE_FILTER")
@@ -1023,7 +1035,7 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
     tp_str  = f"{round_tick(tp1, tick):.8f}".rstrip("0").rstrip(".")
     sl_str  = f"{round_tick(sl,  tick):.8f}".rstrip("0").rstrip(".")
 
-    # Verify current price constraint before placing
+    # ── Emergency check: price already past SL? ───────────────────────
     try:
         current = get_futures_price(client, sym)
         is_long = trade["position_side"] == "LONG"
@@ -1034,148 +1046,131 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
             resp = client.futures_create_order(
                 symbol=sym, side=side, type="MARKET",
                 quantity=qty_str, positionSide="BOTH",
-                reduceOnly=True
+                reduceOnly=True,
             )
-            return {"sl_order_id": resp.get("orderId"), "tp_order_id": None,
+            return {"sl_order_id": resp.get("orderId"), "sl_algo_id": None,
+                    "tp_order_id": None, "tp_algo_id": None,
                     "success": True, "emergency_exit": True}
     except Exception as e:
-         print(f"  [WARN] Price check failed: {e} — proceeding anyway")
+        print(f"  [WARN] Price check failed: {e} — proceeding anyway")
 
     results = {"tp_order_id": None, "sl_order_id": None,
                "tp_algo_id": None, "sl_algo_id": None,
                "success": False}
 
-    def _place_and_verify(label: str, order_kwargs: dict) -> tuple:
+    def _place_algo_and_verify(label: str, order_type: str, trigger_price: str) -> tuple:
         """
-        Place a futures order and immediately verify it exists on the exchange.
+        Place a conditional exit order via futures_create_algo_order() and
+        verify it is registered on the exchange via futures_get_algo_order().
 
-        Returns (order_id, algo_id, verified: bool).
+        Returns (algo_id, verified: bool).
 
-        Root-cause fix: Binance Testnet sometimes returns algoId in the orderId
-        field for conditional orders (TAKE_PROFIT_MARKET / STOP_MARKET). When
-        that happens, tp_order_id == tp_algo_id, and every subsequent
-        futures_get_order() call returns -2013 (not found) because the exchange
-        only knows the order by its regular orderId — which was never stored.
-
-        Strategy:
-          1. Prefer `orderId` from the create response (real exchange order id).
-          2. Store `algoId` separately (may differ from orderId).
-          3. After creation, call futures_get_order(orderId) once to confirm.
-             If that fails with -2013, the order is NOT on the exchange → treat
-             as failed, return verified=False so the caller can alert.
+        Why algo endpoint:
+          TAKE_PROFIT_MARKET and STOP_MARKET on Binance Futures Testnet are
+          handled as algo/conditional orders. The create response contains
+          algoId as the primary identifier — orderId is absent or zero.
+          futures_get_order(orderId) will always -2013 for these order types.
+          The correct lifecycle is:
+            create  → futures_create_algo_order(algoType=CONDITIONAL)
+            query   → futures_get_algo_order(algoId=...)
+            cancel  → futures_cancel_algo_order(algoId=...)
         """
         try:
-            resp = client.futures_create_order(**order_kwargs)
-        except BinanceAPIException as e:
-            print(f"  ❌ {label} order failed (API): {e}")
-            return None, None, False
-        except Exception as e:
-            print(f"  ❌ {label} order unexpected error: {type(e).__name__}: {e}")
-            return None, None, False
-
-        raw_order_id = resp.get("orderId")
-        algo_id      = resp.get("algoId")
-
-        # Testnet quirk: orderId may be 0/None while algoId is present.
-        # Do NOT use algoId as a substitute for orderId — they are different
-        # namespaces. Record both separately.
-        order_id = raw_order_id if raw_order_id else None
-
-        if order_id is None:
-            print(f"  ❌ {label} order — no orderId in response. "
-                  f"algoId={algo_id}  Full response: {resp}")
-            # Still record algo_id so price-guard / manual lookup can use it
-            return None, algo_id, False
-
-        print(f"  ✅ {label} order placed: #{order_id} @ "
-              f"{order_kwargs.get('stopPrice', '?')}  (algoId={algo_id})")
-
-        # ── Post-placement verification ────────────────────────────────
-        # One get_order() call to confirm the exchange actually registered it.
-        import time as _time
-        _time.sleep(0.3)   # brief settle — testnet can lag before order is queryable
-        try:
-            verify = client.futures_get_order(
-                symbol=order_kwargs["symbol"], orderId=order_id
+            resp = client.futures_create_algo_order(
+                algoType     = "CONDITIONAL",
+                symbol       = sym,
+                side         = side,
+                type         = order_type,
+                quantity     = qty_str,
+                triggerPrice = trigger_price,
+                timeInForce  = "GTC",
+                positionSide = "BOTH",
+                reduceOnly   = "true",
+                workingType  = "MARK_PRICE",
             )
-            v_status = verify.get("status", "UNKNOWN")
-            if v_status in ("NEW", "PARTIALLY_FILLED", "FILLED"):
-                print(f"  ✅ {label} order verified on exchange: status={v_status}")
-                return order_id, algo_id, True
+        except BinanceAPIException as e:
+            print(f"  ❌ {label} algo order failed (API): {e}")
+            return None, False
+        except Exception as e:
+            print(f"  ❌ {label} algo order unexpected error: {type(e).__name__}: {e}")
+            return None, False
+
+        algo_id = resp.get("algoId") or resp.get("orderId")
+        if not algo_id:
+            print(f"  ❌ {label} algo order — no algoId in response: {resp}")
+            return None, False
+
+        print(f"  ✅ {label} algo order placed: algoId={algo_id} @ {trigger_price}")
+
+        # ── Post-placement verification via algo endpoint ──────────────
+        _time.sleep(0.4)  # brief settle — testnet can lag slightly
+        try:
+            verify = client.futures_get_algo_order(symbol=sym, algoId=algo_id)
+            # Response shape: {"algoId": ..., "algoStatus": "NEW"/"WORKING"/..., ...}
+            v_status = (
+                verify.get("algoStatus")
+                or verify.get("status")
+                or verify.get("orderStatus")
+                or "UNKNOWN"
+            )
+            # Accept any non-terminal status as confirmed
+            if v_status.upper() in ("NEW", "WORKING", "EXECUTING", "PARTIALLY_FILLED"):
+                print(f"  ✅ {label} algo order verified: algoStatus={v_status}")
+                return algo_id, True
+            elif v_status.upper() in ("FILLED", "EXECUTED", "COMPLETED"):
+                # Immediately filled (e.g. market was already at trigger) — still valid
+                print(f"  ⚠  {label} algo order immediately executed: algoStatus={v_status}")
+                return algo_id, True
             else:
-                # Unexpected status (e.g. immediately CANCELED) — not safe
-                print(f"  ⚠  {label} order verification: unexpected status={v_status}. "
-                      f"Treating as unverified.")
-                return order_id, algo_id, False
+                print(f"  ⚠  {label} algo order verification: unexpected algoStatus={v_status}. "
+                      f"Full response: {verify}")
+                return algo_id, False
         except BinanceAPIException as ve:
-            # -2013 = order does not exist → exchange never registered it
-            if "-2013" in str(ve) or "does not exist" in str(ve).lower():
-                print(f"  ❌ {label} order verification FAILED (-2013): "
-                      f"exchange has no record of #{order_id}. "
-                      f"Position may be UNPROTECTED.")
-            else:
-                print(f"  ⚠  {label} order verification error (non-2013): {ve}. "
-                      f"Assuming placed — monitor manually.")
-                return order_id, algo_id, True   # non-fatal: give benefit of doubt
-            return order_id, algo_id, False
+            print(f"  ⚠  {label} algo order verification error: {ve}. "
+                  f"Treating as unverified — price-guard will monitor.")
+            return algo_id, False
         except Exception as ve:
-            print(f"  ⚠  {label} order verification error: {type(ve).__name__}: {ve}. "
-                  f"Assuming placed — monitor manually.")
-            return order_id, algo_id, True   # network hiccup — benefit of doubt
+            print(f"  ⚠  {label} algo order verification error: {type(ve).__name__}: {ve}. "
+                  f"Assuming placed.")
+            return algo_id, True  # network hiccup — benefit of doubt
 
-    tp_id_placed, tp_algo_placed, tp_verified = _place_and_verify(
-        "TP",
-        dict(
-            symbol       = sym,
-            side         = side,
-            type         = "TAKE_PROFIT_MARKET",
-            stopPrice    = tp_str,
-            quantity     = qty_str,
-            timeInForce  = "GTC",
-            positionSide = "BOTH",
-            reduceOnly   = True,
-            workingType  = "MARK_PRICE",
-        ),
-    )
+    tp_algo_id, tp_verified = _place_algo_and_verify("TP", "TAKE_PROFIT_MARKET", tp_str)
+    sl_algo_id, sl_verified = _place_algo_and_verify("SL", "STOP_MARKET",        sl_str)
 
-    sl_id_placed, sl_algo_placed, sl_verified = _place_and_verify(
-        "SL",
-        dict(
-            symbol       = sym,
-            side         = side,
-            type         = "STOP_MARKET",
-            stopPrice    = sl_str,
-            quantity     = qty_str,
-            timeInForce  = "GTC",
-            positionSide = "BOTH",
-            reduceOnly   = True,
-            workingType  = "MARK_PRICE",
-        ),
-    )
+    # Store algoId as both the order_id and algo_id — they are the same identifier
+    # for this order type. All downstream code (query, cancel) must use the algo endpoint.
+    results["tp_order_id"] = tp_algo_id
+    results["sl_order_id"] = sl_algo_id
+    results["tp_algo_id"]  = tp_algo_id
+    results["sl_algo_id"]  = sl_algo_id
 
-    results["tp_order_id"] = tp_id_placed
-    results["sl_order_id"] = sl_id_placed
-    results["tp_algo_id"]  = tp_algo_placed   # kept separate — never conflated with orderId
-    results["sl_algo_id"]  = sl_algo_placed
-
-    both_placed   = (tp_id_placed is not None and sl_id_placed is not None)
+    both_placed   = (tp_algo_id is not None and sl_algo_id is not None)
     both_verified = (tp_verified and sl_verified)
 
     if both_placed and not both_verified:
-        # At least one order is unverified — warn loudly but still mark placed
-        # so price-guard keeps watching. The caller will see the console warning.
         print(f"\n  {'!'*60}")
-        print(f"  !! WARNING: Exit order(s) placed but NOT verified on exchange for {sym} !!")
+        print(f"  !! WARNING: Exit algo order(s) placed but NOT verified for {sym} !!")
         print(f"  !!   TP verified={tp_verified}  SL verified={sl_verified}")
         print(f"  !! Price-guard in --check-positions will catch any SL breach.")
         print(f"  {'!'*60}\n")
         _send_telegram(
-            f"⚠️ [FUTURES] Exit order placement UNVERIFIED for {sym} {trade.get('position_side')}.\n"
+            f"⚠️ [FUTURES] Exit algo order UNVERIFIED for {sym} {trade.get('position_side')}.\n"
             f"TP verified={tp_verified}  SL verified={sl_verified}\n"
             f"Price-guard active — run --check-positions to monitor."
         )
+    elif not both_placed:
+        print(f"\n  {'!'*60}")
+        print(f"  !! CRITICAL: Exit order placement FAILED for {sym} {trade.get('position_side')} !!")
+        print(f"  !!   TP placed={tp_algo_id is not None}  SL placed={sl_algo_id is not None}")
+        print(f"  !! Position UNPROTECTED — price-guard is active but fix ASAP.")
+        print(f"  {'!'*60}\n")
+        _send_telegram(
+            f"🚨 [FUTURES] EXIT ORDER FAILED for {sym} {trade.get('position_side')}!\n"
+            f"TP algoId={tp_algo_id}  SL algoId={sl_algo_id}\n"
+            f"Position UNPROTECTED — intervene immediately."
+        )
 
-    results["success"] = both_placed   # placed (even if unverified) = proceed with guard active
+    results["success"] = both_placed
     return results
 
 
@@ -1350,45 +1345,49 @@ def check_futures_positions(client, verbose: bool = False) -> None:
 
         def _query_exit_order(order_id, algo_id, label):
             """
-            Query exit order status. Tries regular order first,
-            falls back to algo order query if -2013 (not found).
-            Returns (status, fill_price, update_time) or None on error.
+            Query exit order status using the algo order endpoint.
+
+            TAKE_PROFIT_MARKET and STOP_MARKET on Binance Futures are conditional
+            (algo) orders — their lifecycle must be tracked via:
+              futures_get_algo_order(algoId=...)   ← primary
+            The regular futures_get_order(orderId=...) endpoint does NOT serve
+            these order types and will always return -2013.
+
+            order_id and algo_id are expected to be the same value (both set to
+            algoId at placement time). algo_id is used for the query.
+
+            Returns (status, fill_price, update_time) or (None, None, None) on error.
             """
-            # Try regular order endpoint
+            effective_id = algo_id or order_id
+            if not effective_id:
+                return None, None, None
             try:
-                o = client.futures_get_order(symbol=sym, orderId=order_id)
-                return o.get("status"), \
-                       (float(o.get("cumQuote",0)) / max(float(o.get("executedQty",0)),0.0001)
-                        if float(o.get("executedQty",0)) > 0
-                        else float(o.get("stopPrice",0))), \
-                       o.get("updateTime")
+                o = client.futures_get_algo_order(symbol=sym, algoId=effective_id)
+                # Response fields vary slightly; try all known status keys
+                status = (
+                    o.get("algoStatus")
+                    or o.get("orderStatus")
+                    or o.get("status")
+                    or "UNKNOWN"
+                )
+                # Trigger/fill price: triggerPrice for CONDITIONAL orders
+                raw_qty   = float(o.get("executedQty") or o.get("qty") or 0)
+                raw_quote = float(o.get("cumQuote") or o.get("cummulativeQuoteQty") or 0)
+                if raw_qty > 0 and raw_quote > 0:
+                    fill_price = raw_quote / raw_qty
+                else:
+                    fill_price = float(
+                        o.get("triggerPrice")
+                        or o.get("stopPrice")
+                        or o.get("price")
+                        or 0
+                    )
+                upd_time = o.get("updateTime") or o.get("bookTime")
+                return status, fill_price, upd_time
             except Exception as e:
-                if "-2013" not in str(e) and "does not exist" not in str(e).lower():
-                    return None, None, None
-            # Fallback: algo order endpoint
-            if algo_id:
-                try:
-                    import requests as _req
-                    import time as _time, hmac, hashlib, urllib.parse
-                    api_key    = client.API_KEY
-                    api_secret = client.API_SECRET
-                    ts = int(_time.time() * 1000)
-                    params = f"symbol={sym}&algoId={algo_id}&timestamp={ts}"
-                    sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
-                    resp = _req.get(
-                        f"https://testnet.binancefuture.com/fapi/v1/algo/orders/history"
-                        f"?{params}&signature={sig}",
-                        headers={"X-MBX-APIKEY": api_key}, timeout=8
-                    ).json()
-                    orders = resp.get("orders", [])
-                    for ao in orders:
-                        if str(ao.get("algoId")) == str(algo_id):
-                            status = ao.get("orderStatus") or ao.get("algoStatus", "UNKNOWN")
-                            sp = float(ao.get("triggerPrice") or ao.get("stopPrice") or 0)
-                            return status, sp, ao.get("updateTime")
-                except Exception:
-                    pass
-            return None, None, None
+                print(f"  [WARN] _query_exit_order algo lookup failed "
+                      f"({label} algoId={effective_id}): {e}")
+                return None, None, None
 
         if trade.get("exit_orders_placed") and (tp_id or sl_id):
             exit_status_found     = None
@@ -1436,15 +1435,17 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                     ) // 1000
 
                 # Cancel the surviving exit order to prevent ghost position
-                surviving_id = sl_id if exit_status_found == "TP_HIT" else tp_id
-                surviving_type = "SL" if exit_status_found == "TP_HIT" else "TP"
-                if surviving_id:
+                surviving_algo_id = sl_algo_id if exit_status_found == "TP_HIT" else tp_algo_id
+                surviving_type    = "SL"        if exit_status_found == "TP_HIT" else "TP"
+                if surviving_algo_id:
                     try:
-                        client.futures_cancel_order(symbol=sym, orderId=surviving_id)
-                        print(f"  ✅ {sym} — {surviving_type} order #{surviving_id} canceled (counterpart)")
+                        client.futures_cancel_algo_order(symbol=sym, algoId=surviving_algo_id)
+                        print(f"  ✅ {sym} — {surviving_type} algo order #{surviving_algo_id} canceled (counterpart)")
                     except Exception as cancel_err:
-                        print(f"  ⚠  {sym} — Could not cancel {surviving_type} order #{surviving_id}: {cancel_err}")
-                        print(f"      Manual action required at testnet.binancefuture.com to avoid ghost position")
+                        print(f"  ⚠  {sym} — Could not cancel {surviving_type} algo order "
+                              f"#{surviving_algo_id}: {cancel_err}")
+                        print(f"      Manual action required at testnet.binancefuture.com "
+                              f"to avoid ghost position")
 
                 # MAE/MFE reconstruction (Opsi B)
                 if trade.get("entry_fill_time") and trade["exit_time"]:
@@ -1500,11 +1501,11 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                 trade["realized_pnl_pct"]  = round(pnl_pct, 2)
                 if trade.get("entry_fill_time"):
                     trade["time_in_position_sec"] = (exit_time_ms - int(trade["entry_fill_time"])) // 1000
-                # Attempt to cancel any lingering exit orders
-                for _oid in [tp_id, sl_id]:
-                    if _oid:
+                # Attempt to cancel any lingering exit algo orders
+                for _aid in [tp_algo_id, sl_algo_id]:
+                    if _aid:
                         try:
-                            client.futures_cancel_order(symbol=sym, orderId=_oid)
+                            client.futures_cancel_algo_order(symbol=sym, algoId=_aid)
                         except Exception:
                             pass
                 log_dirty = True
