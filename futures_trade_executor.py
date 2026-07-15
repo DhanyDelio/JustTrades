@@ -1391,6 +1391,50 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                 current = float(client.futures_symbol_ticker(symbol=sym)["price"])
             except Exception:
                 current = None
+
+        # ── Step 3.5: Price-guard — catch SL breaches testnet missed ──
+        # Testnet sometimes fails to trigger stop orders. If price has
+        # already blown through SL, resolve the trade as SL_HIT now
+        # rather than letting it show OPEN indefinitely.
+        if (entry_status == "FILLED"
+                and trade.get("exit_status") == "OPEN"
+                and current is not None
+                and trade.get("exit_orders_placed")):
+            sl  = trade.get("sl")
+            _sl_breached = (
+                (side == "LONG"  and sl and current <= sl) or
+                (side == "SHORT" and sl and current >= sl)
+            )
+            if _sl_breached:
+                print(f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl:.4f} "
+                      f"— exchange order may have failed. Resolving as SL_HIT.")
+                entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+                qty        = trade.get("entry_qty", 0)
+                pnl_usd    = (current - entry_fill) * qty * (1 if side == "LONG" else -1)
+                pnl_pct    = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+                exit_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                trade["exit_status"]       = "SL_HIT"
+                trade["exit_price"]        = round(current, 6)
+                trade["exit_time"]         = exit_time_ms
+                trade["realized_pnl_usd"]  = round(pnl_usd, 4)
+                trade["realized_pnl_pct"]  = round(pnl_pct, 2)
+                if trade.get("entry_fill_time"):
+                    trade["time_in_position_sec"] = (exit_time_ms - int(trade["entry_fill_time"])) // 1000
+                # Attempt to cancel any lingering exit orders
+                for _oid in [tp_id, sl_id]:
+                    if _oid:
+                        try:
+                            client.futures_cancel_order(symbol=sym, orderId=_oid)
+                        except Exception:
+                            pass
+                log_dirty = True
+                resolved_this_run.append((sym, "SL_HIT", pnl_usd, side))
+                _send_telegram(
+                    f"🛑 [FUTURES] SL_HIT (price-guard): {sym} {side} @ {ca._fmt_price(current).strip()}"
+                    f"  |  PnL: ${pnl_usd:+.2f}"
+                )
+                continue
+
         pnl_display = "n/a"
         if entry_status == "FILLED" and current and trade.get("entry_qty", 0) > 0:
             ref = trade.get("entry_fill_price") or trade["entry_price"]

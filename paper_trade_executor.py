@@ -1385,6 +1385,36 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
             except Exception:
                 current = None
 
+            # ── Step 3.5: Price-guard — catch SL breaches testnet missed ─
+            # Spot is always LONG — SL is below entry price.
+            if (entry_status == "FILLED"
+                    and trade.get("exit_status") == "OPEN"
+                    and current is not None
+                    and trade.get("oco_placed")):
+                sl = trade.get("sl")
+                if sl and current <= sl:
+                    print(f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl:.4f} "
+                          f"— OCO may have failed. Resolving as SL_HIT.")
+                    entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+                    qty        = trade.get("entry_qty", 0)
+                    pnl_usd    = qty * (current - entry_fill)
+                    pnl_pct    = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+                    exit_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    trade["exit_status"]      = "SL_HIT"
+                    trade["exit_price"]       = round(current, 6)
+                    trade["exit_time"]        = exit_time_ms
+                    trade["realized_pnl_usd"] = round(pnl_usd, 4)
+                    trade["realized_pnl_pct"] = round(pnl_pct, 2)
+                    if trade.get("entry_fill_time") and exit_time_ms:
+                        trade["time_to_resolution_sec"] = (exit_time_ms - int(trade["entry_fill_time"])) // 1000
+                    log_dirty = True
+                    resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+                    _send_telegram(
+                        f"🛑 [SPOT] SL_HIT (price-guard): {sym} @ {ca._fmt_price(current).strip()}"
+                        f"  |  PnL: ${pnl_usd:+.2f}"
+                    )
+                    continue
+
             # Compact view: show PnL only for filled positions;
             # for pending orders show distance to entry instead (more useful than "n/a")
             pnl_display = "n/a"
