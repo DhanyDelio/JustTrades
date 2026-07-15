@@ -534,9 +534,12 @@ def _req_get(url: str, params: dict | None = None, timeout: int = 8):
 
 def _fetch_spot_prices(symbols: list[str]) -> dict[str, float]:
     """
-    Fetch current prices using Binance Spot Testnet (same client as
-    paper_trade_executor.py). Falls back to public mainnet if testnet
-    keys are not configured.
+    Fetch current prices for spot positions.
+
+    Source priority:
+    1. Binance Mainnet via python-binance (no-auth, just tickers) — real prices
+    2. Binance Spot Testnet — fallback for symbols not on mainnet
+    3. Raw public mainnet HTTPS — last resort (may fail on SSL-restricted networks)
     """
     prices: dict[str, float] = {}
     if not symbols:
@@ -544,21 +547,38 @@ def _fetch_spot_prices(symbols: list[str]) -> dict[str, float]:
 
     sym_set = set(symbols)
 
-    # ── Primary: Binance Spot Testnet (no SSL/Cloudflare issues) ───────
+    # ── Primary: Binance Mainnet public tickers (python-binance, no auth) ──
+    # Uses the library's session which handles SSL correctly, unlike raw requests
+    # on some networks. No API key needed for ticker data.
     try:
-        api_key    = os.getenv("BINANCE_TESTNET_API_KEY", "")
-        api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
-        if api_key and api_secret:
-            from binance.client import Client as _Client
-            _c = _Client(api_key, api_secret, testnet=True)
-            tickers = _c.get_all_tickers()
-            for item in tickers:
-                if item.get("symbol") in sym_set:
-                    prices[item["symbol"]] = float(item["price"])
+        from binance.client import Client as _Client
+        _mainnet = _Client("", "")  # no auth needed for public ticker endpoint
+        tickers = _mainnet.get_all_tickers()
+        for item in tickers:
+            if item.get("symbol") in sym_set:
+                prices[item["symbol"]] = float(item["price"])
     except Exception:
         pass
 
-    # ── Fallback: public mainnet (may fail on some networks) ───────────
+    # ── Fallback: Binance Spot Testnet (for symbols genuinely not on mainnet) ──
+    # Note: testnet prices are often stale/frozen for low-liquidity symbols.
+    # Only use for symbols we couldn't get from mainnet.
+    missing = sym_set - prices.keys()
+    if missing:
+        try:
+            api_key    = os.getenv("BINANCE_TESTNET_API_KEY", "")
+            api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
+            if api_key and api_secret:
+                from binance.client import Client as _Client
+                _c = _Client(api_key, api_secret, testnet=True)
+                tickers = _c.get_all_tickers()
+                for item in tickers:
+                    if item.get("symbol") in missing:
+                        prices[item["symbol"]] = float(item["price"])
+        except Exception:
+            pass
+
+    # ── Last resort: raw public mainnet HTTPS ──────────────────────────
     for sym in sym_set - prices.keys():
         try:
             resp = _req_get(
