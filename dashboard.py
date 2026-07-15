@@ -454,18 +454,44 @@ def render_futures_side_stats(side_stats: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def _fmt_price(val) -> str:
-    """Format a price value for display — handles None gracefully."""
+    """Format a price value for display — handles None and low-price assets gracefully.
+
+    Uses dynamic decimal precision matching chart_analyzer._fmt_price so that
+    assets like PEPEUSDT (0.0000034...) display meaningfully instead of
+    collapsing to 0.000003 at 6dp.
+    """
     if val is None:
         return "n/a"
     try:
         v = float(val)
     except (TypeError, ValueError):
         return "n/a"
-    if v >= 1000:
-        return f"{v:,.2f}"
-    if v >= 1:
-        return f"{v:.4f}"
-    return f"{v:.6f}"
+    if v == 0:
+        return "0"
+    import math
+    abs_v = abs(v)
+    if abs_v >= 1000:
+        decimals = 2
+    elif abs_v >= 1:
+        decimals = 4
+    elif abs_v >= 0.1:
+        decimals = 5
+    elif abs_v >= 0.01:
+        decimals = 6
+    elif abs_v >= 0.001:
+        decimals = 6
+    elif abs_v >= 1e-4:
+        decimals = 8
+    elif abs_v >= 1e-5:
+        decimals = 9
+    elif abs_v >= 1e-6:
+        decimals = 10
+    else:
+        # enough sig figs for anything smaller
+        decimals = max(10, -int(math.floor(math.log10(abs_v))) + 3)
+    if abs_v >= 1000:
+        return f"{v:,.{decimals}f}"
+    return f"{v:.{decimals}f}"
 
 
 def _pct_color(pct: float | None) -> str:
