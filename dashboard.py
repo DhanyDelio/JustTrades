@@ -628,8 +628,8 @@ def _status_badge(status: str) -> str:
 
 def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     """
-    Render a single open spot position as a card that mirrors the terminal
-    --verbose layout: compact single block with all key info visible at once.
+    Render a single open spot position as a visual card.
+    All original data preserved — layout redesigned for readability.
     """
     sym          = trade.get("symbol", "?")
     direction    = str(trade.get("direction", "long")).upper()
@@ -646,10 +646,11 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     cluster_id   = trade.get("correlation_cluster_id")
     open_time    = trade.get("open_time", "")
     slip_pct     = trade.get("slippage_pct")
+    notional     = trade.get("entry_notional")
 
     ref_price = fill_price or entry_price
 
-    # Derived values
+    # ── Derived ───────────────────────────────────────────────────────
     unreal_pnl:   float | None = None
     pct_to_fill:  float | None = None
     pct_to_sl:    float | None = None
@@ -665,24 +666,6 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
         if tp1:
             pct_to_tp = (float(tp1) - current_price) / current_price * 100
 
-    # ── Build status line ─────────────────────────────────────────────
-    status_icon = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
-    status_parts = [f"{status_icon} {entry_status}"]
-    if entry_status == "FILLED" and unreal_pnl is not None:
-        pnl_color = "#2ca02c" if unreal_pnl >= 0 else "#d62728"
-        status_parts.append(
-            f"Unreal: <span style='color:{pnl_color};font-weight:bold'>${unreal_pnl:+.3f}</span>"
-        )
-    if oco_placed and oco_list_id:
-        status_parts.append(f"OCO List: {oco_list_id}")
-    elif oco_placed:
-        status_parts.append("OCO: ✅ placed")
-    elif entry_status == "FILLED":
-        status_parts.append("OCO: <span style='color:#d62728'>⚠ not placed</span>")
-    if slip_pct is not None:
-        status_parts.append(f"Slip: {slip_pct:+.3f}%")
-
-    # ── Build open_time string ────────────────────────────────────────
     ot_str = ""
     if open_time:
         try:
@@ -690,89 +673,156 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
         except Exception:
             ot_str = str(open_time)
 
-    # ── Render ────────────────────────────────────────────────────────
+    is_filled    = entry_status == "FILLED"
+    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
+    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
+    oco_ok       = oco_placed and oco_list_id
+    oco_badge    = (f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+                    f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>"
+                    if oco_ok else
+                    (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em'>⚠ NO OCO</span>"
+                     if is_filled else ""))
+
+    pnl_color    = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
+
     with st.container(border=True):
-        # Header
-        header_right = ""
-        if cluster_id:
-            header_right += f"<span style='font-size:0.85em;color:#888'>cluster: <code>{cluster_id}</code></span>"
-        if ot_str:
-            header_right += f"<span style='font-size:0.8em;color:#aaa;margin-left:12px'>{ot_str}</span>"
-
-        st.markdown(
-            f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
-            f"<span style='font-size:1.2em;font-weight:bold'>{sym}</span>"
-            f"&nbsp;&nbsp;<code style='font-size:1em'>{direction}</code>"
-            f"<span>{header_right}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("<hr style='margin:6px 0 10px 0;border-color:#ddd'>", unsafe_allow_html=True)
-
-        # Price block — mirrors terminal layout
-        if entry_status in ("NEW", "PARTIALLY_FILLED"):
-            fill_delta_str = ""
-            if pct_to_fill is not None:
-                fill_delta_str = f"&nbsp;&nbsp;<span style='color:#888;font-size:0.9em'>({pct_to_fill:+.2f}% to fill)</span>"
-            cur_str = _fmt_price(current_price) if current_price else "n/a"
-            ep_str  = _fmt_price(entry_price)
+        # ── Header row ────────────────────────────────────────────────
+        h1, h2 = st.columns([3, 2])
+        with h1:
             st.markdown(
-                f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-                f"Current:&nbsp;<b>{cur_str}</b>"
-                f"&nbsp;&nbsp;→&nbsp;&nbsp;"
-                f"Entry:&nbsp;<b>{ep_str}</b>"
-                f"{fill_delta_str}"
+                f"<div style='line-height:1.3'>"
+                f"<span style='font-size:1.25em;font-weight:700'>{sym}</span>"
+                f"&nbsp;&nbsp;"
+                f"<code style='background:#e8f4e8;color:#1a6b1a;padding:2px 8px;"
+                f"border-radius:4px;font-size:0.9em'>LONG</code>"
+                f"&nbsp;&nbsp;{oco_badge}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        else:  # FILLED
-            cur_str   = _fmt_price(current_price) if current_price else "n/a"
-            fill_str  = _fmt_price(fill_price)
-            entry_str = _fmt_price(entry_price)
+        with h2:
             st.markdown(
-                f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-                f"Entry:&nbsp;<b>{entry_str}</b>"
-                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-                f"Fill:&nbsp;<b>{fill_str}</b>"
-                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-                f"Current:&nbsp;<b>{cur_str}</b>"
+                f"<div style='text-align:right;line-height:1.3'>"
+                f"<span style='font-size:0.8em;color:#aaa'>{ot_str}</span><br>"
+                f"{'<span style=\"font-size:0.8em;color:#888\">cluster: <code>' + cluster_id + '</code></span>' if cluster_id else ''}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
-        # SL / TP row
-        sl_pct_str = f" ({pct_to_sl:+.2f}%)" if pct_to_sl is not None else ""
-        tp_pct_str = f" ({pct_to_tp:+.2f}%)" if pct_to_tp is not None else ""
-        rr_str     = f"R:R&nbsp;{float(rr):.2f}:1" if rr else ""
-        risk_str   = f"Risk&nbsp;{float(risk_pct):.2f}%" if risk_pct else ""
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-            f"SL:&nbsp;<b>{_fmt_price(sl)}</b><span style='color:#888'>{sl_pct_str}</span>"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"TP:&nbsp;<b>{_fmt_price(tp1)}</b><span style='color:#888'>{tp_pct_str}</span>"
-            f"{'&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + rr_str if rr_str else ''}"
-            f"{'&nbsp;&nbsp;·&nbsp;&nbsp;' + risk_str if risk_str else ''}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        # ── Status + PnL banner ───────────────────────────────────────
+        if is_filled and unreal_pnl is not None:
+            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
+                f"<span style='font-size:1.1em;font-weight:700;color:{pnl_color}'>"
+                f"Unrealized&nbsp;{unreal_pnl:+.4f} USDT</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div style='background:#f5f5f5;border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        st.markdown("<hr style='margin:8px 0 6px 0;border-color:#eee'>", unsafe_allow_html=True)
+        # ── Price grid ────────────────────────────────────────────────
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Entry</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{_fmt_price(entry_price)}</div>"
+                f"{'<div style=\"font-size:0.78em;color:#aaa\">fill ' + _fmt_price(fill_price) + '</div>' if is_filled and fill_price and fill_price != entry_price else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with pc2:
+            cur_str = _fmt_price(current_price) if current_price else "—"
+            dist_str = f"{pct_to_fill:+.2f}%" if pct_to_fill is not None else ""
+            dist_color = "#2ca02c" if (pct_to_fill or 0) <= 0 else "#ff7f0e"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px;background:#f8f9fa;border-radius:6px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Current</div>"
+                f"<div style='font-size:1.05em;font-weight:700;font-family:monospace'>{cur_str}</div>"
+                f"{'<div style=\"font-size:0.78em;color:' + dist_color + '\">' + dist_str + ' to fill</div>' if dist_str else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with pc3:
+            notional_str = f"${float(notional):.2f}" if notional else "—"
+            qty_str      = f"{float(qty):.4f}" if qty else "—"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{qty_str}</div>"
+                f"<div style='font-size:0.78em;color:#aaa'>{notional_str} notional</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        # Status line
-        st.markdown(
-            f"<div style='font-size:0.9em;color:#555'>"
-            f"{'&nbsp;&nbsp;|&nbsp;&nbsp;'.join(status_parts)}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # ── SL / TP row ───────────────────────────────────────────────
+        sc1, sc2, sc3 = st.columns([2, 2, 1])
+        with sc1:
+            sl_pct = f"  {pct_to_sl:+.2f}%" if pct_to_sl is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(214,39,40,0.07);border-left:3px solid #d62728;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#d62728;font-weight:600'>STOP LOSS</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_price(sl)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{sl_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            tp_pct = f"  {pct_to_tp:+.2f}%" if pct_to_tp is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(44,160,44,0.07);border-left:3px solid #2ca02c;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#2ca02c;font-weight:600'>TAKE PROFIT</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_price(tp1)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{tp_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc3:
+            rr_val   = f"{float(rr):.2f}:1"   if rr       else "—"
+            risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888'>R:R</div>"
+                f"<div style='font-weight:700'>{rr_val}</div>"
+                f"<div style='font-size:0.78em;color:#888'>risk {risk_val}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Footer ────────────────────────────────────────────────────
+        foot_parts = []
+        if slip_pct is not None:
+            foot_parts.append(f"Slip: {slip_pct:+.3f}%")
+        if oco_list_id:
+            foot_parts.append(f"OCO #{oco_list_id}")
+        if foot_parts:
+            st.markdown(
+                f"<div style='font-size:0.78em;color:#aaa;margin-top:4px'>"
+                f"{'  ·  '.join(foot_parts)}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_futures_open_card(trade: dict, current_price: float | None) -> None:
     """
-    Render a single open futures position as a compact card mirroring the
-    terminal --verbose layout, with futures-specific fields added.
+    Render a single open futures position as a visual card.
+    All original data preserved — layout redesigned for readability.
     """
     sym          = trade.get("symbol", "?")
     side         = str(trade.get("position_side", "LONG")).upper()
@@ -793,10 +843,12 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
     cluster_id   = trade.get("correlation_cluster_id")
     open_time    = trade.get("open_time", "")
     slip_pct     = trade.get("slippage_pct")
+    notional     = trade.get("entry_notional")
+    margin_used  = trade.get("margin_used")
 
     ref_price = fill_price or entry_price
 
-    # Derived
+    # ── Derived ───────────────────────────────────────────────────────
     unreal_pnl:  float | None = None
     pct_to_fill: float | None = None
     pct_to_sl:   float | None = None
@@ -816,23 +868,6 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
         if liq_price:
             pct_to_liq = (float(liq_price) - current_price) / current_price * 100
 
-    # ── Build status line ─────────────────────────────────────────────
-    status_icon = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
-    status_parts = [f"{status_icon} {entry_status}"]
-    if entry_status == "FILLED" and unreal_pnl is not None:
-        pnl_color = "#2ca02c" if unreal_pnl >= 0 else "#d62728"
-        status_parts.append(
-            f"Unreal: <span style='color:{pnl_color};font-weight:bold'>${unreal_pnl:+.4f}</span>"
-        )
-    if funding_paid != 0.0:
-        fund_color = "#d62728" if funding_paid > 0 else "#2ca02c"
-        status_parts.append(
-            f"Funding: <span style='color:{fund_color}'>${funding_paid:+.4f}</span>"
-        )
-    if slip_pct is not None:
-        status_parts.append(f"Slip: {slip_pct:+.3f}%")
-
-    # ── Open time string ──────────────────────────────────────────────
     ot_str = ""
     if open_time:
         try:
@@ -840,109 +875,189 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
         except Exception:
             ot_str = str(open_time)
 
-    # ── Regime icon ───────────────────────────────────────────────────
-    regime_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(str(vol_regime).lower(), "⚪")
-    lev_str = f"{int(float(leverage))}x" if leverage else "?"
-    side_icon = "📈" if side == "LONG" else "📉"
-
-    # ── Liquidation warning ───────────────────────────────────────────
+    is_filled    = entry_status == "FILLED"
+    is_long      = side == "LONG"
+    side_color   = "#1f77b4" if is_long else "#d62728"
+    side_bg      = "rgba(31,119,180,0.10)" if is_long else "rgba(214,39,40,0.10)"
+    side_icon    = "📈" if is_long else "📉"
+    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
+    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
+    pnl_color    = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
+    lev_str      = f"{int(float(leverage))}x" if leverage else "?"
+    regime_icon  = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(str(vol_regime).lower(), "⚪")
     liq_dist_val = float(liq_dist) if liq_dist is not None else None
-    liq_warn = liq_dist_val is not None and liq_dist_val < 10.0
+    liq_warn     = liq_dist_val is not None and liq_dist_val < 10.0
 
     with st.container(border=True):
-        # Header
-        header_right = ""
-        if cluster_id:
-            header_right += f"<span style='font-size:0.85em;color:#888'>cluster: <code>{cluster_id}</code></span>"
-        if ot_str:
-            header_right += f"<span style='font-size:0.8em;color:#aaa;margin-left:12px'>{ot_str}</span>"
+        # ── Header row ────────────────────────────────────────────────
+        h1, h2 = st.columns([3, 2])
+        with h1:
+            st.markdown(
+                f"<div style='line-height:1.4'>"
+                f"<span style='font-size:1.25em;font-weight:700'>{sym}</span>"
+                f"&nbsp;&nbsp;"
+                f"<code style='background:{side_bg};color:{side_color};padding:2px 9px;"
+                f"border-radius:4px;font-size:0.9em'>{side_icon} {side}</code>"
+                f"&nbsp;&nbsp;"
+                f"<span style='background:#f0f0f0;border-radius:4px;padding:2px 8px;"
+                f"font-size:0.82em;color:#444'>{lev_str} {margin_mode}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with h2:
+            st.markdown(
+                f"<div style='text-align:right;line-height:1.4'>"
+                f"<span style='font-size:0.79em;color:#aaa'>{ot_str}</span><br>"
+                f"{'<span style=\"font-size:0.79em;color:#888\">cluster: <code>' + cluster_id + '</code></span>' if cluster_id else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        st.markdown(
-            f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
-            f"<span style='font-size:1.2em;font-weight:bold'>{sym}</span>"
-            f"&nbsp;&nbsp;{side_icon}&nbsp;<code style='font-size:1em'>{side}</code>"
-            f"&nbsp;&nbsp;<span style='font-size:0.9em;color:#666'>{lev_str} {margin_mode}</span>"
-            f"<span>{header_right}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div style='height:5px'></div>", unsafe_allow_html=True)
 
-        st.markdown("<hr style='margin:6px 0 10px 0;border-color:#ddd'>", unsafe_allow_html=True)
+        # ── PnL / status banner ───────────────────────────────────────
+        if is_filled and unreal_pnl is not None:
+            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            fund_str = (f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+                        f"<span style='color:{'#d62728' if funding_paid > 0 else '#2ca02c'}'>"
+                        f"Funding {funding_paid:+.4f}</span>"
+                        if funding_paid != 0.0 else "")
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}"
+                f"{fund_str}</span>"
+                f"<span style='font-size:1.1em;font-weight:700;color:{pnl_color}'>"
+                f"Unrealized&nbsp;{unreal_pnl:+.4f} USDT</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div style='background:#f5f5f5;border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        # Price block
-        if entry_status in ("NEW", "PARTIALLY_FILLED"):
-            fill_delta_str = ""
+        # ── Price grid: Entry | Current | Size ────────────────────────
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Entry</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{_fmt_price(entry_price)}</div>"
+                f"{'<div style=\"font-size:0.78em;color:#aaa\">fill ' + _fmt_price(fill_price) + '</div>' if is_filled and fill_price and fill_price != entry_price else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with pc2:
+            cur_str  = _fmt_price(current_price) if current_price else "—"
             if pct_to_fill is not None:
-                fill_delta_str = f"&nbsp;&nbsp;<span style='color:#888;font-size:0.9em'>({pct_to_fill:+.2f}% to fill)</span>"
-            cur_str = _fmt_price(current_price) if current_price else "n/a"
-            ep_str  = _fmt_price(entry_price)
+                dist_color = "#ff7f0e"
+                dist_str   = f"{pct_to_fill:+.2f}% to fill"
+            else:
+                dist_str   = ""
+                dist_color = "#888"
             st.markdown(
-                f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-                f"Current:&nbsp;<b>{cur_str}</b>"
-                f"&nbsp;&nbsp;→&nbsp;&nbsp;"
-                f"Entry:&nbsp;<b>{ep_str}</b>"
-                f"{fill_delta_str}"
+                f"<div style='text-align:center;padding:4px;background:#f8f9fa;border-radius:6px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Current</div>"
+                f"<div style='font-size:1.05em;font-weight:700;font-family:monospace'>{cur_str}</div>"
+                f"{'<div style=\"font-size:0.78em;color:' + dist_color + '\">' + dist_str + '</div>' if dist_str else ''}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        else:  # FILLED
-            cur_str   = _fmt_price(current_price) if current_price else "n/a"
-            fill_str  = _fmt_price(fill_price)
-            entry_str = _fmt_price(entry_price)
+        with pc3:
+            notional_str  = f"${float(notional):.2f}" if notional else "—"
+            margin_str    = f"${float(margin_used):.2f}" if margin_used else "—"
+            qty_str       = f"{float(qty):.4f}" if qty else "—"
             st.markdown(
-                f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-                f"Entry:&nbsp;<b>{entry_str}</b>"
-                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-                f"Fill:&nbsp;<b>{fill_str}</b>"
-                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-                f"Current:&nbsp;<b>{cur_str}</b>"
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{qty_str}</div>"
+                f"<div style='font-size:0.78em;color:#aaa'>{notional_str} · margin {margin_str}</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
-        # SL / TP row
-        sl_pct_str = f" ({pct_to_sl:+.2f}%)" if pct_to_sl is not None else ""
-        tp_pct_str = f" ({pct_to_tp:+.2f}%)" if pct_to_tp is not None else ""
-        rr_str     = f"R:R&nbsp;{float(rr):.2f}:1" if rr else ""
-        risk_str   = f"Risk&nbsp;{float(risk_pct):.2f}%" if risk_pct else ""
+        st.markdown("<div style='height:5px'></div>", unsafe_allow_html=True)
 
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-            f"SL:&nbsp;<b>{_fmt_price(sl)}</b><span style='color:#888'>{sl_pct_str}</span>"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"TP:&nbsp;<b>{_fmt_price(tp1)}</b><span style='color:#888'>{tp_pct_str}</span>"
-            f"{'&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;' + rr_str if rr_str else ''}"
-            f"{'&nbsp;&nbsp;·&nbsp;&nbsp;' + risk_str if risk_str else ''}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        # ── SL / TP / R:R row ─────────────────────────────────────────
+        sc1, sc2, sc3 = st.columns([2, 2, 1])
+        with sc1:
+            sl_pct = f"  {pct_to_sl:+.2f}%" if pct_to_sl is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(214,39,40,0.07);border-left:3px solid #d62728;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#d62728;font-weight:600'>STOP LOSS</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_price(sl)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{sl_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            tp_pct = f"  {pct_to_tp:+.2f}%" if pct_to_tp is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(44,160,44,0.07);border-left:3px solid #2ca02c;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#2ca02c;font-weight:600'>TAKE PROFIT</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_price(tp1)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{tp_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc3:
+            rr_val   = f"{float(rr):.2f}:1"    if rr       else "—"
+            risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888'>R:R</div>"
+                f"<div style='font-weight:700'>{rr_val}</div>"
+                f"<div style='font-size:0.78em;color:#888'>risk {risk_val}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        # Liquidation row — always shown for futures
-        liq_pct_str = f" ({pct_to_liq:+.2f}% from current)" if pct_to_liq is not None else ""
-        liq_dist_str = f"{liq_dist_val:.2f}% away" if liq_dist_val is not None else "n/a"
-        liq_warn_str = "  ⚠ TIGHT" if liq_warn else ""
-        liq_color    = "#d62728" if liq_warn else "#555"
+        st.markdown("<div style='height:5px'></div>", unsafe_allow_html=True)
 
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:0.95em;line-height:2'>"
-            f"Liq:&nbsp;<b>{_fmt_price(liq_price)}</b>"
-            f"<span style='color:{liq_color}'>&nbsp;{liq_dist_str}{liq_warn_str}</span>"
-            f"<span style='color:#888'>{liq_pct_str}</span>"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"{regime_icon}&nbsp;{vol_regime}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        # ── Liquidation row ───────────────────────────────────────────
+        lc1, lc2 = st.columns([3, 1])
+        with lc1:
+            liq_color    = "#d62728" if liq_warn else "#888"
+            liq_dist_str = f"{liq_dist_val:.2f}% away" if liq_dist_val is not None else "n/a"
+            liq_pct_str  = f"  ({pct_to_liq:+.2f}% from current)" if pct_to_liq is not None else ""
+            warn_badge   = ("&nbsp;<span style='background:#d62728;color:#fff;border-radius:3px;"
+                            "padding:1px 5px;font-size:0.72em'>⚠ TIGHT</span>"
+                            if liq_warn else "")
+            st.markdown(
+                f"<div style='font-size:0.85em;font-family:monospace'>"
+                f"<span style='color:#888'>Liq:</span>&nbsp;"
+                f"<b>{_fmt_price(liq_price)}</b>&nbsp;"
+                f"<span style='color:{liq_color}'>{liq_dist_str}</span>"
+                f"<span style='color:#aaa'>{liq_pct_str}</span>"
+                f"{warn_badge}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with lc2:
+            st.markdown(
+                f"<div style='text-align:right;font-size:0.85em'>"
+                f"{regime_icon}&nbsp;<span style='color:#888'>{vol_regime}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        st.markdown("<hr style='margin:8px 0 6px 0;border-color:#eee'>", unsafe_allow_html=True)
-
-        # Status line
-        st.markdown(
-            f"<div style='font-size:0.9em;color:#555'>"
-            f"{'&nbsp;&nbsp;|&nbsp;&nbsp;'.join(status_parts)}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        # ── Footer ────────────────────────────────────────────────────
+        foot_parts = []
+        if slip_pct is not None:
+            foot_parts.append(f"Slip: {slip_pct:+.3f}%")
+        if foot_parts:
+            st.markdown(
+                f"<div style='font-size:0.78em;color:#aaa;margin-top:4px'>"
+                f"{'  ·  '.join(foot_parts)}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
