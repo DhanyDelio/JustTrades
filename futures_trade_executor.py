@@ -1045,8 +1045,87 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
                "tp_algo_id": None, "sl_algo_id": None,
                "success": False}
 
-    try:
-        tp_resp = client.futures_create_order(
+    def _place_and_verify(label: str, order_kwargs: dict) -> tuple:
+        """
+        Place a futures order and immediately verify it exists on the exchange.
+
+        Returns (order_id, algo_id, verified: bool).
+
+        Root-cause fix: Binance Testnet sometimes returns algoId in the orderId
+        field for conditional orders (TAKE_PROFIT_MARKET / STOP_MARKET). When
+        that happens, tp_order_id == tp_algo_id, and every subsequent
+        futures_get_order() call returns -2013 (not found) because the exchange
+        only knows the order by its regular orderId — which was never stored.
+
+        Strategy:
+          1. Prefer `orderId` from the create response (real exchange order id).
+          2. Store `algoId` separately (may differ from orderId).
+          3. After creation, call futures_get_order(orderId) once to confirm.
+             If that fails with -2013, the order is NOT on the exchange → treat
+             as failed, return verified=False so the caller can alert.
+        """
+        try:
+            resp = client.futures_create_order(**order_kwargs)
+        except BinanceAPIException as e:
+            print(f"  ❌ {label} order failed (API): {e}")
+            return None, None, False
+        except Exception as e:
+            print(f"  ❌ {label} order unexpected error: {type(e).__name__}: {e}")
+            return None, None, False
+
+        raw_order_id = resp.get("orderId")
+        algo_id      = resp.get("algoId")
+
+        # Testnet quirk: orderId may be 0/None while algoId is present.
+        # Do NOT use algoId as a substitute for orderId — they are different
+        # namespaces. Record both separately.
+        order_id = raw_order_id if raw_order_id else None
+
+        if order_id is None:
+            print(f"  ❌ {label} order — no orderId in response. "
+                  f"algoId={algo_id}  Full response: {resp}")
+            # Still record algo_id so price-guard / manual lookup can use it
+            return None, algo_id, False
+
+        print(f"  ✅ {label} order placed: #{order_id} @ "
+              f"{order_kwargs.get('stopPrice', '?')}  (algoId={algo_id})")
+
+        # ── Post-placement verification ────────────────────────────────
+        # One get_order() call to confirm the exchange actually registered it.
+        import time as _time
+        _time.sleep(0.3)   # brief settle — testnet can lag before order is queryable
+        try:
+            verify = client.futures_get_order(
+                symbol=order_kwargs["symbol"], orderId=order_id
+            )
+            v_status = verify.get("status", "UNKNOWN")
+            if v_status in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                print(f"  ✅ {label} order verified on exchange: status={v_status}")
+                return order_id, algo_id, True
+            else:
+                # Unexpected status (e.g. immediately CANCELED) — not safe
+                print(f"  ⚠  {label} order verification: unexpected status={v_status}. "
+                      f"Treating as unverified.")
+                return order_id, algo_id, False
+        except BinanceAPIException as ve:
+            # -2013 = order does not exist → exchange never registered it
+            if "-2013" in str(ve) or "does not exist" in str(ve).lower():
+                print(f"  ❌ {label} order verification FAILED (-2013): "
+                      f"exchange has no record of #{order_id}. "
+                      f"Position may be UNPROTECTED.")
+            else:
+                print(f"  ⚠  {label} order verification error (non-2013): {ve}. "
+                      f"Assuming placed — monitor manually.")
+                return order_id, algo_id, True   # non-fatal: give benefit of doubt
+            return order_id, algo_id, False
+        except Exception as ve:
+            print(f"  ⚠  {label} order verification error: {type(ve).__name__}: {ve}. "
+                  f"Assuming placed — monitor manually.")
+            return order_id, algo_id, True   # network hiccup — benefit of doubt
+
+    tp_id_placed, tp_algo_placed, tp_verified = _place_and_verify(
+        "TP",
+        dict(
             symbol       = sym,
             side         = side,
             type         = "TAKE_PROFIT_MARKET",
@@ -1056,22 +1135,12 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
             positionSide = "BOTH",
             reduceOnly   = True,
             workingType  = "MARK_PRICE",
-        )
-        # Testnet may return algoId instead of orderId for conditional orders
-        tp_order_id = tp_resp.get("orderId") or tp_resp.get("algoId")
-        if tp_order_id is not None:
-            results["tp_order_id"] = tp_order_id
-            results["tp_algo_id"]  = tp_resp.get("algoId")
-            print(f"  ✅ TP order placed: #{tp_order_id} @ {tp1}")
-        else:
-            print(f"  ❌ TP order — no orderId in response. Full response: {tp_resp}")
-    except BinanceAPIException as e:
-        print(f"  ❌ TP order failed: {e}")
-    except Exception as e:
-        print(f"  ❌ TP order unexpected error: {type(e).__name__}: {e}")
+        ),
+    )
 
-    try:
-        sl_resp = client.futures_create_order(
+    sl_id_placed, sl_algo_placed, sl_verified = _place_and_verify(
+        "SL",
+        dict(
             symbol       = sym,
             side         = side,
             type         = "STOP_MARKET",
@@ -1081,21 +1150,32 @@ def place_futures_exit_orders(client, trade: dict) -> dict:
             positionSide = "BOTH",
             reduceOnly   = True,
             workingType  = "MARK_PRICE",
-        )
-        sl_order_id = sl_resp.get("orderId") or sl_resp.get("algoId")
-        if sl_order_id is not None:
-            results["sl_order_id"] = sl_order_id
-            results["sl_algo_id"]  = sl_resp.get("algoId")
-            print(f"  ✅ SL order placed: #{sl_order_id} @ {sl}")
-        else:
-            print(f"  ❌ SL order — no orderId in response. Full response: {sl_resp}")
-    except BinanceAPIException as e:
-        print(f"  ❌ SL order failed: {e}")
-    except Exception as e:
-        print(f"  ❌ SL order unexpected error: {type(e).__name__}: {e}")
+        ),
+    )
 
-    results["success"] = (results["tp_order_id"] is not None and
-                          results["sl_order_id"] is not None)
+    results["tp_order_id"] = tp_id_placed
+    results["sl_order_id"] = sl_id_placed
+    results["tp_algo_id"]  = tp_algo_placed   # kept separate — never conflated with orderId
+    results["sl_algo_id"]  = sl_algo_placed
+
+    both_placed   = (tp_id_placed is not None and sl_id_placed is not None)
+    both_verified = (tp_verified and sl_verified)
+
+    if both_placed and not both_verified:
+        # At least one order is unverified — warn loudly but still mark placed
+        # so price-guard keeps watching. The caller will see the console warning.
+        print(f"\n  {'!'*60}")
+        print(f"  !! WARNING: Exit order(s) placed but NOT verified on exchange for {sym} !!")
+        print(f"  !!   TP verified={tp_verified}  SL verified={sl_verified}")
+        print(f"  !! Price-guard in --check-positions will catch any SL breach.")
+        print(f"  {'!'*60}\n")
+        _send_telegram(
+            f"⚠️ [FUTURES] Exit order placement UNVERIFIED for {sym} {trade.get('position_side')}.\n"
+            f"TP verified={tp_verified}  SL verified={sl_verified}\n"
+            f"Price-guard active — run --check-positions to monitor."
+        )
+
+    results["success"] = both_placed   # placed (even if unverified) = proceed with guard active
     return results
 
 
