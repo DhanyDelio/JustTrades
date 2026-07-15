@@ -1356,7 +1356,6 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
                                 elif exit_t and trade.get("open_time"):
                                     # Fallback: use open_time (order placed time) if fill_time missing
                                     try:
-                                        from datetime import datetime, timezone
                                         open_ms = int(datetime.fromisoformat(
                                             trade["open_time"]
                                         ).timestamp() * 1000)
