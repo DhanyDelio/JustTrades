@@ -1305,6 +1305,56 @@ def main():
     with tab_open:
         st.caption("Live view of all open positions + trades resolved in the last 24h  |  Read-only")
 
+        # ── Check Positions buttons ───────────────────────────────────────
+        st.markdown("#### Run check-positions")
+        _cp_col1, _cp_col2, _cp_col3 = st.columns([1, 1, 3])
+        _run_spot    = _cp_col1.button("📈 Check Spot",    key="btn_check_spot")
+        _run_futures = _cp_col2.button("⚡ Check Futures", key="btn_check_futures")
+
+        if _run_spot or _run_futures:
+            import subprocess, sys, os
+            _script = (
+                "paper_trade_executor.py"   if _run_spot
+                else "futures_trade_executor.py"
+            )
+            _label  = "Spot" if _run_spot else "Futures"
+            _env    = {**os.environ}  # inherits all .env vars already loaded
+
+            with st.spinner(f"Running {_label} check-positions…"):
+                try:
+                    _proc = subprocess.run(
+                        [sys.executable, _script, "--check-positions"],
+                        capture_output=True, text=True, timeout=120,
+                        cwd=str(Path(__file__).parent),
+                        env=_env,
+                    )
+                    _stdout = _proc.stdout.strip()
+                    _stderr = _proc.stderr.strip()
+                    _rc     = _proc.returncode
+                except subprocess.TimeoutExpired:
+                    _stdout, _stderr, _rc = "", "Timed out after 120 s", 1
+                except Exception as _exc:
+                    _stdout, _stderr, _rc = "", str(_exc), 1
+
+            if _rc == 0:
+                st.success(f"✅ {_label} check-positions completed")
+            else:
+                st.error(f"❌ {_label} check-positions exited with code {_rc}")
+
+            with st.expander("Output", expanded=True):
+                if _stdout:
+                    st.code(_stdout, language="text")
+                if _stderr:
+                    st.warning("stderr:")
+                    st.code(_stderr, language="text")
+                if not _stdout and not _stderr:
+                    st.write("(no output)")
+
+            # Reload data so cards reflect any newly resolved positions
+            st.rerun()
+
+        st.divider()
+
         # Load raw rows (not the processed DataFrames) so we have all original fields
         try:
             _spot_rows = fetch_all_spot()
