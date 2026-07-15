@@ -661,10 +661,11 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             unreal_pnl = float(qty) * (current_price - float(ref_price))
         if entry_status in ("NEW", "PARTIALLY_FILLED") and entry_price:
             pct_to_fill = (float(entry_price) - current_price) / current_price * 100
-        if sl:
-            pct_to_sl = (float(sl) - current_price) / current_price * 100
-        if tp1:
-            pct_to_tp = (float(tp1) - current_price) / current_price * 100
+        if sl and entry_price:
+            # % from entry — always meaningful regardless of testnet price discrepancy
+            pct_to_sl = (float(sl) - float(entry_price)) / float(entry_price) * 100
+        if tp1 and entry_price:
+            pct_to_tp = (float(tp1) - float(entry_price)) / float(entry_price) * 100
 
     ot_str = ""
     if open_time:
@@ -747,8 +748,10 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             dist_str = f"{pct_to_fill:+.2f}%" if pct_to_fill is not None else ""
             dist_color = "#2ca02c" if (pct_to_fill or 0) <= 0 else "#ff7f0e"
             st.markdown(
-                f"<div style='text-align:center;padding:4px;background:#f8f9fa;border-radius:6px'>"
-                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Current</div>"
+                f"<div style='text-align:center;padding:4px;border-radius:6px;"
+                f"border:1px solid rgba(128,128,128,0.25)'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;"
+                f"letter-spacing:0.05em'>Current</div>"
                 f"<div style='font-size:1.05em;font-weight:700;font-family:monospace'>{cur_str}</div>"
                 f"{'<div style=\"font-size:0.78em;color:' + dist_color + '\">' + dist_str + ' to fill</div>' if dist_str else ''}"
                 f"</div>",
@@ -861,10 +864,10 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
             unreal_pnl = float(qty) * (current_price - float(ref_price)) * mult
         if entry_status in ("NEW", "PARTIALLY_FILLED") and entry_price:
             pct_to_fill = (float(entry_price) - current_price) / current_price * 100
-        if sl:
-            pct_to_sl = (float(sl) - current_price) / current_price * 100
-        if tp1:
-            pct_to_tp = (float(tp1) - current_price) / current_price * 100
+        if sl and entry_price:
+            pct_to_sl = (float(sl) - float(entry_price)) / float(entry_price) * 100
+        if tp1 and entry_price:
+            pct_to_tp = (float(tp1) - float(entry_price)) / float(entry_price) * 100
         if liq_price:
             pct_to_liq = (float(liq_price) - current_price) / current_price * 100
 
@@ -960,7 +963,8 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 dist_str   = ""
                 dist_color = "#888"
             st.markdown(
-                f"<div style='text-align:center;padding:4px;background:#f8f9fa;border-radius:6px'>"
+                f"<div style='text-align:center;padding:4px;border-radius:6px;"
+                f"border:1px solid rgba(128,128,128,0.25)'>"
                 f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Current</div>"
                 f"<div style='font-size:1.05em;font-weight:700;font-family:monospace'>{cur_str}</div>"
                 f"{'<div style=\"font-size:0.78em;color:' + dist_color + '\">' + dist_str + '</div>' if dist_str else ''}"
