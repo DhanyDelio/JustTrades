@@ -1391,45 +1391,86 @@ def check_futures_positions(client, verbose: bool = False) -> None:
 
         def _cancel_all_open_algo_orders_for_sym(symbol: str) -> list:
             """
-            Query ALL open algo orders for a symbol and cancel every one of them.
+            Cancel ALL open exit-related orders for a symbol using two separate
+            endpoints, because they cover different order populations:
 
-            This is the safe cleanup path used both when price-guard resolves a
-            position AND when a TP/SL hit cancels the counterpart order. Using
-            a symbol-scoped query (not just the recorded algoId) ensures that
-            ghost/duplicate orders from previous placement retries are also
-            cleaned up — not just the last known ID.
+            1. /fapi/v1/openAlgoOrders — algo/conditional orders placed via
+               futures_create_algo_order() (TAKE_PROFIT_MARKET, STOP_MARKET).
+               BUG: the `symbol` filter is silently ignored by testnet — passing
+               symbol=X returns [] even when orders exist for that symbol.
+               FIX: query WITHOUT symbol filter (returns all symbols), then
+               filter client-side by symbol before canceling.
 
-            Returns list of successfully canceled algoIds.
+            2. /fapi/v1/openOrders — regular limit/stop orders placed via
+               futures_create_order(). These also appear in the web UI
+               "Conditional" tab and must be canceled separately.
+               The symbol= filter works correctly for this endpoint.
+
+            Returns list of successfully canceled IDs.
             """
             canceled = []
+
+            # ── Path 1: algo orders (symbol filter broken — query all, filter client-side) ──
             try:
-                open_algos = client.futures_get_open_algo_orders(symbol=symbol)
-                if isinstance(open_algos, dict):
-                    open_algos = open_algos.get("orders", [])
-                for _ao in (open_algos or []):
+                # Do NOT pass symbol= — testnet silently ignores it and returns []
+                all_algos = client.futures_get_open_algo_orders()
+                if isinstance(all_algos, dict):
+                    all_algos = all_algos.get("orders", [])
+                sym_algos = [o for o in (all_algos or [])
+                             if o.get("symbol") == symbol]
+                for _ao in sym_algos:
                     _aid = _ao.get("algoId") or _ao.get("orderId")
                     if not _aid:
                         continue
                     try:
                         client.futures_cancel_algo_order(symbol=symbol, algoId=_aid)
-                        canceled.append(_aid)
+                        canceled.append(f"algo:{_aid}")
                     except Exception as _ce:
                         print(f"  ⚠  [{symbol}] Could not cancel algo order #{_aid}: {_ce}")
-                if canceled:
-                    print(f"  🧹 [{symbol}] Canceled {len(canceled)} open algo order(s): {canceled}")
-                elif open_algos is not None:
-                    print(f"  ℹ  [{symbol}] No open algo orders found to cancel.")
+                if sym_algos:
+                    print(f"  🧹 [{symbol}] Canceled {len([c for c in canceled if c.startswith('algo:')])} "
+                          f"algo order(s) from /openAlgoOrders")
             except Exception as _qe:
-                print(f"  ⚠  [{symbol}] Could not query open algo orders: {_qe}")
-                print(f"      Falling back to canceling recorded IDs only.")
-                # Fallback: cancel only the two recorded IDs
+                print(f"  ⚠  [{symbol}] /openAlgoOrders query failed: {_qe}")
+                # Fallback: cancel recorded IDs directly
                 for _aid in [tp_algo_id, sl_algo_id]:
                     if _aid:
                         try:
                             client.futures_cancel_algo_order(symbol=symbol, algoId=_aid)
-                            canceled.append(_aid)
+                            canceled.append(f"algo:{_aid}")
                         except Exception:
                             pass
+
+            # ── Path 2: regular open orders for this symbol ───────────────────
+            # Catches any TAKE_PROFIT_MARKET / STOP_MARKET placed via
+            # futures_create_order() (the old code path) that are reduceOnly.
+            try:
+                open_regular = client.futures_get_open_orders(symbol=symbol)
+                if isinstance(open_regular, dict):
+                    open_regular = open_regular.get("orders", [])
+                exit_types = {"TAKE_PROFIT_MARKET", "STOP_MARKET",
+                              "TAKE_PROFIT", "STOP"}
+                reduce_exits = [o for o in (open_regular or [])
+                                if o.get("type") in exit_types
+                                and o.get("reduceOnly")]
+                for _ro in reduce_exits:
+                    _oid = _ro.get("orderId")
+                    if not _oid:
+                        continue
+                    try:
+                        client.futures_cancel_order(symbol=symbol, orderId=_oid)
+                        canceled.append(f"order:{_oid}")
+                    except Exception as _ce:
+                        print(f"  ⚠  [{symbol}] Could not cancel regular order #{_oid}: {_ce}")
+                if reduce_exits:
+                    print(f"  🧹 [{symbol}] Canceled {len([c for c in canceled if c.startswith('order:')])} "
+                          f"regular exit order(s) from /openOrders")
+            except Exception as _qe2:
+                print(f"  ⚠  [{symbol}] /openOrders query failed: {_qe2}")
+
+            if not canceled:
+                print(f"  ℹ  [{symbol}] No open exit orders found to cancel.")
+
             return canceled
 
         if trade.get("exit_orders_placed") and (tp_id or sl_id):
