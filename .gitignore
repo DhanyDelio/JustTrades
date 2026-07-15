@@ -1,0 +1,43 @@
+# ── Secrets — JANGAN PERNAH commit ──────────────────────────────────────────
+.env
+
+# ── Trade logs (data sensitif, disimpan di Supabase) ─────────────────────────
+trade_log.json
+trade_log.json.backup
+trade_futures.json
+trade_futures.json.backup
+trade_log_*_clean.json
+
+# ── Data cache (bisa di-download ulang dari Binance Archive) ──────────────────
+data_cache/
+
+# ── Charts (generated, tidak perlu di-track) ─────────────────────────────────
+charts/
+
+# ── Python artifacts ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+position_listener.pid
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+*.swo

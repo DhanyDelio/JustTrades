@@ -1,0 +1,21 @@
+# Core trading
+pandas
+numpy
+scikit-learn
+python-binance
+python-dotenv
+requests
+
+# Chart analysis
+mplfinance
+matplotlib
+
+# Dashboard
+streamlit
+plotly
+
+# Cloud persistence
+supabase
+
+# Listener (optional, kept for --test-notify)
+websocket-client
