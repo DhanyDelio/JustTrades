@@ -1389,6 +1389,49 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                       f"({label} algoId={effective_id}): {e}")
                 return None, None, None
 
+        def _cancel_all_open_algo_orders_for_sym(symbol: str) -> list:
+            """
+            Query ALL open algo orders for a symbol and cancel every one of them.
+
+            This is the safe cleanup path used both when price-guard resolves a
+            position AND when a TP/SL hit cancels the counterpart order. Using
+            a symbol-scoped query (not just the recorded algoId) ensures that
+            ghost/duplicate orders from previous placement retries are also
+            cleaned up — not just the last known ID.
+
+            Returns list of successfully canceled algoIds.
+            """
+            canceled = []
+            try:
+                open_algos = client.futures_get_open_algo_orders(symbol=symbol)
+                if isinstance(open_algos, dict):
+                    open_algos = open_algos.get("orders", [])
+                for _ao in (open_algos or []):
+                    _aid = _ao.get("algoId") or _ao.get("orderId")
+                    if not _aid:
+                        continue
+                    try:
+                        client.futures_cancel_algo_order(symbol=symbol, algoId=_aid)
+                        canceled.append(_aid)
+                    except Exception as _ce:
+                        print(f"  ⚠  [{symbol}] Could not cancel algo order #{_aid}: {_ce}")
+                if canceled:
+                    print(f"  🧹 [{symbol}] Canceled {len(canceled)} open algo order(s): {canceled}")
+                elif open_algos is not None:
+                    print(f"  ℹ  [{symbol}] No open algo orders found to cancel.")
+            except Exception as _qe:
+                print(f"  ⚠  [{symbol}] Could not query open algo orders: {_qe}")
+                print(f"      Falling back to canceling recorded IDs only.")
+                # Fallback: cancel only the two recorded IDs
+                for _aid in [tp_algo_id, sl_algo_id]:
+                    if _aid:
+                        try:
+                            client.futures_cancel_algo_order(symbol=symbol, algoId=_aid)
+                            canceled.append(_aid)
+                        except Exception:
+                            pass
+            return canceled
+
         if trade.get("exit_orders_placed") and (tp_id or sl_id):
             exit_status_found     = None
             exit_price_found      = None
@@ -1434,18 +1477,9 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                         trade["exit_time"] - int(trade["entry_fill_time"])
                     ) // 1000
 
-                # Cancel the surviving exit order to prevent ghost position
-                surviving_algo_id = sl_algo_id if exit_status_found == "TP_HIT" else tp_algo_id
-                surviving_type    = "SL"        if exit_status_found == "TP_HIT" else "TP"
-                if surviving_algo_id:
-                    try:
-                        client.futures_cancel_algo_order(symbol=sym, algoId=surviving_algo_id)
-                        print(f"  ✅ {sym} — {surviving_type} algo order #{surviving_algo_id} canceled (counterpart)")
-                    except Exception as cancel_err:
-                        print(f"  ⚠  {sym} — Could not cancel {surviving_type} algo order "
-                              f"#{surviving_algo_id}: {cancel_err}")
-                        print(f"      Manual action required at testnet.binancefuture.com "
-                              f"to avoid ghost position")
+                # Cancel ALL open algo orders for this symbol (counterpart +
+                # any ghost/duplicate orders from previous placement retries)
+                _cancel_all_open_algo_orders_for_sym(sym)
 
                 # MAE/MFE reconstruction (Opsi B)
                 if trade.get("entry_fill_time") and trade["exit_time"]:
@@ -1501,13 +1535,11 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                 trade["realized_pnl_pct"]  = round(pnl_pct, 2)
                 if trade.get("entry_fill_time"):
                     trade["time_in_position_sec"] = (exit_time_ms - int(trade["entry_fill_time"])) // 1000
-                # Attempt to cancel any lingering exit algo orders
-                for _aid in [tp_algo_id, sl_algo_id]:
-                    if _aid:
-                        try:
-                            client.futures_cancel_algo_order(symbol=sym, algoId=_aid)
-                        except Exception:
-                            pass
+                # Cancel ALL open algo orders for this symbol — not just the
+                # ones recorded in tp_algo_id/sl_algo_id. Previous placement
+                # retries may have created ghost/duplicate orders that were never
+                # tracked. Querying open orders by symbol catches all of them.
+                _cancel_all_open_algo_orders_for_sym(sym)
                 log_dirty = True
                 resolved_this_run.append((sym, "SL_HIT", pnl_usd, side))
                 _send_telegram(
