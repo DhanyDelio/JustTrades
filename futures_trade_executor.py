@@ -727,10 +727,6 @@ def log_futures_trade(order: dict, cand: dict,
         "realized_pnl_pct":    None,
         "time_in_position_sec": None,
 
-        # ── ML scoring (observation only — not used for decisions) ───
-        "ml_score":              cand.get("ml_score"),
-        "ml_model_version":      cand.get("ml_model_version"),
-
         # ── ML features ───────────────────────────────────────────────
         "max_adverse_excursion_pct":       None,
         "max_favorable_excursion_pct":     None,
@@ -1898,14 +1894,6 @@ def print_futures_proposal(cand: dict) -> None:
         for w in sz["warnings"]:
             print(f"  ║  ⚠  {w:<{W-5}}║")
 
-    # ML Score (observation only — does not influence decisions)
-    if cand.get("ml_score") is not None:
-        ms  = cand["ml_score"]
-        mv  = cand.get("ml_model_version", "v1")
-        ml_str = f"{ms:.2f}  (observation only — not used for decisions)"
-        print(f"  ╠{'═'*W}╣")
-        print(f"  ║  {'ML Score ('+mv+')':<22} {ml_str:<{W-24}}║")
-
     print(f"  ╚{'═'*W}╝")
 
 
@@ -2089,15 +2077,6 @@ def cmd_propose_futures(
         print("❌ No candidate passed constraints.")
         sys.exit(0)
 
-    # ML scoring — observation only, does not affect decision
-    try:
-        from ml.ml_scorer import compute_ml_score
-        ml_result = compute_ml_score(best)
-        best["ml_score"]         = ml_result["ml_score"]
-        best["ml_model_version"] = ml_result["ml_model_version"]
-    except Exception:
-        best["ml_score"] = None
-
     print_futures_proposal(best)
 
     print("\n" + "─" * 70)
@@ -2233,34 +2212,21 @@ def cmd_propose_multi_futures(
         print("\n❌ No candidates passed exchange constraints.")
         sys.exit(0)
 
-    # ML scoring — observation only, does not affect decision
-    try:
-        from ml.ml_scorer import compute_ml_score
-        for _cand in selected:
-            _ml = compute_ml_score(_cand)
-            _cand["ml_score"]         = _ml["ml_score"]
-            _cand["ml_model_version"] = _ml["ml_model_version"]
-    except Exception:
-        for _cand in selected:
-            _cand.setdefault("ml_score", None)
-
     # ── Display batch summary table ──────────────────────────────────────
     cluster_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     print(f"\n  Batch proposal  [{len(selected)} trade(s)]  cluster: {cluster_id}")
     print(f"  {'#':<3} {'Symbol':<12} {'Side':<6} {'Entry':>12} {'SL':>10} "
-          f"{'TP1':>10} {'R:R':>5} {'Risk%':>6} {'Liq%':>6}  {'ML':>5}  Regime")
-    print(f"  {'─'*87}")
+          f"{'TP1':>10} {'R:R':>5} {'Risk%':>6} {'Liq%':>6}  Regime")
+    print(f"  {'─'*80}")
     for i, c in enumerate(selected, 1):
-        liq    = c["liquidation"]
-        ml_str = f"{c['ml_score']:.2f}" if c.get("ml_score") is not None else "  n/a"
+        liq = c["liquidation"]
         print(f"  {i:<3} {c['symbol']:<12} {c['position_side']:<6} "
               f"{ca._fmt_price(c['entry_price']).strip():>12} "
               f"{ca._fmt_price(c['sl']).strip():>10} "
               f"{ca._fmt_price(c['tp1']).strip():>10} "
               f"{c['rr']:>5.1f} {c['risk_pct']:>5.2f}% "
               f"{liq['distance_to_liquidation_pct']:>5.1f}%  "
-              f"{ml_str:>5}  "
               f"{c.get('volatility_regime','?')}")
 
     if skipped_syms:
