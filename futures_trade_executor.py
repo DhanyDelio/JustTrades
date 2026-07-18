@@ -73,9 +73,8 @@ MIN_RR: float = 1.5
 DEFAULT_SCAN_N: int = 100   # raised from 30 — throttle handles rate limiting
 
 # Tiered scanning constants (mirrors spot's gather_all_candidates pattern)
-FUTURES_PART_SIZE: int = 25          # symbols per scan part
-FUTURES_MAX_PARTS: int = 4           # 4 × 25 = 100 symbols max
-FUTURES_MIN_CANDIDATES: int = 5      # stop early if enough found
+FUTURES_PART_SIZE: int = 25   # symbols per scan part
+FUTURES_MAX_PARTS: int = 4    # 4 × 25 = 100 symbols — always scan all parts
 
 # Trade log — completely separate from spot's trade_log.json
 FUTURES_LOG_PATH = Path("./trade_futures.json")
@@ -849,11 +848,6 @@ def gather_futures_candidates(scan_n: int = DEFAULT_SCAN_N) -> list[dict]:
         all_candidates.extend(part_candidates)
         print(f"  [Futures Part {part}] {len(part_candidates)} candidate(s) found  "
               f"(cumulative: {len(all_candidates)})")
-
-        if len(all_candidates) >= FUTURES_MIN_CANDIDATES:
-            print(f"  ✅ {len(all_candidates)} ≥ target {FUTURES_MIN_CANDIDATES} "
-                  f"— stopping scan early.")
-            break
 
     all_candidates.sort(key=lambda c: (c["risk_pct"], -c["rr"]))
     print(f"\nFound {len(all_candidates)} futures candidates (LONG+SHORT combined).")

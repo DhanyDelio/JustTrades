@@ -69,7 +69,7 @@ DEFAULT_SCAN_N: int = 30
 # Part 1 = rank 1–30, Part 2 = 31–60, Part 3 = 61–90, Part 4 = 91–120
 PART_SIZE: int = 30
 MAX_PARTS: int = 4                  # 4 × 30 = 120 symbols scanned max
-MIN_DESIRED_CANDIDATES: int = 5     # stop early if enough candidates found
+MIN_DESIRED_CANDIDATES: int = 5     # kept for reference, no longer stops scan early
 SCAN_PART_DELAY_SEC: float = 2.0    # courtesy sleep between parts (throttle handles the rest)
 # Binance Spot rate limit: 6000 weight/min. Ceiling = 80% = 4800.
 # Each analyze_symbol call uses ~2–5 weight units (ticker + klines).
@@ -1923,13 +1923,8 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
         print(f"  [Part {part}] Raw candidates found this part: {len(part_raw)}  "
               f"(cumulative raw: {len(all_raw)})")
 
-        if len(all_raw) >= MIN_DESIRED_CANDIDATES:
-            print(f"  [Part {part}] ✅ {len(all_raw)} candidates ≥ target {MIN_DESIRED_CANDIDATES} "
-                  f"— stopping scan.")
-            break
-        elif part < MAX_PARTS:
-            print(f"  [Part {part}] Only {len(all_raw)} candidates < target {MIN_DESIRED_CANDIDATES} "
-                  f"— proceeding to Part {part+1}...")
+        if part < MAX_PARTS:
+            print(f"  [Part {part}] Continuing to Part {part+1}...")
 
     # ── Sort + score ───────────────────────────────────────────────────────
     all_raw.sort(key=lambda c: (c["risk_pct"], -c["rr"]))
