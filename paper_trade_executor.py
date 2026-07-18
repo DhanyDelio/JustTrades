@@ -66,14 +66,14 @@ DEFAULT_MIN_NOTIONAL: float = 5.0
 DEFAULT_SCAN_N: int = 30
 
 # Tiered / paginated scanning for --propose-all
-# Part 1 = rank 1–30, Part 2 = 31–60, Part 3 = 61–90 (if MAX_PARTS=3)
+# Part 1 = rank 1–30, Part 2 = 31–60, Part 3 = 61–90, Part 4 = 91–120
 PART_SIZE: int = 30
-MAX_PARTS: int = 3
-MIN_DESIRED_CANDIDATES: int = 5   # proceed to next part if fewer than this found
-SCAN_PART_DELAY_SEC: float = 8.0  # delay between parts to respect rate limits
-# Binance public API weight limit is 6000/min; each ticker/24hr call = 40 weight.
-# If used weight after a part is above this threshold, skip deeper scanning.
-RATE_LIMIT_WEIGHT_CEILING: int = 800   # conservative ceiling out of 6000
+MAX_PARTS: int = 4                  # 4 × 30 = 120 symbols scanned max
+MIN_DESIRED_CANDIDATES: int = 5     # stop early if enough candidates found
+SCAN_PART_DELAY_SEC: float = 2.0    # courtesy sleep between parts (throttle handles the rest)
+# Binance Spot rate limit: 6000 weight/min. Ceiling = 80% = 4800.
+# Each analyze_symbol call uses ~2–5 weight units (ticker + klines).
+RATE_LIMIT_WEIGHT_CEILING: int = 4800
 
 # Trade log file
 TRADE_LOG_PATH = Path("./trade_log.json")
@@ -723,6 +723,14 @@ def print_proposal(cand: dict) -> None:
         print(f"  ║  {'Scores':<20} {score_str:<{W-22}}║")
         print(f"  ║  {'  (weights)':<20} {'Risk×0.5  Zone×0.3  R:R×0.2':<{W-22}}║")
 
+    # ML Score (observation only — does not influence decisions)
+    if cand.get("ml_score") is not None:
+        print(f"  ╠{'═'*W}╣")
+        ms  = cand["ml_score"]
+        mv  = cand.get("ml_model_version", "v1")
+        ml_str = f"{ms:.2f}  (observation only — not used for decisions)"
+        print(f"  ║  {'ML Score ('+mv+')':<20} {ml_str:<{W-22}}║")
+
     print(f"  ╚{'═'*W}╝")
 
     bud = cand.get("budget_for_slot", BUDGET_USD)
@@ -884,6 +892,10 @@ def log_trade(order: dict, cand: dict,
         "exit_time":         None,
         "realized_pnl_usd":  None,
         "realized_pnl_pct":  None,
+
+        # ── ML scoring (observation only) ─────────────────────────────
+        "ml_score":          cand.get("ml_score"),
+        "ml_model_version":  cand.get("ml_model_version"),
 
         # ── Raw ───────────────────────────────────────────────────────
         "raw_entry_order":   order,
@@ -1700,6 +1712,12 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
         print(f"   Slot budget ${budget_for_slot:.2f} may be too small for min notional.")
         sys.exit(0)
 
+    # ── Compute ML score (observation only — does not affect decisions) ─
+    from ml.ml_scorer import compute_ml_score
+    ml_result = compute_ml_score(best)
+    best["ml_score"] = ml_result["ml_score"]
+    best["ml_model_version"] = ml_result["ml_model_version"]
+
     # ── Display proposal ──────────────────────────────────────────────
     print_proposal(best)
 
@@ -1791,20 +1809,12 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
 
     open_symbols = open_symbols or set()
 
+    from binance_throttle import SpotThrottle
+    _throttle = SpotThrottle()
+
     def _get_used_weight() -> int:
-        """Fetch current used request weight from Binance public API headers."""
-        try:
-            resp = _req.get(
-                "https://api.binance.com/api/v3/time",
-                timeout=5,
-            )
-            weight = resp.headers.get(
-                "x-mbx-used-weight-1m",
-                resp.headers.get("x-mbx-used-weight", "0")
-            )
-            return int(weight)
-        except Exception:
-            return 0
+        """Fetch current used-weight from Binance Spot API headers (1 weight unit)."""
+        return _throttle.fetch_used_weight()
 
     def _scan_part(symbols: list[str], part_num: int) -> list[dict]:
         """Scan a list of symbols and return raw valid candidate dicts."""
@@ -1898,13 +1908,13 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
         # Rate-limit check before each part (except part 1)
         if part > 1:
             weight = _get_used_weight()
-            print(f"  [Rate limit] Used weight before Part {part}: {weight} / 6000")
+            print(f"  [Rate limit/Spot] Used weight before Part {part}: {weight} / {_throttle._limit}")
             if weight >= RATE_LIMIT_WEIGHT_CEILING:
-                print(f"  [Rate limit] ⚠  Weight {weight} ≥ ceiling {RATE_LIMIT_WEIGHT_CEILING} "
+                print(f"  [Rate limit/Spot] ⚠  Weight {weight} ≥ ceiling {RATE_LIMIT_WEIGHT_CEILING} "
                       f"— skipping Part {part}+ to avoid ban.")
                 break
-            print(f"  [Rate limit] Weight safe — proceeding. Waiting {SCAN_PART_DELAY_SEC:.0f}s...")
-            _time.sleep(SCAN_PART_DELAY_SEC)
+            _throttle.check_weight(weight)
+            _throttle.between_parts_sleep()
 
         part_raw = _scan_part(part_syms, part)
         all_raw.extend(part_raw)
@@ -2099,12 +2109,19 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
         return
 
     placed, failed = 0, 0
+    from ml.ml_scorer import compute_ml_score
     for cand in candidates:
         try:
+            # ML score (observation only — does not affect decisions)
+            ml_result = compute_ml_score(cand)
+            cand["ml_score"] = ml_result["ml_score"]
+            cand["ml_model_version"] = ml_result["ml_model_version"]
+
             order = place_limit_order(client, cand)
             log_trade(order, cand, correlation_cluster_id=cluster_id)
+            ml_tag = f"  ml={cand['ml_score']:.2f}" if cand.get('ml_score') is not None else ""
             print(f"  ✅ {cand['symbol']:<12} order #{order.get('orderId')}  "
-                  f"price={order.get('price')}")
+                  f"price={order.get('price')}{ml_tag}")
             placed += 1
         except Exception as e:
             print(f"  ❌ {cand['symbol']:<12} FAILED: {e}")

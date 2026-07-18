@@ -70,7 +70,12 @@ TAKER_FEE_PCT: float = 0.0004  # 0.04% taker
 MIN_RR: float = 1.5
 
 # How many symbols to scan
-DEFAULT_SCAN_N: int = 30
+DEFAULT_SCAN_N: int = 100   # raised from 30 — throttle handles rate limiting
+
+# Tiered scanning constants (mirrors spot's gather_all_candidates pattern)
+FUTURES_PART_SIZE: int = 25          # symbols per scan part
+FUTURES_MAX_PARTS: int = 4           # 4 × 25 = 100 symbols max
+FUTURES_MIN_CANDIDATES: int = 5      # stop early if enough found
 
 # Trade log — completely separate from spot's trade_log.json
 FUTURES_LOG_PATH = Path("./trade_futures.json")
@@ -722,6 +727,10 @@ def log_futures_trade(order: dict, cand: dict,
         "realized_pnl_pct":    None,
         "time_in_position_sec": None,
 
+        # ── ML scoring (observation only — not used for decisions) ───
+        "ml_score":              cand.get("ml_score"),
+        "ml_model_version":      cand.get("ml_model_version"),
+
         # ── ML features ───────────────────────────────────────────────
         "max_adverse_excursion_pct":       None,
         "max_favorable_excursion_pct":     None,
@@ -743,73 +752,116 @@ def log_futures_trade(order: dict, cand: dict,
 
 def gather_futures_candidates(scan_n: int = DEFAULT_SCAN_N) -> list[dict]:
     """
-    Scan top scan_n symbols. For futures, evaluate BOTH long and short setups.
+    Tiered scan for futures candidates — evaluates BOTH long and short setups.
+
+    Scans up to scan_n symbols in parts of FUTURES_PART_SIZE each.
+    After each part, reads the X-MBX-Used-Weight-1M header from a lightweight
+    futures API call and pauses if usage is approaching the 2400/min limit.
+    Stops early once FUTURES_MIN_CANDIDATES are found.
+
     Returns candidates sorted by risk% ASC.
     """
-    print(f"\nScanning top {scan_n} symbols for futures setups (LONG + SHORT)...")
-    symbols = ca.get_top_symbols_by_volume(scan_n)
-    print(f"Symbols: {symbols}\n")
+    import time as _time
+    from binance_throttle import FuturesThrottle
 
-    candidates: list[dict] = []
+    _throttle  = FuturesThrottle()
+    total_syms = ca.get_top_symbols_by_volume(scan_n)
+    n_parts    = max(1, (len(total_syms) + FUTURES_PART_SIZE - 1) // FUTURES_PART_SIZE)
+    n_parts    = min(n_parts, FUTURES_MAX_PARTS)
 
-    for sym in symbols:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            result = ca.analyze_symbol(sym, save_chart=False)
-        if result is None:
-            continue
+    print(f"\nScanning top {len(total_syms)} symbols for futures setups "
+          f"({n_parts} part(s) × {FUTURES_PART_SIZE}) ...")
 
-        current_price = result["current_price"]
-        atr           = result["atr"]
-        atr_pct       = result["atr_pct"]
+    all_candidates: list[dict] = []
 
-        for direction in ("long", "short"):
-            setup = result["sl_tp"].get(direction, {})
+    for part in range(1, n_parts + 1):
+        start_idx = (part - 1) * FUTURES_PART_SIZE
+        end_idx   = start_idx + FUTURES_PART_SIZE
+        part_syms = total_syms[start_idx:end_idx]
+        if not part_syms:
+            break
 
-            if not setup.get("rr_clears"):
+        print(f"\n  ── Futures Part {part}: rank {start_idx+1}–{end_idx} "
+              f"({len(part_syms)} symbols) ──")
+
+        # Rate-limit check between parts
+        if part > 1:
+            weight = _throttle.fetch_used_weight()
+            print(f"  [Rate limit/Futures] Used weight before Part {part}: "
+                  f"{weight} / {_throttle._limit}")
+            if weight >= int(_throttle._limit * 0.80):
+                print(f"  [Rate limit/Futures] ⚠  Ceiling reached — stopping scan.")
+                break
+            _throttle.between_parts_sleep()
+
+        part_candidates: list[dict] = []
+
+        for sym in part_syms:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                result = ca.analyze_symbol(sym, save_chart=False)
+            if result is None:
                 continue
-            if setup.get("no_tp_in_range"):
-                continue
-            if setup.get("tier_used") not in ("T1", "T2"):
-                continue
 
-            sl      = setup.get("sl")
-            tp_list = setup.get("tp", [])
-            tp1     = tp_list[0] if tp_list else None
-            tp2     = tp_list[1] if len(tp_list) > 1 else None
-            rr      = setup.get("rr")
-            risk_pct = setup.get("risk_pct")
+            current_price = result["current_price"]
+            atr           = result["atr"]
+            atr_pct       = result["atr_pct"]
 
-            if not sl or not tp1 or not rr or not risk_pct:
-                continue
+            for direction in ("long", "short"):
+                setup = result["sl_tp"].get(direction, {})
 
-            # Safety check for direction consistency
-            if direction == "long" and not (sl < current_price < tp1):
-                continue
-            if direction == "short" and not (tp1 < current_price < sl):
-                continue
+                if not setup.get("rr_clears"):
+                    continue
+                if setup.get("no_tp_in_range"):
+                    continue
+                if setup.get("tier_used") not in ("T1", "T2"):
+                    continue
 
-            candidates.append({
-                "symbol":        sym,
-                "direction":     direction,
-                "position_side": "LONG" if direction == "long" else "SHORT",
-                "current_price": current_price,
-                "entry_price":   current_price,   # refined in pick_best
-                "sl":            sl,
-                "tp1":           tp1,
-                "tp2":           tp2,
-                "rr":            rr,
-                "risk_pct":      risk_pct,
-                "atr":           atr,
-                "atr_pct":       atr_pct,
-                "tier_used":     setup.get("tier_used", "T1"),
-                "support_zones":    result.get("support_zones", []),
-                "resistance_zones": result.get("resistance_zones", []),
-            })
+                sl       = setup.get("sl")
+                tp_list  = setup.get("tp", [])
+                tp1      = tp_list[0] if tp_list else None
+                tp2      = tp_list[1] if len(tp_list) > 1 else None
+                rr       = setup.get("rr")
+                risk_pct = setup.get("risk_pct")
 
-    candidates.sort(key=lambda c: (c["risk_pct"], -c["rr"]))
-    print(f"Found {len(candidates)} futures candidates (LONG+SHORT combined).")
-    return candidates
+                if not sl or not tp1 or not rr or not risk_pct:
+                    continue
+
+                if direction == "long"  and not (sl < current_price < tp1):
+                    continue
+                if direction == "short" and not (tp1 < current_price < sl):
+                    continue
+
+                part_candidates.append({
+                    "symbol":        sym,
+                    "direction":     direction,
+                    "position_side": "LONG" if direction == "long" else "SHORT",
+                    "current_price": current_price,
+                    "entry_price":   current_price,
+                    "sl":            sl,
+                    "tp1":           tp1,
+                    "tp2":           tp2,
+                    "rr":            rr,
+                    "risk_pct":      risk_pct,
+                    "atr":           atr,
+                    "atr_pct":       atr_pct,
+                    "tier_used":     setup.get("tier_used", "T1"),
+                    "support_zones":    result.get("support_zones", []),
+                    "resistance_zones": result.get("resistance_zones", []),
+                })
+
+        all_candidates.extend(part_candidates)
+        print(f"  [Futures Part {part}] {len(part_candidates)} candidate(s) found  "
+              f"(cumulative: {len(all_candidates)})")
+
+        if len(all_candidates) >= FUTURES_MIN_CANDIDATES:
+            print(f"  ✅ {len(all_candidates)} ≥ target {FUTURES_MIN_CANDIDATES} "
+                  f"— stopping scan early.")
+            break
+
+    all_candidates.sort(key=lambda c: (c["risk_pct"], -c["rr"]))
+    print(f"\nFound {len(all_candidates)} futures candidates (LONG+SHORT combined).")
+    return all_candidates
 
 
 def pick_best_futures_candidate(
@@ -1491,7 +1543,7 @@ def check_futures_positions(client, verbose: bool = False) -> None:
 
             return canceled
 
-        if trade.get("exit_orders_placed") and (tp_id or sl_id):
+        if trade.get("exit_orders_placed") and (tp_id or sl_id or tp_algo_id or sl_algo_id):
             exit_status_found     = None
             exit_price_found      = None
             exit_time_from_exchange = None
@@ -1500,10 +1552,10 @@ def check_futures_positions(client, verbose: bool = False) -> None:
                 (tp_id, tp_algo_id, "TP"),
                 (sl_id, sl_algo_id, "SL"),
             ]:
-                if not order_id:
+                if not order_id and not algo_id:
                     continue
                 status, ep, upd_time = _query_exit_order(order_id, algo_id, order_type)
-                if status in ("FILLED", "EXECUTED", "COMPLETED"):
+                if status in ("FILLED", "EXECUTED", "COMPLETED", "FINISHED"):
                     exit_status_found       = "TP_HIT" if order_type == "TP" else "SL_HIT"
                     exit_price_found        = ep or float(trade.get("tp1" if order_type=="TP" else "sl", 0))
                     exit_time_from_exchange = upd_time
@@ -1846,6 +1898,14 @@ def print_futures_proposal(cand: dict) -> None:
         for w in sz["warnings"]:
             print(f"  ║  ⚠  {w:<{W-5}}║")
 
+    # ML Score (observation only — does not influence decisions)
+    if cand.get("ml_score") is not None:
+        ms  = cand["ml_score"]
+        mv  = cand.get("ml_model_version", "v1")
+        ml_str = f"{ms:.2f}  (observation only — not used for decisions)"
+        print(f"  ╠{'═'*W}╣")
+        print(f"  ║  {'ML Score ('+mv+')':<22} {ml_str:<{W-24}}║")
+
     print(f"  ╚{'═'*W}╝")
 
 
@@ -2029,6 +2089,15 @@ def cmd_propose_futures(
         print("❌ No candidate passed constraints.")
         sys.exit(0)
 
+    # ML scoring — observation only, does not affect decision
+    try:
+        from ml.ml_scorer import compute_ml_score
+        ml_result = compute_ml_score(best)
+        best["ml_score"]         = ml_result["ml_score"]
+        best["ml_model_version"] = ml_result["ml_model_version"]
+    except Exception:
+        best["ml_score"] = None
+
     print_futures_proposal(best)
 
     print("\n" + "─" * 70)
@@ -2164,21 +2233,34 @@ def cmd_propose_multi_futures(
         print("\n❌ No candidates passed exchange constraints.")
         sys.exit(0)
 
+    # ML scoring — observation only, does not affect decision
+    try:
+        from ml.ml_scorer import compute_ml_score
+        for _cand in selected:
+            _ml = compute_ml_score(_cand)
+            _cand["ml_score"]         = _ml["ml_score"]
+            _cand["ml_model_version"] = _ml["ml_model_version"]
+    except Exception:
+        for _cand in selected:
+            _cand.setdefault("ml_score", None)
+
     # ── Display batch summary table ──────────────────────────────────────
     cluster_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     print(f"\n  Batch proposal  [{len(selected)} trade(s)]  cluster: {cluster_id}")
     print(f"  {'#':<3} {'Symbol':<12} {'Side':<6} {'Entry':>12} {'SL':>10} "
-          f"{'TP1':>10} {'R:R':>5} {'Risk%':>6} {'Liq%':>6}  Regime")
-    print(f"  {'─'*80}")
+          f"{'TP1':>10} {'R:R':>5} {'Risk%':>6} {'Liq%':>6}  {'ML':>5}  Regime")
+    print(f"  {'─'*87}")
     for i, c in enumerate(selected, 1):
-        liq = c["liquidation"]
+        liq    = c["liquidation"]
+        ml_str = f"{c['ml_score']:.2f}" if c.get("ml_score") is not None else "  n/a"
         print(f"  {i:<3} {c['symbol']:<12} {c['position_side']:<6} "
               f"{ca._fmt_price(c['entry_price']).strip():>12} "
               f"{ca._fmt_price(c['sl']).strip():>10} "
               f"{ca._fmt_price(c['tp1']).strip():>10} "
               f"{c['rr']:>5.1f} {c['risk_pct']:>5.2f}% "
               f"{liq['distance_to_liquidation_pct']:>5.1f}%  "
+              f"{ml_str:>5}  "
               f"{c.get('volatility_regime','?')}")
 
     if skipped_syms:
