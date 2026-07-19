@@ -723,13 +723,17 @@ def print_proposal(cand: dict) -> None:
         print(f"  ║  {'Scores':<20} {score_str:<{W-22}}║")
         print(f"  ║  {'  (weights)':<20} {'Risk×0.5  Zone×0.3  R:R×0.2':<{W-22}}║")
 
-    # ML Score (observation only — does not influence decisions)
-    if cand.get("ml_score") is not None:
+    # ML Score + scan rank (observation only — does not influence decisions)
+    if cand.get("ml_score") is not None or cand.get("symbol_rank") is not None:
         print(f"  ╠{'═'*W}╣")
-        ms  = cand["ml_score"]
-        mv  = cand.get("ml_model_version", "v1")
+    if cand.get("ml_score") is not None:
+        ms     = cand["ml_score"]
+        mv     = cand.get("ml_model_version", "v1")
         ml_str = f"{ms:.2f}  (observation only — not used for decisions)"
         print(f"  ║  {'ML Score ('+mv+')':<20} {ml_str:<{W-22}}║")
+    if cand.get("symbol_rank") is not None:
+        rank_str = f"#{cand['symbol_rank']}  (observation only)"
+        print(f"  ║  {'Symbol rank':<20} {rank_str:<{W-22}}║")
 
     print(f"  ╚{'═'*W}╝")
 
@@ -896,6 +900,9 @@ def log_trade(order: dict, cand: dict,
         # ── ML scoring (observation only) ─────────────────────────────
         "ml_score":          cand.get("ml_score"),
         "ml_model_version":  cand.get("ml_model_version"),
+
+        # ── Scan metadata (observation only) ──────────────────────────
+        "symbol_rank":       cand.get("symbol_rank"),   # rank from get_top_symbols_by_volume
 
         # ── Raw ───────────────────────────────────────────────────────
         "raw_entry_order":   order,
@@ -1816,11 +1823,13 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
         """Fetch current used-weight from Binance Spot API headers (1 weight unit)."""
         return _throttle.fetch_used_weight()
 
-    def _scan_part(symbols: list[str], part_num: int) -> list[dict]:
-        """Scan a list of symbols and return raw valid candidate dicts."""
+    def _scan_part(symbols: list[str], part_num: int, start_rank: int) -> list[dict]:
+        """Scan a list of symbols and return raw valid candidate dicts.
+        start_rank: 1-based rank of the first symbol in this batch."""
         raw: list[dict] = []
         skipped = 0
-        for sym in symbols:
+        for sym_idx, sym in enumerate(symbols):
+            sym_rank = start_rank + sym_idx   # 1-based rank from volume list
             if sym in open_symbols:
                 skipped += 1
                 continue
@@ -1883,6 +1892,7 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
                     "resistance_zones": result.get("resistance_zones", []),
                     "tier_used":        setup.get("tier_used", "T1"),
                     "scan_part":        part_num,
+                    "symbol_rank":      sym_rank,
                 })
         if skipped:
             print(f"  [Part {part_num}] Skipped {skipped} already-open symbol(s)")
@@ -1916,7 +1926,7 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
             _throttle.check_weight(weight)
             _throttle.between_parts_sleep()
 
-        part_raw = _scan_part(part_syms, part)
+        part_raw = _scan_part(part_syms, part, start_rank=start_idx + 1)
         all_raw.extend(part_raw)
 
         valid_so_far = len([c for c in all_raw])  # will be filtered below
@@ -2114,9 +2124,10 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
 
             order = place_limit_order(client, cand)
             log_trade(order, cand, correlation_cluster_id=cluster_id)
-            ml_tag = f"  ml={cand['ml_score']:.2f}" if cand.get('ml_score') is not None else ""
+            ml_tag   = f"  ml={cand['ml_score']:.2f}" if cand.get('ml_score') is not None else ""
+            rank_tag = f"  rank=#{cand['symbol_rank']}" if cand.get('symbol_rank') is not None else ""
             print(f"  ✅ {cand['symbol']:<12} order #{order.get('orderId')}  "
-                  f"price={order.get('price')}{ml_tag}")
+                  f"price={order.get('price')}{ml_tag}{rank_tag}")
             placed += 1
         except Exception as e:
             print(f"  ❌ {cand['symbol']:<12} FAILED: {e}")
