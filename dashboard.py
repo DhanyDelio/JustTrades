@@ -5,11 +5,17 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from pathlib import Path
+from streamlit_autorefresh import st_autorefresh
 
 from supabase_client import fetch_all_spot, fetch_all_futures
 
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
+
+# Auto-refresh every 5 minutes — keeps positions and prices current
+# without manual page reload. Count is shown in the Streamlit component
+# but hidden from view (limit=None = infinite refreshes).
+st_autorefresh(interval=300_000, limit=None, key="dashboard_autorefresh")
 
 
 STARTING_LAB_CAPITAL = 240.0

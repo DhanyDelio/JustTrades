@@ -13,6 +13,7 @@ matplotlib
 # Dashboard
 streamlit
 plotly
+streamlit-autorefresh
 
 # Cloud persistence
 supabase
