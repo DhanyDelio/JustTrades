@@ -10,7 +10,9 @@ Supports LONG and SHORT (futures allows both from USDT margin account).
 Zone detection logic reused from chart_analyzer.py — no duplication.
 
 Usage:
-    python3 futures_trade_executor.py --propose
+    python3 futures_trade_executor.py --propose           # batch: scan + place up to N positions
+    python3 futures_trade_executor.py --propose --count 3 # batch: up to 3 positions
+    python3 futures_trade_executor.py --propose --yes     # non-interactive (CI)
     python3 futures_trade_executor.py --check-positions
     python3 futures_trade_executor.py --stats-futures
 
@@ -2311,9 +2313,7 @@ def main() -> None:
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--propose",          action="store_true",
-                       help="Scan, pick best candidate, confirm & place")
-    group.add_argument("--propose-multi",    action="store_true",
-                       help="Batch: pick N candidates, single confirm, place all")
+                       help="Batch: scan, pick up to --count candidates, single confirm, place all")
     group.add_argument("--check-positions",  action="store_true",
                        help="Check open futures positions, place TP/SL if filled")
     group.add_argument("--stats-futures",    action="store_true",
@@ -2321,9 +2321,7 @@ def main() -> None:
 
     parser.add_argument("--scan-n",    type=int, default=DEFAULT_SCAN_N)
     parser.add_argument("--count",     type=int, default=2,
-                        help="--propose-multi: number of positions to open (default 2)")
-    parser.add_argument("--symbol",    type=str, default=None,
-                        help="Force a specific symbol")
+                        help="Number of positions to open in one batch (default 2)")
     parser.add_argument("--side",      type=str, default=None,
                         choices=["LONG", "SHORT"],
                         help="Filter by position side (LONG or SHORT)")
@@ -2334,13 +2332,6 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.propose:
-        cmd_propose_futures(
-            scan_n        = args.scan_n,
-            symbol_filter = args.symbol,
-            side_filter   = args.side,
-            auto_confirm  = args.yes,
-        )
-    elif args.propose_multi:
         cmd_propose_multi_futures(
             scan_n        = args.scan_n,
             count         = args.count,

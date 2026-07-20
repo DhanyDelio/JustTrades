@@ -66,7 +66,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 paper_trade_executor.py --propose-all --yes
 
-      - name: Futures propose-multi
+      - name: Futures propose
         continue-on-error: true
         env:
           BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
@@ -77,4 +77,4 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 futures_trade_executor.py --propose-multi --yes
+        run: python3 futures_trade_executor.py --propose --yes
