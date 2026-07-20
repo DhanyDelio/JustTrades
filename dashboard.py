@@ -1,5 +1,8 @@
 import math
 import os
+import pytz
+from datetime import datetime
+import streamlit.components.v1 as components
 
 import pandas as pd
 import plotly.express as px
@@ -12,10 +15,48 @@ from supabase_client import fetch_all_spot, fetch_all_futures
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
 
-# Auto-refresh every 5 minutes — keeps positions and prices current
-# without manual page reload. Count is shown in the Streamlit component
-# but hidden from view (limit=None = infinite refreshes).
-st_autorefresh(interval=300_000, limit=None, key="dashboard_autorefresh")
+# Auto-refresh every 1 hour (3_600_000 ms)
+refresh_count = st_autorefresh(interval=3600_000, limit=None, key="dashboard_autorefresh")
+
+if "last_refresh_count" not in st.session_state:
+    st.session_state.last_refresh_count = refresh_count
+
+if "auto_check_log" not in st.session_state:
+    st.session_state.auto_check_log = ""
+
+if refresh_count > st.session_state.last_refresh_count:
+    st.session_state.last_refresh_count = refresh_count
+    
+    if st.session_state.get("auto_check_enabled", False):
+        import subprocess, sys, os
+        from datetime import datetime
+        import pytz
+        
+        _env = {**os.environ}
+        _jobs = [
+            ("Spot",    "paper_trade_executor.py"),
+            ("Futures", "futures_trade_executor.py"),
+        ]
+        
+        success_count = 0
+        for _label, _script in _jobs:
+            try:
+                _proc = subprocess.run(
+                    [sys.executable, _script, "--check-positions"],
+                    capture_output=True, text=True, timeout=120,
+                    cwd=str(Path(__file__).parent),
+                    env=_env,
+                )
+                if _proc.returncode == 0:
+                    success_count += 1
+            except Exception:
+                pass
+                
+        now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+        if success_count == 2:
+            st.session_state.auto_check_log = f"✅ Last auto-check success at {now_str}"
+        else:
+            st.session_state.auto_check_log = f"⚠️ Last auto-check had errors at {now_str}"
 
 
 STARTING_LAB_CAPITAL = 240.0
@@ -1325,8 +1366,64 @@ def render_open_positions_tab(
 def main():
     st.title("Swing Trade Dashboard")
 
-    if st.button("🔄 Refresh data"):
-        st.rerun()
+
+
+    now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+
+    c_btn, c_toggle, c_info = st.columns([1.5, 2.5, 6])
+    with c_btn:
+        if st.button("🔄 Refresh data"):
+            st.rerun()
+
+    with c_toggle:
+        st.toggle("Auto Check Positions (1h)", key="auto_check_enabled")
+        if st.session_state.get("auto_check_log"):
+            st.caption(st.session_state.auto_check_log)
+
+    with c_info:
+        components.html(f"""
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
+                    display: flex; align-items: center; gap: 15px; color: #555; padding-top: 6px;">
+            <div style="font-size: 14px;">
+                <strong>Last refreshed:</strong> <span style="color: #111;">{now_str}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px; width: 220px;">
+                <span style="font-size: 13px; color: #777;">Next refresh:</span>
+                <span id="timer" style="font-family: monospace; font-weight: bold; font-size: 14px; width: 45px; color: #333;">60:00</span>
+                <div style="flex-grow: 1; height: 6px; background-color: #e0e0e0; border-radius: 3px; overflow: hidden;">
+                    <div id="bar" style="height: 100%; width: 100%; background-color: #2ca02c; transition: width 1s linear;"></div>
+                </div>
+            </div>
+        </div>
+        <script>
+            const duration = 3600;
+            const start = Date.now();
+            const timerEl = document.getElementById('timer');
+            const barEl = document.getElementById('bar');
+            
+            const interval = setInterval(() => {{
+                const elapsed = Math.floor((Date.now() - start) / 1000);
+                const remain = Math.max(0, duration - elapsed);
+                
+                const m = Math.floor(remain / 60);
+                const s = remain % 60;
+                timerEl.innerText = (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+                
+                const pct = (remain / duration) * 100;
+                barEl.style.width = pct + '%';
+                
+                if (remain < 60) {{
+                    barEl.style.backgroundColor = '#ff7f0e';
+                }}
+                
+                if (remain <= 0) {{
+                    clearInterval(interval);
+                }}
+            }}, 1000);
+        </script>
+        """, height=40)
+
+    st.write("")
 
     tab_spot, tab_futures, tab_open = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions"])
 
