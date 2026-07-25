@@ -604,5 +604,196 @@ class TestCheckPositions(unittest.TestCase):
         print(f"✓ oco_placed=True tercatat di Supabase.")
 
 
+# =============================================================================
+# TEST: log_trade() — Insert New Trade to Supabase
+# =============================================================================
+
+class TestLogTrade(unittest.TestCase):
+    """
+    Unit tests for SpotOrderExecutor.log_trade().
+
+    Skenario yang diuji:
+      1. Happy path — semua field wajib ada → upsert_spot dipanggil dengan
+         record yang field-nya identik dengan log_trade() di paper_trade_executor.py
+      2. Field opsional (ml_score, symbol_rank, correlation_cluster_id) None
+         → tetap masuk record sebagai None (tidak di-skip)
+      3. winning_zone None → zone_type default "T1", zone_label None
+      4. Field yang diambil dari sizing dict benar (notional, qty, max_loss_usd)
+      5. fee_usd_roundtrip dihitung benar: notional × 0.001 × 2
+    """
+
+    def _make_executor(self):
+        mock_client = MagicMock()
+        return SpotOrderExecutor(mock_client)
+
+    def _base_order(self) -> dict:
+        return {
+            "orderId":       12345,
+            "clientOrderId": "x-abc123",
+            "status":        "NEW",
+        }
+
+    def _base_cand(self, **overrides) -> dict:
+        cand = {
+            "symbol":       "ETHUSDT",
+            "direction":    "long",
+            "entry_price":  3000.0,
+            "sl":           2850.0,
+            "tp1":          3300.0,
+            "tp2":          3500.0,
+            "rr":           2.0,
+            "risk_pct":     1.5,
+            "atr_pct":      1.8,
+            "sizing": {
+                "notional_usd": 36.0,
+                "qty":          0.012,
+                "max_loss_usd": 0.54,
+            },
+            "entry_zone":   {"center": 2990.0, "touches": 3},
+            "winning_zone": {"tier": "T1", "label": "Zone 3×"},
+            "ml_score":     None,
+            "ml_model_version": None,
+            "symbol_rank":  None,
+        }
+        cand.update(overrides)
+        return cand
+
+    # ── 1. Happy path ─────────────────────────────────────────────────────────
+
+    @unittest.mock.patch("supabase_client.upsert_spot")
+    def test_happy_path_all_fields(self, mock_upsert):
+        print("\n=== Test log_trade: Happy path ===")
+        executor = self._make_executor()
+        order    = self._base_order()
+        cand     = self._base_cand(ml_score=0.62, ml_model_version="v1", symbol_rank=7)
+
+        executor.log_trade(order, cand, correlation_cluster_id="20260720_120000")
+
+        mock_upsert.assert_called_once()
+        record = mock_upsert.call_args.args[0]
+
+        # Identity
+        self.assertEqual(record["symbol"],        "ETHUSDT")
+        self.assertEqual(record["direction"],     "long")
+        self.assertEqual(record["rule_version"],  "v1.0.0")
+        self.assertEqual(record["correlation_cluster_id"], "20260720_120000")
+
+        # Entry order
+        self.assertEqual(record["entry_order_id"],   12345)
+        self.assertEqual(record["entry_client_id"],  "x-abc123")
+        self.assertEqual(record["entry_status"],     "NEW")
+        self.assertEqual(record["entry_price"],      3000.0)
+        self.assertIsNone(record["entry_fill_price"])
+        self.assertEqual(record["entry_qty"],        0.012)
+        self.assertEqual(record["entry_notional"],   36.0)
+
+        # OCO initial state
+        self.assertFalse(record["oco_placed"])
+        self.assertIsNone(record["oco_list_id"])
+
+        # Levels
+        self.assertEqual(record["sl"],   2850.0)
+        self.assertEqual(record["tp1"],  3300.0)
+        self.assertEqual(record["tp2"],  3500.0)
+        self.assertEqual(record["entry_zone_center"],  2990.0)
+        self.assertEqual(record["entry_zone_touches"], 3)
+
+        # Setup metadata
+        self.assertEqual(record["planned_rr"],       2.0)
+        self.assertEqual(record["risk_pct"],         1.5)
+        self.assertEqual(record["max_loss_usd"],     0.54)
+        self.assertEqual(record["zone_type"],        "T1")
+        self.assertEqual(record["zone_label"],       "Zone 3×")
+        self.assertEqual(record["zone_touches"],     3)
+        self.assertEqual(record["atr_pct_at_entry"], 1.8)
+
+        # Fee: 36.0 × 0.001 × 2 = 0.072
+        self.assertAlmostEqual(record["fee_usd_roundtrip"], 0.072, places=4)
+
+        # Exit initial state
+        self.assertEqual(record["exit_status"],     "OPEN")
+        self.assertIsNone(record["exit_price"])
+        self.assertIsNone(record["realized_pnl_usd"])
+
+        # ML + scan metadata
+        self.assertAlmostEqual(record["ml_score"], 0.62, places=3)
+        self.assertEqual(record["ml_model_version"], "v1")
+        self.assertEqual(record["symbol_rank"], 7)
+
+        # Raw order preserved
+        self.assertEqual(record["raw_entry_order"], order)
+
+        print(f"✓ upsert_spot dipanggil sekali dengan record yang benar.")
+        print(f"✓ fee_usd_roundtrip = {record['fee_usd_roundtrip']} (36 × 0.001 × 2 = 0.072)")
+        print(f"✓ entry_order_id = {record['entry_order_id']}, status = {record['entry_status']}")
+
+    # ── 2. Opsional fields None → masuk sebagai None ──────────────────────────
+
+    @unittest.mock.patch("supabase_client.upsert_spot")
+    def test_optional_fields_passed_as_none(self, mock_upsert):
+        print("\n=== Test log_trade: Optional fields None ===")
+        executor = self._make_executor()
+        order    = self._base_order()
+        cand     = self._base_cand()   # ml_score=None, symbol_rank=None
+
+        executor.log_trade(order, cand)   # no cluster_id
+
+        record = mock_upsert.call_args.args[0]
+        self.assertIsNone(record["ml_score"])
+        self.assertIsNone(record["ml_model_version"])
+        self.assertIsNone(record["symbol_rank"])
+        self.assertIsNone(record["correlation_cluster_id"])
+        print("✓ ml_score=None, symbol_rank=None, correlation_cluster_id=None → semua masuk record.")
+
+    # ── 3. winning_zone None → default zone_type "T1" ────────────────────────
+
+    @unittest.mock.patch("supabase_client.upsert_spot")
+    def test_winning_zone_none_defaults_to_T1(self, mock_upsert):
+        print("\n=== Test log_trade: winning_zone=None → zone_type=T1 ===")
+        executor = self._make_executor()
+        cand     = self._base_cand(winning_zone=None)
+
+        executor.log_trade(self._base_order(), cand)
+
+        record = mock_upsert.call_args.args[0]
+        self.assertEqual(record["zone_type"],  "T1")
+        self.assertIsNone(record["zone_label"])
+        print("✓ zone_type='T1', zone_label=None saat winning_zone tidak ada.")
+
+    # ── 4. Sizing fields diambil dengan benar ────────────────────────────────
+
+    @unittest.mock.patch("supabase_client.upsert_spot")
+    def test_sizing_fields_extracted_correctly(self, mock_upsert):
+        print("\n=== Test log_trade: sizing fields ===")
+        executor = self._make_executor()
+        cand     = self._base_cand()
+        cand["sizing"] = {"notional_usd": 50.0, "qty": 0.02, "max_loss_usd": 0.75}
+
+        executor.log_trade(self._base_order(), cand)
+
+        record = mock_upsert.call_args.args[0]
+        self.assertEqual(record["entry_notional"], 50.0)
+        self.assertEqual(record["entry_qty"],       0.02)
+        self.assertEqual(record["max_loss_usd"],    0.75)
+        # fee: 50 × 0.001 × 2 = 0.1
+        self.assertAlmostEqual(record["fee_usd_roundtrip"], 0.1, places=4)
+        print(f"✓ notional={record['entry_notional']}, qty={record['entry_qty']}")
+        print(f"✓ fee_usd_roundtrip={record['fee_usd_roundtrip']} (50 × 0.001 × 2 = 0.1)")
+
+    # ── 5. budget_for_slot override ───────────────────────────────────────────
+
+    @unittest.mock.patch("supabase_client.upsert_spot")
+    def test_budget_for_slot_override(self, mock_upsert):
+        print("\n=== Test log_trade: budget_for_slot override ===")
+        executor = self._make_executor()
+        cand     = self._base_cand(budget_for_slot=24.0)
+
+        executor.log_trade(self._base_order(), cand)
+
+        record = mock_upsert.call_args.args[0]
+        self.assertEqual(record["budget_usd"], 24.0)
+        print(f"✓ budget_usd={record['budget_usd']} (dari budget_for_slot override)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

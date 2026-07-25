@@ -277,7 +277,11 @@ class SpotOrderExecutor(OrderExecutor):
                  filled → resolve as TP_HIT or SL_HIT, compute realized PnL.
         Step 3.5 — Price-guard: if price has already breached SL and OCO
                    never triggered → resolve as SL_HIT directly.
-        Step 4 — Persist dirty state back to Supabase.
+        Step 4 — Persist dirty state back to Supabase via self._persist_update().
+
+        Persistence model:
+          log_trade()        → INSERT new row when trade is first opened
+          _persist_update()  → PATCH existing row throughout trade lifecycle
 
         State transitions persisted:
           entry_status            NEW → FILLED
@@ -292,16 +296,12 @@ class SpotOrderExecutor(OrderExecutor):
           realized_pnl_usd        None → float
           realized_pnl_pct        None → float
           time_to_resolution_sec  None → int
-
-        TODO: Replace direct supabase_client calls with self.log_trade()
-              once log_trade() is fully implemented.
         """
         import sys
         import os
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
-        # TODO: Replace with self.log_trade() once implemented
-        from supabase_client import fetch_all_spot, update_spot_by_order_id
+        from supabase_client import fetch_all_spot
 
         trades     = fetch_all_spot()
         open_trades = [t for t in trades if t.get("exit_status") == "OPEN"]
@@ -417,8 +417,7 @@ class SpotOrderExecutor(OrderExecutor):
                         fields["time_to_resolution_sec"] = (exit_ts - int(fill_t)) // 1000
                     print(f"  [{sym}] 🔴 Emergency MARKET SELL → SL_HIT  PnL=${pnl_usd:+.4f}")
                     dirty[eid] = {**trade, **fields}
-                    # TODO: replace with self.log_trade() update call
-                    update_spot_by_order_id(eid, fields)
+                    self._persist_update(eid, fields)
                     continue
 
                 if oco_resp:
@@ -493,8 +492,7 @@ class SpotOrderExecutor(OrderExecutor):
                         # If resolved, persist and skip to next trade
                         if fields.get("exit_status") in ("TP_HIT", "SL_HIT"):
                             dirty[eid] = {**trade, **fields}
-                            # TODO: replace with self.log_trade() update call
-                            update_spot_by_order_id(eid, fields)
+                            self._persist_update(eid, fields)
                             continue
 
                 except Exception as e:
@@ -543,15 +541,13 @@ class SpotOrderExecutor(OrderExecutor):
                 print(f"  [{sym}] 🛑 SL_HIT (price-guard): "
                       f"price={current:.6g} ≤ SL={sl_val:.6g}  PnL=${pnl_usd:+.4f}")
                 dirty[eid] = {**trade, **fields}
-                # TODO: replace with self.log_trade() update call
-                update_spot_by_order_id(eid, fields)
+                self._persist_update(eid, fields)
                 continue
 
             # ── Step 4: Persist any accumulated field changes ─────────────
             if fields:
                 dirty[eid] = {**trade, **fields}
-                # TODO: replace with self.log_trade() update call
-                update_spot_by_order_id(eid, fields)
+                self._persist_update(eid, fields)
 
             # ── Compact display ───────────────────────────────────────────
             if not verbose:
@@ -575,9 +571,124 @@ class SpotOrderExecutor(OrderExecutor):
         print(f"\n  [SpotOrderExecutor] Done — "
               f"{len(dirty)} trade(s) updated, {resolved} resolved.")
 
-    def log_trade(self, order: dict, cand: dict, correlation_cluster_id: str | None = None) -> None:
-        # TODO: Isi dengan logika log_trade (memanggil upsert_spot)
-        pass
+    def _persist_update(self, entry_order_id: int, fields: dict) -> None:
+        """
+        Patch specific fields on an existing trades_spot row.
+
+        This is the internal persistence method used by check_positions()
+        for state updates (fill detection, OCO placement, exit resolution).
+        Wraps update_spot_by_order_id() so check_positions stays self-contained
+        without direct supabase_client imports scattered through the method.
+
+        log_trade()   → INSERT new row  (called once at trade open)
+        _persist_update() → PATCH existing row (called during lifecycle)
+        """
+        from supabase_client import update_spot_by_order_id
+        update_spot_by_order_id(entry_order_id, fields)
+
+    # ── Class-level constants (mirror paper_trade_executor.py) ───────────────
+    RULE_VERSION:    str   = "v1.0.0"
+    BUDGET_USD:      float = 12.00
+    TAKER_FEE_PCT:   float = 0.001   # 0.1% taker fee
+
+    def log_trade(self, order: dict, cand: dict,
+                  correlation_cluster_id: str | None = None) -> None:
+        """
+        Insert a new spot trade into Supabase trades_spot.
+
+        Field schema is identical to log_trade() in paper_trade_executor.py —
+        same field names, same types, same defaults. This ensures trades logged
+        via SpotOrderExecutor are fully compatible with the dashboard and
+        ml/train_v1.py without any schema migration.
+
+        Parameters
+        ----------
+        order : dict
+            Raw response from Binance create_order (entry limit order).
+            Must contain at minimum: orderId, clientOrderId, status.
+        cand : dict
+            Candidate dict built by gather_candidates() / gather_all_candidates().
+            Required keys: symbol, direction, entry_price, sl, tp1, rr,
+            risk_pct, atr_pct, sizing (notional_usd, qty, max_loss_usd).
+            Optional: entry_zone, winning_zone, tp2, ml_score,
+            ml_model_version, symbol_rank, budget_for_slot.
+        correlation_cluster_id : str | None
+            Cluster ID from --propose-all batch run, None for single --propose.
+        """
+        from supabase_client import upsert_spot
+        from datetime import datetime, timezone
+
+        ez       = cand.get("entry_zone") or {}
+        sizing   = cand["sizing"]
+        notional = sizing["notional_usd"]
+
+        record = {
+            # ── Identity ──────────────────────────────────────────────
+            "symbol":                 cand["symbol"],
+            "direction":              cand["direction"],
+            "budget_usd":             cand.get("budget_for_slot", self.BUDGET_USD),
+            "rule_version":           self.RULE_VERSION,
+            "correlation_cluster_id": correlation_cluster_id,
+
+            # ── Entry order ───────────────────────────────────────────
+            "entry_order_id":         order.get("orderId"),
+            "entry_client_id":        order.get("clientOrderId"),
+            "entry_status":           order.get("status", "NEW"),
+            "entry_price":            cand["entry_price"],
+            "entry_fill_price":       None,
+            "entry_fill_time":        None,
+            "entry_qty":              sizing["qty"],
+            "entry_notional":         notional,
+            "open_time":              datetime.now(timezone.utc).isoformat(),
+
+            # ── OCO ───────────────────────────────────────────────────
+            "oco_placed":             False,
+            "oco_order_ids":          None,
+            "oco_list_id":            None,
+
+            # ── Levels ────────────────────────────────────────────────
+            "sl":                     cand["sl"],
+            "tp1":                    cand["tp1"],
+            "tp2":                    cand.get("tp2"),
+            "entry_zone_center":      ez.get("center"),
+            "entry_zone_touches":     ez.get("touches"),
+
+            # ── Setup metadata ────────────────────────────────────────
+            "planned_rr":             cand["rr"],
+            "risk_pct":               cand["risk_pct"],
+            "max_loss_usd":           sizing["max_loss_usd"],
+            "zone_type":              (cand["winning_zone"]["tier"]
+                                       if cand.get("winning_zone") else "T1"),
+            "zone_label":             (cand["winning_zone"]["label"]
+                                       if cand.get("winning_zone") else None),
+            "zone_touches":           ez.get("touches"),
+            "atr_pct_at_entry":       cand["atr_pct"],
+
+            # ── Cost estimates ────────────────────────────────────────
+            "fee_usd_roundtrip":      round(notional * self.TAKER_FEE_PCT * 2, 4),
+            "slippage_pct":           None,
+            "time_to_resolution_sec": None,
+
+            # ── Exit ──────────────────────────────────────────────────
+            "exit_status":            "OPEN",
+            "exit_price":             None,
+            "exit_time":              None,
+            "realized_pnl_usd":       None,
+            "realized_pnl_pct":       None,
+
+            # ── ML scoring (observation only) ─────────────────────────
+            "ml_score":               cand.get("ml_score"),
+            "ml_model_version":       cand.get("ml_model_version"),
+
+            # ── Scan metadata (observation only) ──────────────────────
+            "symbol_rank":            cand.get("symbol_rank"),
+
+            # ── Raw ───────────────────────────────────────────────────
+            "raw_entry_order":        order,
+        }
+        upsert_spot(record)
+        print(f"  Trade inserted into Supabase trades_spot "
+              f"(order #{record['entry_order_id']})")
 
 
 class FuturesOrderExecutor(OrderExecutor):
