@@ -693,25 +693,560 @@ class SpotOrderExecutor(OrderExecutor):
 
 class FuturesOrderExecutor(OrderExecutor):
     """
-    Implementasi Order Executor khusus untuk market Binance Futures.
-    Mengadaptasi fungsi-fungsi asli dari futures_trade_executor.py.
+    Implementasi Order Executor untuk Binance Futures Testnet.
+    Mengadaptasi fungsi-fungsi dari futures_trade_executor.py.
     """
 
+    # ── Class-level constants (mirror futures_trade_executor.py) ─────────────
+    LEVERAGE:       int   = 3
+    MARGIN_MODE:    str   = "isolated"
+    RULE_VERSION:   str   = "fv1.0.0"
+    BUDGET_USD:     float = 12.00
+    TAKER_FEE_PCT:  float = 0.0004   # 0.04% taker
+    RISK_FRACTION:  float = 0.25
+    MMR:            float = 0.004    # maintenance margin rate tier-1
+
+    def get_symbol_constraints(self, symbol: str) -> dict:
+        """Override: use futures_exchange_info() instead of spot get_symbol_info()."""
+        now    = time.time()
+        cached = self._constraints_cache.get(symbol)
+        if cached and (now - cached["timestamp"]) <= self.CACHE_TTL_SECONDS:
+            return cached["data"]
+
+        info = self.client.futures_exchange_info()
+        constraints = {"tick_size": 0.01, "step_size": 0.001,
+                       "min_qty": 0.0, "min_notional": 5.0}
+        for s in info.get("symbols", []):
+            if s["symbol"] != symbol:
+                continue
+            for f in s.get("filters", []):
+                ft = f["filterType"]
+                if ft == "PRICE_FILTER":
+                    constraints["tick_size"] = float(f["tickSize"])
+                elif ft == "LOT_SIZE":
+                    constraints["step_size"] = float(f["stepSize"])
+                    constraints["min_qty"]   = float(f["minQty"])
+                elif ft == "MIN_NOTIONAL":
+                    constraints["min_notional"] = float(f.get("notional", 5.0))
+            break
+
+        self._constraints_cache[symbol] = {"data": constraints, "timestamp": now}
+        return constraints
+
+    def _set_leverage_and_margin(self, symbol: str) -> None:
+        """Set isolated margin + leverage before placing any futures order."""
+        try:
+            self.client.futures_change_margin_type(
+                symbol=symbol, marginType="ISOLATED")
+        except Exception as e:
+            if "No need to change" not in str(e):
+                print(f"  [WARN] Margin mode: {e}")
+        try:
+            self.client.futures_change_leverage(
+                symbol=symbol, leverage=self.LEVERAGE)
+        except Exception as e:
+            print(f"  [WARN] Leverage set: {e}")
+
+    def _persist_update(self, entry_order_id: int, fields: dict) -> None:
+        """Patch fields on existing trades_futures row."""
+        from supabase_client import update_futures_by_order_id
+        update_futures_by_order_id(entry_order_id, fields)
+
+
     def place_entry_order(self, candidate: dict) -> dict:
-        # TODO: Isi dengan logika place_futures_limit_order
-        # PENTING: Harus handle change_initial_leverage dan positionSide
-        pass
+        """
+        Place futures LIMIT entry order (LONG or SHORT).
+        Sets leverage + margin mode before placing.
+        """
+        from binance.exceptions import BinanceAPIException
+
+        sym   = candidate["symbol"]
+        side  = "BUY" if candidate["position_side"] == "LONG" else "SELL"
+        qty   = candidate["sizing"]["qty"]
+        entry = candidate["entry_price"]
+
+        constraints = self.get_symbol_constraints(sym)
+        step = constraints.get("step_size", 0)
+        tick = constraints.get("tick_size", 0)
+
+        qty_str   = f"{self.round_step(qty, step):.8f}".rstrip("0").rstrip(".")
+        price_str = f"{self.round_tick(entry, tick):.8f}".rstrip("0").rstrip(".")
+
+        self._set_leverage_and_margin(sym)
+
+        try:
+            return self.client.futures_create_order(
+                symbol       = sym,
+                side         = side,
+                type         = "LIMIT",
+                timeInForce  = "GTC",
+                quantity     = qty_str,
+                price        = price_str,
+                positionSide = "BOTH",
+            )
+        except BinanceAPIException as e:
+            raise RuntimeError(f"Futures order failed: {e}") from e
+
 
     def place_exit_orders(self, trade: dict) -> dict:
-        # TODO: Isi dengan logika place_futures_exit_orders
-        # PENTING: Membuat 2 order bersyarat terpisah (STOP_MARKET & TAKE_PROFIT_MARKET)
-        pass
+        """
+        Place TP + SL as two separate algo orders after entry fills.
+        Uses futures_create_algo_order(algoType=CONDITIONAL) because
+        TAKE_PROFIT_MARKET / STOP_MARKET on Binance Futures always return
+        algoId (not orderId) — standard behaviour for conditional orders.
+
+        Returns dict: {tp_order_id, sl_order_id, tp_algo_id, sl_algo_id, success}
+        """
+        from binance.exceptions import BinanceAPIException
+        import time as _time
+
+        sym  = trade["symbol"]
+        qty  = trade["entry_qty"]
+        tp1  = trade["tp1"]
+        sl   = trade["sl"]
+        side = "SELL" if trade["position_side"] == "LONG" else "BUY"
+
+        constraints = self.get_symbol_constraints(sym)
+        tick = constraints.get("tick_size", 0.01)
+        step = constraints.get("step_size", 0.001)
+
+        qty_str = f"{self.round_step(qty, step):.8f}".rstrip("0").rstrip(".")
+        tp_str  = f"{self.round_tick(tp1, tick):.8f}".rstrip("0").rstrip(".")
+        sl_str  = f"{self.round_tick(sl,  tick):.8f}".rstrip("0").rstrip(".")
+
+        # Emergency check: price already past SL?
+        try:
+            current = float(self.client.futures_symbol_ticker(symbol=sym)["price"])
+            is_long = trade["position_side"] == "LONG"
+            if (is_long and current <= sl) or (not is_long and current >= sl):
+                resp = self.client.futures_create_order(
+                    symbol=sym, side=side, type="MARKET",
+                    quantity=qty_str, positionSide="BOTH", reduceOnly=True,
+                )
+                return {"sl_order_id": resp.get("orderId"), "sl_algo_id": None,
+                        "tp_order_id": None, "tp_algo_id": None,
+                        "success": True, "emergency_exit": True}
+        except Exception:
+            pass
+
+        results = {"tp_order_id": None, "sl_order_id": None,
+                   "tp_algo_id": None,  "sl_algo_id": None, "success": False}
+
+        def _place_and_verify(label: str, order_type: str, trigger: str):
+            try:
+                resp = self.client.futures_create_algo_order(
+                    algoType=    "CONDITIONAL",
+                    symbol=      sym,
+                    side=        side,
+                    type=        order_type,
+                    quantity=    qty_str,
+                    triggerPrice=trigger,
+                    timeInForce= "GTC",
+                    positionSide="BOTH",
+                    reduceOnly=  "true",
+                    workingType= "MARK_PRICE",
+                )
+            except Exception as e:
+                print(f"  ❌ {label} algo order failed: {e}")
+                return None, False
+
+            algo_id = resp.get("algoId") or resp.get("orderId")
+            if not algo_id:
+                print(f"  ❌ {label} no algoId in response: {resp}")
+                return None, False
+
+            print(f"  ✅ {label} algo order: algoId={algo_id} @ {trigger}")
+            _time.sleep(0.4)
+
+            # Verify via open-orders list (symbol filter broken on testnet)
+            try:
+                all_open = self.client.futures_get_open_algo_orders()
+                if isinstance(all_open, dict):
+                    all_open = all_open.get("orders", [])
+                found = any(str(o.get("algoId")) == str(algo_id)
+                            for o in (all_open or []))
+                if found:
+                    return algo_id, True
+                # Fallback: direct query without symbol
+                verify = self.client.futures_get_algo_order(algoId=algo_id)
+                if isinstance(verify, list):
+                    verify = next((o for o in verify
+                                   if str(o.get("algoId")) == str(algo_id)), {})
+                v_status = (verify.get("algoStatus") or
+                            verify.get("status") or "UNKNOWN")
+                return algo_id, v_status.upper() in (
+                    "NEW", "WORKING", "EXECUTING", "PARTIALLY_FILLED",
+                    "FILLED", "EXECUTED", "COMPLETED")
+            except Exception:
+                return algo_id, True  # network hiccup — benefit of doubt
+
+        tp_id, tp_ok = _place_and_verify("TP", "TAKE_PROFIT_MARKET", tp_str)
+        sl_id, sl_ok = _place_and_verify("SL", "STOP_MARKET",        sl_str)
+
+        results.update({"tp_order_id": tp_id, "sl_order_id": sl_id,
+                        "tp_algo_id":  tp_id, "sl_algo_id":  sl_id,
+                        "success": (tp_id is not None and sl_id is not None)})
+        return results
+
 
     def check_positions(self, verbose: bool = False, mode: str = "all") -> None:
-        # TODO: Isi dengan logika check_futures_positions
-        # PENTING: Pengecekan algoId dan liquidation price
-        pass
+        """
+        Check all OPEN futures trades and drive their state machine:
 
-    def log_trade(self, order: dict, cand: dict, correlation_cluster_id: str | None = None) -> None:
-        # TODO: Isi dengan logika log_futures_trade (memanggil upsert_futures)
-        pass
+        Step 1 — Query entry order status (futures_get_order).
+        Step 2 — If FILLED + no exit orders → place_exit_orders().
+        Step 3 — Query TP/SL algo order status via futures_get_algo_order.
+                 On FILLED/EXECUTED → resolve TP_HIT or SL_HIT.
+        Step 3.5 — Price-guard: if price breached SL → cancel all open
+                   algo orders for symbol + resolve SL_HIT.
+        Step 4 — Persist dirty state via _persist_update().
+        """
+        import sys
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+        from supabase_client import fetch_all_futures
+        from datetime import datetime, timezone
+
+        trades      = fetch_all_futures()
+        open_trades = [t for t in trades if t.get("exit_status") == "OPEN"]
+
+        if not open_trades:
+            print("\n  [FuturesOrderExecutor] No open futures positions.")
+            return
+
+        print(f"\n  [FuturesOrderExecutor] Checking {len(open_trades)} open position(s)...")
+
+        try:
+            all_tickers = {t["symbol"]: float(t["price"])
+                           for t in self.client.futures_symbol_ticker()}
+        except Exception:
+            all_tickers = {}
+
+        for trade in open_trades:
+            sym  = trade["symbol"]
+            side = trade.get("position_side", "LONG")
+            eid  = trade.get("entry_order_id")
+            if not eid:
+                continue
+
+            fields: dict = {}
+
+            # ── Step 1: Entry order status ────────────────────────────
+            try:
+                entry_order  = self.client.futures_get_order(
+                    symbol=sym, orderId=eid)
+                entry_status = entry_order.get("status", "UNKNOWN")
+            except Exception as e:
+                print(f"  [{sym}] ⚠ Could not query entry order: {e}")
+                continue
+
+            filled_qty = float(entry_order.get("executedQty", 0) or 0)
+            cum_quote  = float(entry_order.get("cumQuote", 0) or 0)
+            if filled_qty > 0 and cum_quote > 0:
+                fill_price = cum_quote / filled_qty
+            else:
+                avg = float(entry_order.get("avgPrice", 0) or 0)
+                fill_price = avg if avg > 0 else float(
+                    entry_order.get("price", trade.get("entry_price", 0)))
+
+            if trade.get("entry_status") != entry_status:
+                fields["entry_status"] = entry_status
+
+            if entry_status == "FILLED" and trade.get("entry_fill_price") is None:
+                planned = trade.get("entry_price") or fill_price
+                fields.update({
+                    "entry_fill_price": fill_price,
+                    "entry_fill_time":  entry_order.get("updateTime"),
+                    "entry_qty":        filled_qty,
+                    "slippage_pct":     (round((fill_price - planned)
+                                               / planned * 100, 4)
+                                         if planned else None),
+                    "last_funding_check_time": entry_order.get("updateTime"),
+                })
+                print(f"  [{sym}] ✅ FILLED @ {fill_price:.6g}  "
+                      f"slip={fields['slippage_pct']:+.3f}%")
+
+            # ── Step 2: Place exit orders if needed ───────────────────
+            if entry_status == "FILLED" and not trade.get("exit_orders_placed"):
+                working = {**trade, **fields}
+                print(f"  [{sym}] Placing TP+SL algo orders...")
+                exit_result = self.place_exit_orders(working)
+
+                if exit_result.get("emergency_exit"):
+                    current = all_tickers.get(sym, fill_price)
+                    qty_    = working.get("entry_qty") or filled_qty or 0
+                    pnl     = (current - fill_price) * qty_ * (
+                        1 if side == "LONG" else -1)
+                    fields.update({
+                        "exit_status":    "SL_HIT",
+                        "exit_price":     round(current, 6),
+                        "exit_time":      int(datetime.now(timezone.utc)
+                                              .timestamp() * 1000),
+                        "realized_pnl_usd": round(pnl, 4),
+                        "exit_orders_placed": False,
+                    })
+                    self._persist_update(eid, fields)
+                    continue
+
+                if exit_result.get("success"):
+                    fields.update({
+                        "tp_order_id":      exit_result["tp_order_id"],
+                        "sl_order_id":      exit_result["sl_order_id"],
+                        "tp_algo_id":       exit_result["tp_algo_id"],
+                        "sl_algo_id":       exit_result["sl_algo_id"],
+                        "exit_orders_placed": True,
+                    })
+                    print(f"  [{sym}] ✅ Exit orders placed")
+                else:
+                    print(f"  [{sym}] ❌ Exit order placement failed — "
+                          f"position UNPROTECTED")
+
+            # ── Step 3: Check algo order status ───────────────────────
+            tp_algo = trade.get("tp_algo_id") or fields.get("tp_algo_id")
+            sl_algo = trade.get("sl_algo_id") or fields.get("sl_algo_id")
+            exit_str = "n/a"
+
+            if (trade.get("exit_orders_placed") or fields.get("exit_orders_placed")) \
+                    and (tp_algo or sl_algo):
+
+                def _query_algo(algo_id):
+                    if not algo_id:
+                        return None, None
+                    try:
+                        r = self.client.futures_get_algo_order(algoId=algo_id)
+                        if isinstance(r, list):
+                            r = next((o for o in r
+                                      if str(o.get("algoId")) == str(algo_id)), {})
+                        status = (r.get("algoStatus") or r.get("status")
+                                  or "UNKNOWN")
+                        qty_f  = float(r.get("executedQty") or 0)
+                        quote  = float(r.get("cumQuote") or 0)
+                        price  = (quote / qty_f if qty_f > 0 and quote > 0
+                                  else float(r.get("triggerPrice") or 0))
+                        return status, price
+                    except Exception:
+                        return None, None
+
+                for algo_id, label in [(tp_algo, "TP"), (sl_algo, "SL")]:
+                    status, price = _query_algo(algo_id)
+                    if status and status.upper() in (
+                            "FILLED", "EXECUTED", "COMPLETED"):
+                        is_tp  = (label == "TP")
+                        exit_s = "TP_HIT" if is_tp else "SL_HIT"
+                        ef     = (trade.get("entry_fill_price")
+                                  or fields.get("entry_fill_price")
+                                  or trade.get("entry_price", 0))
+                        qty_   = (trade.get("entry_qty")
+                                  or fields.get("entry_qty") or 0)
+                        mult   = 1 if side == "LONG" else -1
+                        pnl    = (price - ef) * qty_ * mult
+                        exit_t = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        fill_t = (trade.get("entry_fill_time")
+                                  or fields.get("entry_fill_time"))
+                        fields.update({
+                            "exit_status":     exit_s,
+                            "exit_price":      round(price, 6),
+                            "exit_time":       exit_t,
+                            "realized_pnl_usd": round(pnl, 4),
+                            "realized_pnl_pct": round(
+                                pnl / max(trade.get("entry_notional", 1),
+                                          0.001) * 100, 2),
+                            "time_in_position_sec": (
+                                (exit_t - int(fill_t)) // 1000
+                                if fill_t else None),
+                        })
+                        icon = "🟢" if is_tp else "🔴"
+                        print(f"  [{sym}] {icon} {exit_s}  "
+                              f"exit={price:.6g}  PnL=${pnl:+.4f}")
+                        # Cancel counterpart + any ghost orders
+                        self._cancel_all_open_algo_orders(sym)
+                        self._persist_update(eid, fields)
+                        break
+                    elif status:
+                        exit_str = status
+
+            if fields.get("exit_status") in ("TP_HIT", "SL_HIT"):
+                continue   # already persisted above
+
+            # ── Step 3.5: Price-guard ─────────────────────────────────
+            current = all_tickers.get(sym)
+            if current is None:
+                try:
+                    current = float(
+                        self.client.futures_symbol_ticker(symbol=sym)["price"])
+                except Exception:
+                    current = None
+
+            sl_val = trade.get("sl")
+            if (entry_status == "FILLED"
+                    and trade.get("exit_status") == "OPEN"
+                    and fields.get("exit_status") is None
+                    and current is not None and sl_val is not None
+                    and (trade.get("exit_orders_placed")
+                         or fields.get("exit_orders_placed"))):
+                breached = ((side == "LONG"  and current <= sl_val) or
+                            (side == "SHORT" and current >= sl_val))
+                if breached:
+                    ef   = (trade.get("entry_fill_price")
+                            or fields.get("entry_fill_price")
+                            or trade.get("entry_price", 0))
+                    qty_ = trade.get("entry_qty") or fields.get("entry_qty") or 0
+                    mult = 1 if side == "LONG" else -1
+                    pnl  = (current - ef) * qty_ * mult
+                    exit_t = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    fill_t = (trade.get("entry_fill_time")
+                              or fields.get("entry_fill_time"))
+                    fields.update({
+                        "exit_status":     "SL_HIT",
+                        "exit_price":      round(current, 6),
+                        "exit_time":       exit_t,
+                        "realized_pnl_usd": round(pnl, 4),
+                        "realized_pnl_pct": round(
+                            pnl / max(trade.get("entry_notional", 1),
+                                      0.001) * 100, 2),
+                        "time_in_position_sec": (
+                            (exit_t - int(fill_t)) // 1000 if fill_t else None),
+                    })
+                    print(f"  [{sym}] 🛑 SL_HIT (price-guard)  "
+                          f"price={current:.6g}  PnL=${pnl:+.4f}")
+                    self._cancel_all_open_algo_orders(sym)
+                    self._persist_update(eid, fields)
+                    continue
+
+            # ── Step 4: Persist accumulated changes ───────────────────
+            if fields:
+                self._persist_update(eid, fields)
+
+            if not verbose:
+                pnl_disp = "n/a"
+                if entry_status == "FILLED" and current is not None:
+                    ef   = (trade.get("entry_fill_price")
+                            or fields.get("entry_fill_price")
+                            or trade.get("entry_price", 0))
+                    qty_ = (trade.get("entry_qty")
+                            or fields.get("entry_qty") or 0)
+                    mult = 1 if side == "LONG" else -1
+                    if ef and qty_:
+                        pnl_disp = f"${(current - ef) * qty_ * mult:+.4f}"
+                print(f"  {sym:<12} {side:<6} {entry_status:<20} "
+                      f"{pnl_disp:>10}  {exit_str}")
+
+        print(f"\n  [FuturesOrderExecutor] Done.")
+
+    def _cancel_all_open_algo_orders(self, symbol: str) -> None:
+        """Cancel all open algo + regular exit orders for a symbol."""
+        # Pass 1: algo orders (unfiltered — symbol filter broken on testnet)
+        try:
+            all_algos = self.client.futures_get_open_algo_orders()
+            if isinstance(all_algos, dict):
+                all_algos = all_algos.get("orders", [])
+            for o in (all_algos or []):
+                if o.get("symbol") == symbol:
+                    aid = o.get("algoId")
+                    if aid:
+                        try:
+                            self.client.futures_cancel_algo_order(
+                                symbol=symbol, algoId=aid)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # Pass 2: regular reduceOnly exit orders
+        try:
+            EXIT_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET",
+                          "TAKE_PROFIT", "STOP"}
+            opens = self.client.futures_get_open_orders(symbol=symbol)
+            if isinstance(opens, dict):
+                opens = opens.get("orders", [])
+            for o in (opens or []):
+                if o.get("type") in EXIT_TYPES and o.get("reduceOnly"):
+                    try:
+                        self.client.futures_cancel_order(
+                            symbol=symbol, orderId=o["orderId"])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+    def log_trade(self, order: dict, cand: dict,
+                  correlation_cluster_id: str | None = None) -> None:
+        """
+        Insert new futures trade into Supabase trades_futures.
+        Schema identical to log_futures_trade() in futures_trade_executor.py.
+        """
+        from supabase_client import upsert_futures
+        from datetime import datetime, timezone
+
+        sizing = cand["sizing"]
+        liq    = cand["liquidation"]
+        ez     = cand.get("entry_zone") or {}
+
+        record = {
+            # Identity
+            "symbol":                cand["symbol"],
+            "position_side":         cand["position_side"],
+            "direction":             cand["direction"],
+            "margin_budget":         self.BUDGET_USD,
+            "leverage":              self.LEVERAGE,
+            "margin_mode":           self.MARGIN_MODE,
+            "rule_version":          self.RULE_VERSION,
+            "correlation_cluster_id": correlation_cluster_id,
+            # Entry
+            "entry_order_id":        order.get("orderId"),
+            "entry_client_id":       order.get("clientOrderId"),
+            "entry_status":          order.get("status", "NEW"),
+            "entry_price":           cand["entry_price"],
+            "entry_fill_price":      None,
+            "entry_fill_time":       None,
+            "entry_qty":             sizing["qty"],
+            "entry_notional":        sizing["notional_usd"],
+            "margin_used":           sizing["margin_used"],
+            "open_time":             datetime.now(timezone.utc).isoformat(),
+            # Exit orders
+            "tp_order_id":           None,
+            "sl_order_id":           None,
+            "tp_algo_id":            None,
+            "sl_algo_id":            None,
+            "exit_orders_placed":    False,
+            # Levels
+            "sl":                    cand["sl"],
+            "tp1":                   cand["tp1"],
+            "tp2":                   cand.get("tp2"),
+            "entry_zone_center":     ez.get("center"),
+            "entry_zone_touches":    ez.get("touches"),
+            # Liquidation
+            "liquidation_price":             liq["liquidation_price"],
+            "distance_to_liquidation_pct":   liq["distance_to_liquidation_pct"],
+            # Setup metadata
+            "planned_rr":            cand["rr"],
+            "risk_pct":              cand["risk_pct"],
+            "max_loss_usd":          sizing["max_loss_usd"],
+            "zone_type":             cand.get("tier_used", "T1"),
+            "zone_touches":          ez.get("touches"),
+            "atr_pct_at_entry":      cand["atr_pct"],
+            "volatility_regime_at_entry": cand.get("volatility_regime", "unknown"),
+            "funding_rate_at_entry": cand.get("funding_rate_at_entry"),
+            # Cost
+            "fee_usd_roundtrip":     round(
+                sizing["notional_usd"] * self.TAKER_FEE_PCT * 2, 4),
+            "slippage_pct":          None,
+            # Exit
+            "exit_status":           "OPEN",
+            "exit_price":            None,
+            "exit_time":             None,
+            "realized_pnl_usd":      None,
+            "realized_pnl_pct":      None,
+            "time_in_position_sec":  None,
+            # ML excursion fields
+            "max_adverse_excursion_pct":       None,
+            "max_favorable_excursion_pct":     None,
+            "distance_to_liquidation_pct_min": None,
+            "funding_rate_paid":               0.0,
+            "funding_rate_history":            [],
+            "last_funding_check_time":         None,
+            # Raw
+            "raw_entry_order":       order,
+        }
+        upsert_futures(record)
+        print(f"  Futures trade inserted into Supabase "
+              f"(order #{record['entry_order_id']})")
