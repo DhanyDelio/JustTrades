@@ -20,11 +20,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from core.repositories.spot_trade_repository import SpotTradeRepository
+repo = SpotTradeRepository()
 import sys
 import io
 import contextlib
 from datetime import datetime, timezone
 from pathlib import Path
+from core.executors.spot_order_executor import SpotOrderExecutor
+from core.utils.binance_math import (
+    get_symbol_constraints,
+    compute_position_size,
+    round_step,
+    round_tick,
+)
 
 import requests
 
@@ -35,8 +44,7 @@ except ImportError:
     pass
 
 # Reuse chart_analyzer's analysis engine — no duplication
-sys.path.insert(0, str(Path(__file__).parent))
-import chart_analyzer as ca
+import services.chart_analyzer as ca
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -157,7 +165,7 @@ def get_simulated_balance(trades: list[dict] | None = None) -> float:
     and only grows/shrinks based on real trade outcomes logged here.
     """
     if trades is None:
-        trades = load_trade_log()
+        trades = repo.load_trade_log()
     closed_pnl = sum(
         t.get("realized_pnl_usd") or 0.0
         for t in trades
@@ -182,7 +190,7 @@ def compute_lab_pool(trades: list[dict] | None = None) -> dict:
     """
     import math
     if trades is None:
-        trades = load_trade_log()
+        trades = repo.load_trade_log()
 
     # Realized PnL only from resolved clustered trades
     closed_cluster_pnl = sum(
@@ -217,140 +225,6 @@ def compute_lab_pool(trades: list[dict] | None = None) -> dict:
 # 2. EXCHANGE INFO — min notional, lot size, tick size
 # ---------------------------------------------------------------------------
 
-def get_symbol_constraints(client, symbol: str) -> dict:
-    """
-    Fetch lot size (min qty, step), tick size (price precision), and
-    min notional from Binance exchange info.
-    Returns dict with keys: min_qty, step_size, tick_size, min_notional
-    """
-    info = client.get_symbol_info(symbol)
-    if not info:
-        raise ValueError(f"Symbol {symbol} not found on testnet exchange info")
-
-    constraints = {
-        "min_qty":      0.0,
-        "step_size":    0.0,
-        "tick_size":    0.0,
-        "min_notional": DEFAULT_MIN_NOTIONAL,
-    }
-
-    for f in info.get("filters", []):
-        ft = f["filterType"]
-        if ft == "LOT_SIZE":
-            constraints["min_qty"]   = float(f["minQty"])
-            constraints["step_size"] = float(f["stepSize"])
-        elif ft == "PRICE_FILTER":
-            constraints["tick_size"] = float(f["tickSize"])
-        elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
-            constraints["min_notional"] = float(f.get("minNotional", f.get("minVal", DEFAULT_MIN_NOTIONAL)))
-
-    return constraints
-
-
-def round_step(value: float, step: float) -> float:
-    """Round value DOWN to the nearest step_size increment."""
-    if step <= 0:
-        return value
-    import math
-    precision = max(0, round(-math.log10(step)))
-    return round(math.floor(value / step) * step, precision)
-
-
-def round_tick(value: float, tick: float) -> float:
-    """Round price to nearest tick_size."""
-    if tick <= 0:
-        return value
-    import math
-    precision = max(0, round(-math.log10(tick)))
-    return round(round(value / tick) * tick, precision)
-
-
-# ---------------------------------------------------------------------------
-# 3. POSITION SIZING
-# ---------------------------------------------------------------------------
-
-def compute_position_size(
-    entry_price:   float,
-    sl_price:      float,
-    budget_usd:    float,
-    risk_fraction: float,
-    constraints:   dict,
-) -> dict:
-    """
-    Size the position so that worst-case loss (if SL is hit) equals
-    risk_fraction * budget_usd.
-
-    Returns dict with:
-      qty           — base asset quantity (rounded to step_size)
-      notional_usd  — entry_price × qty (position value in USD)
-      max_loss_usd  — (entry - SL) × qty
-      max_loss_pct  — max_loss_usd / budget_usd
-      risk_per_unit — $ loss if SL hit, per unit of base asset
-      warnings      — list of warning strings (empty if clean)
-    """
-    warnings_: list[str] = []
-
-    risk_per_unit = abs(entry_price - sl_price)
-    if risk_per_unit <= 0:
-        return {"qty": 0, "notional_usd": 0, "max_loss_usd": 0,
-                "max_loss_pct": 0, "risk_per_unit": 0,
-                "warnings": ["SL price equals entry — cannot size position"]}
-
-    max_loss_budget = budget_usd * risk_fraction   # e.g. $3 at 25%
-    ideal_qty       = max_loss_budget / risk_per_unit
-
-    # Hard cap: position value must not exceed total budget
-    # (can't spend more than you have on spot)
-    max_qty_by_budget = budget_usd / entry_price
-    ideal_qty = min(ideal_qty, max_qty_by_budget)
-
-    # Round down to lot step
-    step = constraints.get("step_size", 0)
-    qty  = round_step(ideal_qty, step) if step > 0 else ideal_qty
-
-    # Enforce min qty
-    min_qty = constraints.get("min_qty", 0)
-    if qty < min_qty:
-        qty = min_qty
-        warnings_.append(
-            f"Qty rounded up to exchange minimum ({min_qty}) — "
-            f"actual risk may exceed target"
-        )
-
-    notional_usd = entry_price * qty
-    max_loss_usd = risk_per_unit * qty
-    max_loss_pct = max_loss_usd / budget_usd * 100
-
-    # Check min notional
-    min_notional = constraints.get("min_notional", DEFAULT_MIN_NOTIONAL)
-    if notional_usd < min_notional:
-        warnings_.append(
-            f"Position notional ${notional_usd:.2f} is below exchange "
-            f"minimum ${min_notional:.2f} — order would be rejected"
-        )
-
-    # Check if max loss exceeds budget sanity limit (>50%)
-    if max_loss_pct > 50:
-        warnings_.append(
-            f"Max loss {max_loss_pct:.1f}% of total budget (${max_loss_usd:.2f}) "
-            f"— position too large relative to $12 account"
-        )
-
-    # Check if whole notional > budget (would require margin)
-    if notional_usd > budget_usd:
-        warnings_.append(
-            f"Position value ${notional_usd:.2f} exceeds total budget "
-            f"${budget_usd:.2f} — reduce qty or use a cheaper coin"
-        )
-
-    return {
-        "qty":          qty,
-        "notional_usd": notional_usd,
-        "max_loss_usd": max_loss_usd,
-        "max_loss_pct": max_loss_pct,
-        "risk_per_unit": risk_per_unit,
-        "warnings":     warnings_,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -750,338 +624,28 @@ def print_proposal(cand: dict) -> None:
 # 6. TRADE LOG
 # ---------------------------------------------------------------------------
 
-def load_trade_log() -> list[dict]:
-    """Load all spot trades from Supabase trades_spot table.
-    trade_log.json is kept as a backup but is no longer the source of truth.
-    """
-    try:
-        from supabase_client import fetch_all_spot
-        return fetch_all_spot()
-    except Exception as e:
-        print(f"  [WARN] Supabase read failed, falling back to trade_log.json: {e}")
-        if TRADE_LOG_PATH.exists():
-            with open(TRADE_LOG_PATH) as f:
-                return json.load(f)
-        return []
 
 
-def _match_mode(trade: dict, mode: str) -> bool:
-    """Return True if trade matches selected mode filter."""
-    cid = trade.get("correlation_cluster_id")
-    if mode == "all":
-        return True
-    if mode == "single":
-        return cid is None
-    if mode == "lab":
-        return cid is not None
-    return True
 
 
-def export_clean(trades: list[dict], mode: str = "lab") -> None:
-    """
-    Export resolved trades for ML: filtered by mode and exit_status (TP_HIT/SL_HIT).
-    Writes `trade_log_<mode>_clean.json` with only selected fields.
-    """
-    import csv
-    out = []
-    for t in trades:
-        if not _match_mode(t, mode):
-            continue
-        if t.get("exit_status") not in ("TP_HIT", "SL_HIT"):
-            continue
-        out.append({
-            "symbol": t.get("symbol"),
-            "entry_price": t.get("entry_price"),
-            "sl": t.get("sl"),
-            "tp1": t.get("tp1"),
-            "zone_touches": t.get("entry_zone_touches") or t.get("zone_touches"),
-            "atr_pct": t.get("atr_pct_at_entry") or t.get("atr_pct"),
-            "planned_rr": t.get("planned_rr"),
-            "risk_pct": t.get("risk_pct"),
-            "realized_pnl_usd": t.get("realized_pnl_usd"),
-            "realized_pnl_pct": t.get("realized_pnl_pct"),
-            "time_to_resolution_sec": t.get("time_to_resolution_sec"),
-            "rule_version": t.get("rule_version"),
-            "correlation_cluster_id": t.get("correlation_cluster_id"),
-        })
-
-    fname = f"trade_log_{mode}_clean.json"
-    with open(fname, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"Exported {len(out)} resolved trades to {fname}")
 
 
-def save_trade_log(trades: list[dict]) -> None:
-    # trade_log.json is no longer the write target — Supabase is.
-    # Writes are handled per-record via upsert_spot() / update_spot_by_order_id()
-    # in supabase_client.py.  This stub is kept so call sites compile without change
-    # until each write path is individually migrated to Supabase upserts.
-    pass
 
 
-def has_open_position(trades: list[dict]) -> bool:
-    """A position is 'open' if exit_status is OPEN (entry placed, not yet resolved)."""
-    return any(t.get("exit_status") == "OPEN" for t in trades)
 
 
-def should_show_live_position(trade: dict, entry_status: str | None = None) -> bool:
-    """Return True for trades that should remain visible in the live display block."""
-    resolved_statuses = {"TP_HIT", "SL_HIT", "CLOSED"}
-    if trade.get("exit_status") in resolved_statuses:
-        return False
-
-    status = entry_status if entry_status is not None else trade.get("entry_status")
-    return status in {"NEW", "PARTIALLY_FILLED", "FILLED"}
 
 
-def count_open_positions(trades: list[dict]) -> int:
-    """Count how many trades currently have exit_status == OPEN."""
-    return sum(1 for t in trades if t.get("exit_status") == "OPEN")
 
 
-def log_trade(order: dict, cand: dict,
-              correlation_cluster_id: str | None = None) -> None:
-    """Insert new spot trade into Supabase trades_spot table."""
-    from supabase_client import upsert_spot
-    ez = cand.get("entry_zone") or {}
-    notional = cand["sizing"]["notional_usd"]
-    record = {
-        # ── Identity ──────────────────────────────────────────────────
-        "symbol":            cand["symbol"],
-        "direction":         cand["direction"],
-        "budget_usd":        cand.get("budget_for_slot", BUDGET_USD),
-        "rule_version":      RULE_VERSION,
-        "correlation_cluster_id": correlation_cluster_id,
-
-        # ── Entry order ───────────────────────────────────────────────
-        "entry_order_id":    order.get("orderId"),
-        "entry_client_id":   order.get("clientOrderId"),
-        "entry_status":      order.get("status", "NEW"),
-        "entry_price":       cand["entry_price"],
-        "entry_fill_price":  None,
-        "entry_fill_time":   None,
-        "entry_qty":         cand["sizing"]["qty"],
-        "entry_notional":    notional,
-        "open_time":         datetime.now(timezone.utc).isoformat(),
-
-        # ── OCO ───────────────────────────────────────────────────────
-        "oco_placed":        False,
-        "oco_order_ids":     None,
-        "oco_list_id":       None,
-
-        # ── Levels ────────────────────────────────────────────────────
-        "sl":                cand["sl"],
-        "tp1":               cand["tp1"],
-        "tp2":               cand["tp2"],
-        "entry_zone_center": ez.get("center"),
-        "entry_zone_touches": ez.get("touches"),
-
-        # ── Setup metadata ────────────────────────────────────────────
-        "planned_rr":        cand["rr"],
-        "risk_pct":          cand["risk_pct"],
-        "max_loss_usd":      cand["sizing"]["max_loss_usd"],
-        "zone_type":         cand["winning_zone"]["tier"] if cand.get("winning_zone") else "T1",
-        "zone_label":        cand["winning_zone"]["label"] if cand.get("winning_zone") else None,
-        "zone_touches":      ez.get("touches"),
-        "atr_pct_at_entry":  cand["atr_pct"],
-
-        # ── Cost estimates ────────────────────────────────────────────
-        "fee_usd_roundtrip": round(notional * TAKER_FEE_PCT * 2, 4),
-        "slippage_pct":      None,
-        "time_to_resolution_sec": None,
-
-        # ── Exit ──────────────────────────────────────────────────────
-        "exit_status":       "OPEN",
-        "exit_price":        None,
-        "exit_time":         None,
-        "realized_pnl_usd":  None,
-        "realized_pnl_pct":  None,
-
-        # ── ML scoring (observation only) ─────────────────────────────
-        "ml_score":          cand.get("ml_score"),
-        "ml_model_version":  cand.get("ml_model_version"),
-
-        # ── Scan metadata (observation only) ──────────────────────────
-        "symbol_rank":       cand.get("symbol_rank"),   # rank from get_top_symbols_by_volume
-
-        # ── Raw ───────────────────────────────────────────────────────
-        "raw_entry_order":   order,
-    }
-    upsert_spot(record)
-    print(f"  Trade inserted into Supabase trades_spot (order #{record['entry_order_id']})")
 
 
 # ---------------------------------------------------------------------------
 # 8. ORDER EXECUTION
 # ---------------------------------------------------------------------------
 
-def place_limit_order(client, cand: dict) -> dict:
-    """Place entry limit BUY on Binance Spot Testnet."""
-    from binance.enums import SIDE_BUY, ORDER_TYPE_LIMIT, TIME_IN_FORCE_GTC
-    from binance.exceptions import BinanceAPIException
-
-    sym       = cand["symbol"]
-    qty       = cand["sizing"]["qty"]
-    entry     = cand["entry_price"]
-    step      = cand["constraints"].get("step_size", 0)
-    tick      = cand["constraints"].get("tick_size", 0)
-
-    qty_str   = f"{round_step(qty, step):.8f}".rstrip("0").rstrip(".")
-    price_str = f"{round_tick(entry, tick):.8f}".rstrip("0").rstrip(".")
-
-    try:
-        return client.create_order(
-            symbol      = sym,
-            side        = SIDE_BUY,
-            type        = ORDER_TYPE_LIMIT,
-            timeInForce = TIME_IN_FORCE_GTC,
-            quantity    = qty_str,
-            price       = price_str,
-        )
-    except BinanceAPIException as e:
-        raise RuntimeError(f"Binance API error: {e}") from e
 
 
-def place_oco_order(client, trade: dict) -> dict:
-    """
-    Place OCO SELL after LONG entry is filled.
-
-    New Binance OCO API (python-binance ≥1.0.37) uses above/below leg structure:
-      above leg (price > current) = LIMIT_MAKER  → TP
-      below leg (price < current) = STOP_LOSS_LIMIT → SL
-
-    For SELL OCO:
-        aboveType = LIMIT_MAKER       (TP: fills when price rises to tp1)
-        abovePrice = tp1
-
-        belowType = STOP_LOSS_LIMIT   (SL: triggers when price drops to sl)
-        belowStopPrice  = sl          (trigger price)
-        belowPrice      = sl * 0.9985 (limit fill price, 0.15% below trigger)
-        belowTimeInForce = GTC
-
-    Price constraint the exchange enforces:
-        abovePrice > lastPrice > belowStopPrice
-
-    Race condition handling:
-        - If price already exceeded TP1 at OCO placement time → adjust TP1 to
-          current + small buffer so OCO is still valid and position is protected.
-        - If price already dropped below SL at placement time → place market SELL
-          immediately to cut loss, do not attempt OCO.
-        - Retries up to MAX_OCO_RETRIES with fresh price each time on constraint errors.
-
-    Raises RuntimeError only if all retries exhausted or fatal API error.
-    """
-    from binance.exceptions import BinanceAPIException
-
-    MAX_OCO_RETRIES = 3
-    # Buffer above current price when TP needs to be adjusted (0.3%)
-    TP_ADJUST_BUFFER = 0.003
-
-    sym = trade["symbol"]
-    qty = trade["entry_qty"]
-    sl  = trade["sl"]
-
-    # Fetch symbol precision once
-    try:
-        info = client.get_symbol_info(sym)
-        tick = next(
-            float(f["tickSize"]) for f in info["filters"]
-            if f["filterType"] == "PRICE_FILTER"
-        )
-        step = next(
-            float(f["stepSize"]) for f in info["filters"]
-            if f["filterType"] == "LOT_SIZE"
-        )
-    except Exception:
-        tick, step = 0.01, 0.001
-
-    qty_str = f"{round_step(qty, step):.8f}".rstrip("0").rstrip(".")
-
-    last_err = None
-    for attempt in range(1, MAX_OCO_RETRIES + 1):
-        # Always re-fetch current price on each attempt
-        try:
-            current = float(client.get_symbol_ticker(symbol=sym)["price"])
-        except Exception as e:
-            raise RuntimeError(f"Could not fetch current price for {sym}: {e}") from e
-
-        tp1 = trade["tp1"]  # start with planned TP
-
-        # ── Race condition: price already below SL ─────────────────────
-        if current <= sl:
-            # Place immediate market sell — position already at/past SL
-            print(f"\n  ⚠  [{sym}] Price {current:.4f} ≤ SL {sl:.4f} at OCO placement.")
-            print(f"       Placing MARKET SELL immediately to cut loss.")
-            try:
-                from binance.enums import SIDE_SELL, ORDER_TYPE_MARKET
-                resp = client.create_order(
-                    symbol   = sym,
-                    side     = SIDE_SELL,
-                    type     = ORDER_TYPE_MARKET,
-                    quantity = qty_str,
-                )
-                print(f"  ✅ Market SELL placed: {resp.get('orderId')}")
-                # Mark the trade dict so caller can update log
-                trade["_market_sold"] = True
-                return resp
-            except BinanceAPIException as e:
-                raise RuntimeError(f"Market sell failed for {sym}: {e}") from e
-
-        # ── Race condition: price already above TP1 ────────────────────
-        if current >= tp1:
-            # Adjust TP1 upward: current + buffer, so OCO constraint holds
-            adjusted_tp = round_tick(current * (1 + TP_ADJUST_BUFFER), tick)
-            print(f"\n  ⚠  [{sym}] Price {current:.4f} ≥ TP1 {tp1:.4f} — price exceeded target.")
-            print(f"       Adjusting TP1 → {adjusted_tp:.4f} (current + {TP_ADJUST_BUFFER*100:.1f}% buffer)")
-            print(f"       Position already in profit beyond original target — OCO will protect gains.")
-            tp1 = adjusted_tp
-            trade["tp1"] = adjusted_tp  # update so log reflects actual OCO price
-
-        # ── Final constraint check ─────────────────────────────────────
-        if not (tp1 > current > sl):
-            last_err = RuntimeError(
-                f"OCO constraint still invalid after adjustment attempt {attempt}: "
-                f"tp1={tp1:.4f} current={current:.4f} sl={sl:.4f}"
-            )
-            import time as _time; _time.sleep(2)
-            continue
-
-        # ── Build OCO legs ─────────────────────────────────────────────
-        sl_stop  = round_tick(sl, tick)
-        sl_limit = round_tick(sl * 0.9985, tick)
-        if sl_limit >= sl_stop:
-            sl_limit = round_tick(sl_stop - tick, tick)
-
-        tp_price     = round_tick(tp1, tick)
-        tp_str       = f"{tp_price:.8f}".rstrip("0").rstrip(".")
-        sl_stop_str  = f"{sl_stop:.8f}".rstrip("0").rstrip(".")
-        sl_limit_str = f"{sl_limit:.8f}".rstrip("0").rstrip(".")
-
-        try:
-            resp = client.create_oco_order(
-                symbol           = sym,
-                side             = "SELL",
-                quantity         = qty_str,
-                aboveType        = "LIMIT_MAKER",
-                abovePrice       = tp_str,
-                belowType        = "STOP_LOSS_LIMIT",
-                belowStopPrice   = sl_stop_str,
-                belowPrice       = sl_limit_str,
-                belowTimeInForce = "GTC",
-            )
-            if attempt > 1:
-                print(f"  ✅ OCO placed on attempt {attempt} with adjusted prices.")
-            return resp
-        except BinanceAPIException as e:
-            err_str = str(e)
-            # Only retry on price-constraint errors; fail fast on other errors
-            if "price" in err_str.lower() or "-1013" in err_str or "-1021" in err_str:
-                last_err = RuntimeError(f"OCO placement failed (attempt {attempt}): {e}")
-                import time as _time; _time.sleep(2)
-                continue
-            raise RuntimeError(f"OCO placement failed: {e}") from e
-
-    raise last_err or RuntimeError(f"OCO placement failed after {MAX_OCO_RETRIES} attempts")
 
 
 # ---------------------------------------------------------------------------
@@ -1131,9 +695,9 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
     3. If OCO placed → check OCO legs for TP_HIT / SL_HIT, update log.
     4. Print grouped summary (compact by default, detailed with --verbose).
     """
-    trades     = load_trade_log()
+    trades     = repo.load_trade_log()
     # Filter trades according to mode (single/lab/all) for display and operations
-    filtered_trades = [t for t in trades if _match_mode(t, mode)]
+    filtered_trades = [t for t in trades if repo.match_mode(t, mode)]
     open_trades = [t for t in filtered_trades if t.get("exit_status") == "OPEN"]
     log_dirty  = False
 
@@ -1274,7 +838,7 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
                 oco_resp, last_err = None, None
                 for attempt in range(1, 3):
                     try:
-                        oco_resp = place_oco_order(client, trade)
+                        oco_resp = SpotOrderExecutor(client).place_oco_order(trade)
                         break
                     except RuntimeError as e:
                         last_err = e
@@ -1391,7 +955,7 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
                 except Exception as e:
                     oco_str = f"⚠ {e}"
 
-            if not should_show_live_position(trade, entry_status):
+            if not repo.should_show_live_position(trade, entry_status):
                 continue
 
             # ── Step 4: Compact line + optional verbose card ────────────
@@ -1563,7 +1127,7 @@ def check_positions(client, verbose: bool = False, mode: str = "all") -> None:
 
     # ── Save updates ───────────────────────────────────────────────────
     if log_dirty:
-        from supabase_client import update_spot_by_order_id
+        from services.supabase_client import update_spot_by_order_id
         for ot in open_trades:
             eid = ot.get("entry_order_id")
             if not eid:
@@ -1616,7 +1180,7 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
     # ── Simulated balance (Task 3 correction) ────────────────────────
     # Use simulated capital (BUDGET_USD + closed PnL), NOT real testnet wallet.
     # Real testnet wallet (~100k+) is irrelevant for scaling decisions.
-    trades = load_trade_log()
+    trades = repo.load_trade_log()
 
     if simulate_balance is not None:
         sim_balance = simulate_balance
@@ -1632,7 +1196,7 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
         print(f"  (Real testnet wallet balance is ignored for sizing/threshold decisions)")
 
     # ── Determine position limit and slots available ───────────────────
-    open_count   = count_open_positions(trades)
+    open_count   = repo.count_open_positions(trades)
     open_trades  = [t for t in trades if t.get("exit_status") == "OPEN"]
 
     if sim_balance >= DUAL_POSITION_MIN_BALANCE:
@@ -1757,7 +1321,8 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
     # ── Place order ───────────────────────────────────────────────────
     print("\n  Placing limit order on testnet...")
     try:
-        order = place_limit_order(client, best)
+        executor = SpotOrderExecutor(client, auto_confirm=True, repo=repo)
+        order = executor.execute(best)
     except RuntimeError as e:
         print(f"\n  ❌ Order failed: {e}")
         return
@@ -1770,11 +1335,10 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
     print(f"     Price     : {order.get('price')}")
     print(f"     Qty       : {order.get('origQty')}")
 
-    log_trade(order, best)
     print(f"\n  Trade logged to {TRADE_LOG_PATH}")
 
     # Remind if a 2nd slot is still available
-    new_open = count_open_positions(load_trade_log())
+    new_open = repo.count_open_positions(repo.load_trade_log())
     if new_open < position_limit:
         remaining_slots = position_limit - new_open
         print(f"\n  ℹ️  {remaining_slots} slot(s) still available for another position.")
@@ -1816,7 +1380,7 @@ def gather_all_candidates(scan_n: int, client, open_symbols: set[str] | None = N
 
     open_symbols = open_symbols or set()
 
-    from binance_throttle import SpotThrottle
+    from services.binance_throttle import SpotThrottle
     _throttle = SpotThrottle()
 
     def _get_used_weight() -> int:
@@ -2023,13 +1587,13 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
         print(f"❌ Testnet connection failed: {e}")
         sys.exit(1)
 
-    open_trades = [t for t in load_trade_log() if t.get("exit_status") == "OPEN"]
+    open_trades = [t for t in repo.load_trade_log() if t.get("exit_status") == "OPEN"]
     open_symbols = {t["symbol"] for t in open_trades}
     if open_symbols:
         print(f"  Excluding already open symbol(s) from this batch: {', '.join(sorted(open_symbols))}\n")
 
     # Compute lab capital pool (compounding) and display status
-    all_trades = load_trade_log()
+    all_trades = repo.load_trade_log()
     pool = compute_lab_pool(all_trades)
     lab_cap = pool["lab_capital"]
     net_pnl = pool["closed_cluster_pnl"]
@@ -2122,8 +1686,8 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
             cand["ml_score"] = ml_result["ml_score"]
             cand["ml_model_version"] = ml_result["ml_model_version"]
 
-            order = place_limit_order(client, cand)
-            log_trade(order, cand, correlation_cluster_id=cluster_id)
+            executor = SpotOrderExecutor(client, auto_confirm=True, repo=repo)
+            order = executor.execute(cand, correlation_cluster_id=cluster_id)
             ml_tag   = f"  ml={cand['ml_score']:.2f}" if cand.get('ml_score') is not None else ""
             rank_tag = f"  rank=#{cand['symbol_rank']}" if cand.get('symbol_rank') is not None else ""
             print(f"  ✅ {cand['symbol']:<12} order #{order.get('orderId')}  "
@@ -2149,10 +1713,10 @@ def cmd_stats(mode: str = "all") -> None:
     from collections import defaultdict
     import math
 
-    trades = load_trade_log()
+    trades = repo.load_trade_log()
     # Filter trades by mode
     closed = [t for t in trades
-              if t.get("exit_status") in ("TP_HIT", "SL_HIT") and _match_mode(t, mode)]
+              if t.get("exit_status") in ("TP_HIT", "SL_HIT") and repo.match_mode(t, mode)]
 
     if not closed:
         print("\n  No closed trades yet. Run --check-positions after trades resolve.")
@@ -2266,8 +1830,8 @@ def main():
 
     # Export-clean is a convenience to write a filtered ML-ready dataset then exit
     if args.export_clean:
-        all_trades = load_trade_log()
-        export_clean(all_trades, mode=args.mode)
+        all_trades = repo.load_trade_log()
+        repo.export_clean(all_trades, mode=args.mode)
         return
 
 
