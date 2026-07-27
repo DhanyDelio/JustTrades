@@ -63,7 +63,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
-             patch.object(pte, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -124,7 +124,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
-             patch.object(pte, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -190,7 +190,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(position_listener, "load_trade_log", return_value=[trade]), \
              patch.object(position_listener, "save_trade_log") as save_trade_log, \
-             patch.object(position_listener, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -229,7 +229,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
         messages = []
         with patch.object(position_listener, "load_trade_log", return_value=[trade]), \
              patch.object(position_listener, "save_trade_log"), \
-             patch.object(position_listener, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -276,7 +276,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
             }
             with patch.object(position_listener, "load_trade_log", return_value=[trade2]), \
                  patch.object(position_listener, "save_trade_log"), \
-                 patch.object(position_listener, "compute_lab_pool", return_value={
+                 patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                      "lab_capital": 100.0,
                      "closed_cluster_pnl": 0.0,
                      "deployed_capital": 0.0,
@@ -339,7 +339,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
         messages = []
         with patch.object(position_listener, "load_trade_log", return_value=[trade]), \
              patch.object(position_listener, "save_trade_log"), \
-             patch.object(position_listener, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -392,7 +392,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
         messages = []
         with patch.object(position_listener, "load_trade_log", return_value=[trade]), \
              patch.object(position_listener, "save_trade_log"), \
-             patch.object(position_listener, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -446,7 +446,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
         messages = []
         with patch.object(position_listener, "load_trade_log", return_value=[trade]), \
              patch.object(position_listener, "save_trade_log"), \
-             patch.object(position_listener, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,
@@ -509,7 +509,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
-             patch.object(pte, "compute_lab_pool", return_value={
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
                  "deployed_capital": 0.0,

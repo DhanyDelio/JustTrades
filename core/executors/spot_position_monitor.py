@@ -8,9 +8,11 @@ import services.chart_analyzer as ca
 from core.paper_trade_executor import (
     _fmt_order_status,
     _send_telegram,
-    compute_lab_pool,
-    LAB_STARTING_CAPITAL
+    LAB_STARTING_CAPITAL,
+    BUDGET_USD,
+    PER_TRADE_BUDGET
 )
+from core.managers.portfolio_manager import PortfolioManager
 
 class SpotPositionMonitor:
     def __init__(self, client, repo, order_executor):
@@ -49,7 +51,8 @@ class SpotPositionMonitor:
             return
     
         # Show lab pool status (if any clustered trades exist)
-        pool = compute_lab_pool(trades)
+        pm = PortfolioManager(repo, BUDGET_USD, LAB_STARTING_CAPITAL, PER_TRADE_BUDGET)
+        pool = pm.compute_lab_pool(trades)
         lab_cap = pool["lab_capital"]
         net_pnl = pool["closed_cluster_pnl"]
         deployed = pool["deployed_capital"]
