@@ -183,8 +183,8 @@ class TestFuturesCheckPositions(unittest.TestCase):
 
     # ── Skenario 1: Entry masih NEW ───────────────────────────────────────────
 
-    @patch("supabase_client.fetch_all_futures")
-    @patch("supabase_client.update_futures_by_order_id")
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
     def test_entry_still_new_no_change(self, mock_update, mock_fetch):
         print("\n=== Test futures check_positions: Entry NEW → no change ===")
         executor, mock_client = self._make_executor()
@@ -204,8 +204,8 @@ class TestFuturesCheckPositions(unittest.TestCase):
 
     # ── Skenario 2: Entry baru FILLED → place exit orders ────────────────────
 
-    @patch("supabase_client.fetch_all_futures")
-    @patch("supabase_client.update_futures_by_order_id")
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
     def test_entry_newly_filled_places_exit_orders(self, mock_update, mock_fetch):
         print("\n=== Test futures check_positions: Entry FILLED → place TP+SL ===")
         executor, mock_client = self._make_executor()
@@ -253,8 +253,8 @@ class TestFuturesCheckPositions(unittest.TestCase):
 
     # ── Skenario 3: TP_HIT via algo query ────────────────────────────────────
 
-    @patch("supabase_client.fetch_all_futures")
-    @patch("supabase_client.update_futures_by_order_id")
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
     def test_tp_hit_detected(self, mock_update, mock_fetch):
         print("\n=== Test futures check_positions: TP_HIT detected ===")
         executor, mock_client = self._make_executor()
@@ -302,8 +302,8 @@ class TestFuturesCheckPositions(unittest.TestCase):
 
     # ── Skenario 4: SL_HIT via algo query ────────────────────────────────────
 
-    @patch("supabase_client.fetch_all_futures")
-    @patch("supabase_client.update_futures_by_order_id")
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
     def test_sl_hit_detected(self, mock_update, mock_fetch):
         print("\n=== Test futures check_positions: SL_HIT detected ===")
         executor, mock_client = self._make_executor()
@@ -348,8 +348,8 @@ class TestFuturesCheckPositions(unittest.TestCase):
 
     # ── Skenario 5: Price-guard SL breach ────────────────────────────────────
 
-    @patch("supabase_client.fetch_all_futures")
-    @patch("supabase_client.update_futures_by_order_id")
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
     def test_price_guard_sl_breach(self, mock_update, mock_fetch):
         print("\n=== Test futures check_positions: price-guard SL breach ===")
         executor, mock_client = self._make_executor()
@@ -424,7 +424,7 @@ class TestFuturesLogTrade(unittest.TestCase):
         cand.update(overrides)
         return cand
 
-    @patch("supabase_client.upsert_futures")
+    @patch("services.supabase_client.upsert_futures")
     def test_happy_path_all_fields(self, mock_upsert):
         print("\n=== Test futures log_trade: Happy path ===")
         executor = self._make_executor()
@@ -456,7 +456,7 @@ class TestFuturesLogTrade(unittest.TestCase):
         print(f"✓ fee_usd_roundtrip={record['fee_usd_roundtrip']} "
               f"(720 × 0.0004 × 2 = 0.576)")
 
-    @patch("supabase_client.upsert_futures")
+    @patch("services.supabase_client.upsert_futures")
     def test_fee_calculation(self, mock_upsert):
         print("\n=== Test futures log_trade: Fee calculation ===")
         executor = self._make_executor()
@@ -470,7 +470,7 @@ class TestFuturesLogTrade(unittest.TestCase):
         print(f"✓ fee_usd_roundtrip={record['fee_usd_roundtrip']} "
               f"(1000 × 0.0004 × 2 = 0.8)")
 
-    @patch("supabase_client.upsert_futures")
+    @patch("services.supabase_client.upsert_futures")
     def test_no_cluster_id(self, mock_upsert):
         print("\n=== Test futures log_trade: No cluster_id ===")
         executor = self._make_executor()

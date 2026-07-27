@@ -17,35 +17,36 @@ Dependencies (already installed from chart_analyzer):
 
 from __future__ import annotations
 
+# Standard library
 import argparse
-
+import contextlib
+import io
 import json
 import os
-from core.repositories.spot_trade_repository import SpotTradeRepository
-repo = SpotTradeRepository()
 import sys
-import io
-import contextlib
 from datetime import datetime, timezone
 from pathlib import Path
-from core.executors.spot_order_executor import SpotOrderExecutor
-from core.utils.binance_math import (
-    get_symbol_constraints,
-    compute_position_size,
-    round_step,
-    round_tick,
-)
 
+# Third-party
 import requests
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Reuse chart_analyzer's analysis engine — no duplication
+# Project local
 import services.chart_analyzer as ca
+from core.executors.spot_order_executor import SpotOrderExecutor
+from core.repositories.spot_trade_repository import SpotTradeRepository
+from core.utils.binance_math import (
+    compute_position_size,
+    get_symbol_constraints,
+    round_step,
+    round_tick,
+)
+
+repo = SpotTradeRepository()
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -150,21 +151,6 @@ def get_actual_usdt_balance(client) -> float:
     except Exception as e:
         print(f"  [WARN] Could not fetch testnet USDT balance: {e}")
         return 9999.0   # assume sufficient if query fails
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# 2. EXCHANGE INFO — min notional, lot size, tick size
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# 4. CANDIDATE SELECTION
-# ---------------------------------------------------------------------------
 
 
 
@@ -287,33 +273,6 @@ def print_proposal(cand: dict) -> None:
     print(f"    Remaining    : ${bud - sz['notional_usd']:.2f} (held in USDT)")
     if sz["notional_usd"] > bud:
         print(f"    ⚠  Position value EXCEEDS slot budget — reduce RISK_FRACTION or pick a cheaper pair")
-
-
-# ---------------------------------------------------------------------------
-# 6. TRADE LOG
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# 8. ORDER EXECUTION
-# ---------------------------------------------------------------------------
-
-
 
 
 

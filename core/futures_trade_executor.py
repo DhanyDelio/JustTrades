@@ -41,9 +41,9 @@ try:
 except ImportError:
     pass
 
-# Reuse chart_analyzer's analysis engine — zero duplication
-sys.path.insert(0, str(Path(__file__).parent))
-import chart_analyzer as ca
+# Root resolution boilerplate for CLI wrapper
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from services import chart_analyzer as ca
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -79,7 +79,7 @@ FUTURES_PART_SIZE: int = 25   # symbols per scan part
 FUTURES_MAX_PARTS: int = 4    # 4 × 25 = 100 symbols — always scan all parts
 
 # Trade log — completely separate from spot's trade_log.json
-FUTURES_LOG_PATH = Path("./trade_futures.json")
+FUTURES_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "json" / "trade_futures.json"
 
 # Rule version — bump when parameters change
 RULE_VERSION: str = "fv1.0.0"
@@ -635,7 +635,7 @@ def load_futures_log() -> list[dict]:
     trade_futures.json is kept as a backup but is no longer the source of truth.
     """
     try:
-        from supabase_client import fetch_all_futures
+        from services.supabase_client import fetch_all_futures
         return fetch_all_futures()
     except Exception as e:
         print(f"  [WARN] Supabase read failed, falling back to trade_futures.json: {e}")
@@ -656,7 +656,7 @@ def save_futures_log(trades: list[dict]) -> None:
 def log_futures_trade(order: dict, cand: dict,
                       correlation_cluster_id: str | None = None) -> None:
     """Insert new futures trade into Supabase trades_futures table."""
-    from supabase_client import upsert_futures
+    from services.supabase_client import upsert_futures
     sizing  = cand["sizing"]
     liq     = cand["liquidation"]
     ez      = cand.get("entry_zone") or {}
@@ -759,7 +759,7 @@ def gather_futures_candidates(scan_n: int = DEFAULT_SCAN_N) -> list[dict]:
     Returns candidates sorted by risk% ASC.
     """
     import time as _time
-    from binance_throttle import FuturesThrottle
+    from services.binance_throttle import FuturesThrottle
 
     _throttle  = FuturesThrottle()
     total_syms = ca.get_top_symbols_by_volume(scan_n)
@@ -1797,7 +1797,7 @@ def check_futures_positions(client, verbose: bool = False) -> None:
 
     # ── Save ──────────────────────────────────────────────────────────
     if log_dirty:
-        from supabase_client import update_futures_by_order_id
+        from services.supabase_client import update_futures_by_order_id
         for ot in open_trades:
             eid = ot.get("entry_order_id")
             if not eid:
@@ -2095,7 +2095,9 @@ def cmd_propose_futures(
 
     print("\n  Placing futures limit order...")
     try:
-        order = place_futures_limit_order(client, best)
+        from core.executors.futures_order_executor import FuturesOrderExecutor
+        executor = FuturesOrderExecutor(client, dry_run=False, auto_confirm=auto_confirm)
+        order = executor.execute(best)
     except RuntimeError as e:
         print(f"\n  ❌ Order failed: {e}")
         return
@@ -2108,8 +2110,7 @@ def cmd_propose_futures(
     print(f"     Price     : {order.get('price')}")
     print(f"     Qty       : {order.get('origQty')}")
 
-    log_futures_trade(order, best)
-    print(f"\n  Trade logged to {FUTURES_LOG_PATH}")
+    print(f"\n  Trade logged to Supabase and {FUTURES_LOG_PATH}")
 
     # Telegram notify
     _send_telegram(
@@ -2259,8 +2260,9 @@ def cmd_propose_multi_futures(
         sym  = cand["symbol"]
         side = cand["position_side"]
         try:
-            order = place_futures_limit_order(client, cand)
-            log_futures_trade(order, cand, correlation_cluster_id=cluster_id)
+            from core.executors.futures_order_executor import FuturesOrderExecutor
+            executor = FuturesOrderExecutor(client, dry_run=False, auto_confirm=auto_confirm)
+            order = executor.execute(cand, correlation_cluster_id=cluster_id)
             oid = order.get("orderId")
             print(f"  ✅ {sym:<12} {side:<5}  order #{oid}  "
                   f"price={order.get('price')}")

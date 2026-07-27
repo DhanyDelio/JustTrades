@@ -332,10 +332,10 @@ class TestCheckPositions(unittest.TestCase):
     # ── Skenario 1: Entry masih NEW ───────────────────────────────────────────
 
     @unittest.mock.patch(
-        "supabase_client.fetch_all_spot"
+        "services.supabase_client.fetch_all_spot"
     )
     @unittest.mock.patch(
-        "supabase_client.update_spot_by_order_id"
+        "services.supabase_client.update_spot_by_order_id"
     )
     def test_entry_still_new_no_state_change(self, mock_update, mock_fetch):
         """Entry masih NEW → tidak ada OCO, tidak ada update ke Supabase."""
@@ -364,10 +364,10 @@ class TestCheckPositions(unittest.TestCase):
     # ── Skenario 2: Entry baru FILLED → trigger place_exit_orders() ──────────
 
     @unittest.mock.patch(
-        "supabase_client.fetch_all_spot"
+        "services.supabase_client.fetch_all_spot"
     )
     @unittest.mock.patch(
-        "supabase_client.update_spot_by_order_id"
+        "services.supabase_client.update_spot_by_order_id"
     )
     def test_entry_newly_filled_places_oco(self, mock_update, mock_fetch):
         """Entry baru FILLED → fill price dicatat + OCO langsung dipasang."""
@@ -425,10 +425,10 @@ class TestCheckPositions(unittest.TestCase):
     # ── Skenario 3: TP_HIT terdeteksi ────────────────────────────────────────
 
     @unittest.mock.patch(
-        "supabase_client.fetch_all_spot"
+        "services.supabase_client.fetch_all_spot"
     )
     @unittest.mock.patch(
-        "supabase_client.update_spot_by_order_id"
+        "services.supabase_client.update_spot_by_order_id"
     )
     def test_tp_hit_detected_and_resolved(self, mock_update, mock_fetch):
         """OCO ALL_DONE, LIMIT_MAKER (TP) leg FILLED → exit_status=TP_HIT."""
@@ -489,10 +489,10 @@ class TestCheckPositions(unittest.TestCase):
     # ── Skenario 4: SL_HIT terdeteksi ────────────────────────────────────────
 
     @unittest.mock.patch(
-        "supabase_client.fetch_all_spot"
+        "services.supabase_client.fetch_all_spot"
     )
     @unittest.mock.patch(
-        "supabase_client.update_spot_by_order_id"
+        "services.supabase_client.update_spot_by_order_id"
     )
     def test_sl_hit_detected_and_resolved(self, mock_update, mock_fetch):
         """OCO ALL_DONE, STOP_LOSS_LIMIT leg FILLED → exit_status=SL_HIT."""
@@ -548,10 +548,10 @@ class TestCheckPositions(unittest.TestCase):
     # ── Skenario 5: OCO belum placed (oco_placed=False), entry FILLED → retry ─
 
     @unittest.mock.patch(
-        "supabase_client.fetch_all_spot"
+        "services.supabase_client.fetch_all_spot"
     )
     @unittest.mock.patch(
-        "supabase_client.update_spot_by_order_id"
+        "services.supabase_client.update_spot_by_order_id"
     )
     def test_oco_not_placed_triggers_placement(self, mock_update, mock_fetch):
         """
@@ -660,7 +660,7 @@ class TestLogTrade(unittest.TestCase):
 
     # ── 1. Happy path ─────────────────────────────────────────────────────────
 
-    @unittest.mock.patch("supabase_client.upsert_spot")
+    @unittest.mock.patch("services.supabase_client.upsert_spot")
     def test_happy_path_all_fields(self, mock_upsert):
         print("\n=== Test log_trade: Happy path ===")
         executor = self._make_executor()
@@ -729,7 +729,7 @@ class TestLogTrade(unittest.TestCase):
 
     # ── 2. Opsional fields None → masuk sebagai None ──────────────────────────
 
-    @unittest.mock.patch("supabase_client.upsert_spot")
+    @unittest.mock.patch("services.supabase_client.upsert_spot")
     def test_optional_fields_passed_as_none(self, mock_upsert):
         print("\n=== Test log_trade: Optional fields None ===")
         executor = self._make_executor()
@@ -747,7 +747,7 @@ class TestLogTrade(unittest.TestCase):
 
     # ── 3. winning_zone None → default zone_type "T1" ────────────────────────
 
-    @unittest.mock.patch("supabase_client.upsert_spot")
+    @unittest.mock.patch("services.supabase_client.upsert_spot")
     def test_winning_zone_none_defaults_to_T1(self, mock_upsert):
         print("\n=== Test log_trade: winning_zone=None → zone_type=T1 ===")
         executor = self._make_executor()
@@ -762,7 +762,7 @@ class TestLogTrade(unittest.TestCase):
 
     # ── 4. Sizing fields diambil dengan benar ────────────────────────────────
 
-    @unittest.mock.patch("supabase_client.upsert_spot")
+    @unittest.mock.patch("services.supabase_client.upsert_spot")
     def test_sizing_fields_extracted_correctly(self, mock_upsert):
         print("\n=== Test log_trade: sizing fields ===")
         executor = self._make_executor()
@@ -782,7 +782,7 @@ class TestLogTrade(unittest.TestCase):
 
     # ── 5. budget_for_slot override ───────────────────────────────────────────
 
-    @unittest.mock.patch("supabase_client.upsert_spot")
+    @unittest.mock.patch("services.supabase_client.upsert_spot")
     def test_budget_for_slot_override(self, mock_upsert):
         print("\n=== Test log_trade: budget_for_slot override ===")
         executor = self._make_executor()

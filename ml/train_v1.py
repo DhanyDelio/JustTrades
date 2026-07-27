@@ -42,7 +42,7 @@ from sklearn.metrics import (
 )
 import joblib
 
-from supabase_client import fetch_all_spot
+from services.supabase_client import fetch_all_spot
 
 # ── Config ────────────────────────────────────────────────────────────
 VALID_RULE_VERSIONS = {"v1.0.0", None}

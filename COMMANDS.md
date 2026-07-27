@@ -239,6 +239,9 @@ GitHub → Actions → **Hourly Trade Bot** → **Run workflow**
 
 ## Quick Reference
 
+### 1. Root Wrappers
+*Executed from root directory.*
+
 ```bash
 # ── Spot ──────────────────────────────────────────────────────
 python3 paper_trade_executor.py --propose                  # single best
@@ -257,16 +260,36 @@ python3 futures_trade_executor.py --check-positions
 python3 futures_trade_executor.py --check-positions --verbose
 python3 futures_trade_executor.py --stats-futures
 
+# ── Dashboard ─────────────────────────────────────────────────
+python3 dashboard.py
+# atau
+streamlit run dashboard.py
+
 # ── Chart analysis ────────────────────────────────────────────
 python3 chart_analyzer.py --symbol BTCUSDT
 python3 chart_analyzer.py --scan-top 30 --no-chart
+```
+
+### 2. Services
+*Background services and listeners.*
+
+```bash
+# ── Position Listener ─────────────────────────────────────────
+python3 services/position_listener.py --test-notify        # Test Telegram notification
+python3 services/position_listener.py                      # Run listener in background
+```
+
+### 3. Tests & Scripts
+*Testing, migrations, and machine learning scripts.*
+
+```bash
+# ── Tests ─────────────────────────────────────────────────────
+python3 -m unittest discover tests/                        # Run all tests
+python3 tests/test_check_positions_guard.py                # Run individual test
+
+# ── Scripts ───────────────────────────────────────────────────
+python3 scripts/migration_to_supabase.py                   # Run Supabase migration
 
 # ── ML ────────────────────────────────────────────────────────
-python3 ml/train_v1.py
-
-# ── Dashboard ─────────────────────────────────────────────────
-streamlit run dashboard.py
-
-# ── Telegram test ─────────────────────────────────────────────
-python3 position_listener.py --test-notify
+python3 ml/train_v1.py                                     # Train ML model v1
 ```

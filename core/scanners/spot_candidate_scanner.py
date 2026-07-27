@@ -3,7 +3,7 @@ import contextlib
 import time
 import services.chart_analyzer as ca
 from core.utils.binance_math import get_symbol_constraints, round_tick, compute_position_size
-from core.paper_trade_executor import ZONE_ENTRY_BUFFER_PCT, RISK_FRACTION, DEFAULT_SCAN_N, PART_SIZE, MAX_PARTS, SCAN_PART_DELAY_SEC, RATE_LIMIT_WEIGHT_CEILING, BUDGET_USD
+from core.paper_trade_executor import ZONE_ENTRY_BUFFER_PCT, RISK_FRACTION, DEFAULT_SCAN_N, PART_SIZE, MAX_PARTS, SCAN_PART_DELAY_SEC, RATE_LIMIT_WEIGHT_CEILING, BUDGET_USD, PER_TRADE_BUDGET
 
 class SpotCandidateScanner:
     def __init__(self, client, repo):
@@ -427,7 +427,7 @@ class SpotCandidateScanner:
         for cand in all_raw:
             sym = cand["symbol"]
             try:
-                constraints = get_symbol_constraints(client, sym)
+                constraints = get_symbol_constraints(self.client, sym)
             except Exception:
                 continue
     

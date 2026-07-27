@@ -301,7 +301,7 @@ class SpotOrderExecutor(OrderExecutor):
         import os
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
-        from supabase_client import fetch_all_spot
+        from services.supabase_client import fetch_all_spot
 
         trades     = fetch_all_spot()
         open_trades = [t for t in trades if t.get("exit_status") == "OPEN"]
@@ -583,7 +583,7 @@ class SpotOrderExecutor(OrderExecutor):
         log_trade()   → INSERT new row  (called once at trade open)
         _persist_update() → PATCH existing row (called during lifecycle)
         """
-        from supabase_client import update_spot_by_order_id
+        from services.supabase_client import update_spot_by_order_id
         update_spot_by_order_id(entry_order_id, fields)
 
     # ── Class-level constants (mirror paper_trade_executor.py) ───────────────
@@ -615,7 +615,7 @@ class SpotOrderExecutor(OrderExecutor):
         correlation_cluster_id : str | None
             Cluster ID from --propose-all batch run, None for single --propose.
         """
-        from supabase_client import upsert_spot
+        from services.supabase_client import upsert_spot
         from datetime import datetime, timezone
 
         ez       = cand.get("entry_zone") or {}
@@ -749,7 +749,7 @@ class FuturesOrderExecutor(OrderExecutor):
 
     def _persist_update(self, entry_order_id: int, fields: dict) -> None:
         """Patch fields on existing trades_futures row."""
-        from supabase_client import update_futures_by_order_id
+        from services.supabase_client import update_futures_by_order_id
         update_futures_by_order_id(entry_order_id, fields)
 
 
@@ -903,7 +903,7 @@ class FuturesOrderExecutor(OrderExecutor):
         """
         import sys
         sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
-        from supabase_client import fetch_all_futures
+        from services.supabase_client import fetch_all_futures
         from datetime import datetime, timezone
 
         trades      = fetch_all_futures()
@@ -1174,7 +1174,7 @@ class FuturesOrderExecutor(OrderExecutor):
         Insert new futures trade into Supabase trades_futures.
         Schema identical to log_futures_trade() in futures_trade_executor.py.
         """
-        from supabase_client import upsert_futures
+        from services.supabase_client import upsert_futures
         from datetime import datetime, timezone
 
         sizing = cand["sizing"]

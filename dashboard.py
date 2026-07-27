@@ -4,13 +4,16 @@ import pytz
 from datetime import datetime
 import streamlit.components.v1 as components
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from pathlib import Path
 from streamlit_autorefresh import st_autorefresh
 
-from supabase_client import fetch_all_spot, fetch_all_futures
+from services.supabase_client import fetch_all_spot, fetch_all_futures
 
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
@@ -70,8 +73,9 @@ def load_trade_data() -> pd.DataFrame:
     try:
         rows = fetch_all_spot()
     except Exception as exc:
-        st.error(f"Failed to load spot trades from Supabase: {exc}")
-        st.stop()
+        st.error("Failed to load spot trades from Supabase.")
+        st.exception(exc)
+        return pd.DataFrame()
 
     if not rows:
         return pd.DataFrame()
@@ -84,7 +88,7 @@ def load_trade_data() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT"])
+    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT", "CANCELED"])
     df["is_win"]      = df["realized_pnl_usd"].gt(0)
 
     def parse_epoch_ms(series):
@@ -281,7 +285,8 @@ def load_futures_data() -> pd.DataFrame:
     try:
         rows = fetch_all_futures()
     except Exception as exc:
-        st.error(f"Failed to load futures trades from Supabase: {exc}")
+        st.error("Failed to load futures trades from Supabase.")
+        st.exception(exc)
         return pd.DataFrame()
 
     if not rows:
@@ -297,7 +302,7 @@ def load_futures_data() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT"])
+    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT", "CANCELED"])
     df["is_win"]      = df["realized_pnl_usd"].gt(0)
 
     def parse_epoch_ms(series):
@@ -686,7 +691,7 @@ def _status_badge(status: str) -> str:
         "NEW":              "🕐 NEW",
         "PARTIALLY_FILLED": "🔄 PARTIAL",
         "FILLED":           "✅ FILLED",
-        "CANCELED":         "❌ CANCELED",
+        "CANCELED":         "⚪️ CANCELED",
         "OPEN":             "🟢 OPEN",
         "TP_HIT":           "🟢 TP HIT",
         "SL_HIT":           "🔴 SL HIT",
@@ -1149,13 +1154,22 @@ def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
     direction   = trade.get("direction") or trade.get("position_side") or "?"
 
     is_win      = exit_status == "TP_HIT"
-    pnl_color   = "#2ca02c" if is_win else "#d62728"
+    is_canceled = exit_status == "CANCELED"
+    pnl_color   = "#808080" if is_canceled else ("#2ca02c" if is_win else "#d62728")
     border_css  = f"border-left: 4px solid {pnl_color}; padding-left: 10px;"
-    icon        = "🟢" if is_win else "🔴"
-    label       = "TP HIT" if is_win else "SL HIT"
+    icon        = "⚪️" if is_canceled else ("🟢" if is_win else "🔴")
+    label       = "CANCELED" if is_canceled else ("TP HIT" if is_win else "SL HIT")
 
     # Exit time
     exit_time_raw = trade.get("exit_time")
+    if exit_time_raw is None and is_canceled:
+        ot = trade.get("open_time")
+        if ot:
+            try:
+                exit_time_raw = pd.to_datetime(ot).timestamp() * 1000
+            except:
+                pass
+
     exit_time_str = "n/a"
     if exit_time_raw is not None:
         try:
@@ -1252,28 +1266,58 @@ def render_open_positions_tab(
     def _is_recent(t: dict) -> bool:
         et = t.get("exit_time")
         if et is None:
+            if t.get("exit_status") == "CANCELED":
+                ot = t.get("open_time")
+                if ot:
+                    try:
+                        return pd.to_datetime(ot).timestamp() * 1000 >= cutoff_ms
+                    except Exception:
+                        pass
             return False
         try:
             return float(et) >= cutoff_ms
         except (TypeError, ValueError):
             return False
 
+    def _sort_key(t: dict) -> float:
+        et = t.get("exit_time")
+        if et is not None:
+            try: return float(et)
+            except: pass
+        if t.get("exit_status") == "CANCELED":
+            ot = t.get("open_time")
+            if ot:
+                try: return pd.to_datetime(ot).timestamp() * 1000
+                except: pass
+        return 0.0
+
     spot_resolved    = [t for t in spot_rows
-                        if t.get("exit_status") in ("TP_HIT", "SL_HIT") and _is_recent(t)]
+                        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)]
     futures_resolved = [t for t in futures_rows
-                        if t.get("exit_status") in ("TP_HIT", "SL_HIT") and _is_recent(t)]
+                        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)]
 
     # Sort resolved by exit_time desc (most recent first)
-    spot_resolved.sort(   key=lambda t: float(t.get("exit_time") or 0), reverse=True)
-    futures_resolved.sort(key=lambda t: float(t.get("exit_time") or 0), reverse=True)
+    spot_resolved.sort(key=_sort_key, reverse=True)
+    futures_resolved.sort(key=_sort_key, reverse=True)
 
     # ── Fetch live prices for open positions ──────────────────────────
     spot_syms    = list({t["symbol"] for t in spot_open    if t.get("symbol")})
     futures_syms = list({t["symbol"] for t in futures_open if t.get("symbol")})
 
     with st.spinner("Fetching live prices..."):
-        spot_prices    = _fetch_spot_prices(spot_syms)
-        futures_prices = _fetch_futures_prices(futures_syms)
+        try:
+            spot_prices = _fetch_spot_prices(spot_syms)
+        except Exception as e:
+            st.error("Failed to fetch live spot prices.")
+            st.exception(e)
+            spot_prices = {}
+            
+        try:
+            futures_prices = _fetch_futures_prices(futures_syms)
+        except Exception as e:
+            st.error("Failed to fetch live futures prices.")
+            st.exception(e)
+            futures_prices = {}
 
     # ── Sub-tabs ──────────────────────────────────────────────────────
     sub_spot, sub_futures = st.tabs([
@@ -1627,13 +1671,15 @@ def main():
         try:
             _spot_rows = fetch_all_spot()
         except Exception as exc:
-            st.error(f"Failed to load spot trades: {exc}")
+            st.error("Failed to load spot trades for Open Positions:")
+            st.exception(exc)
             _spot_rows = []
 
         try:
             _futures_rows = fetch_all_futures()
         except Exception as exc:
-            st.error(f"Failed to load futures trades: {exc}")
+            st.error("Failed to load futures trades for Open Positions:")
+            st.exception(exc)
             _futures_rows = []
 
         render_open_positions_tab(_spot_rows, _futures_rows)
