@@ -1730,13 +1730,14 @@ def main():
         except (TypeError, ValueError):
             _time_since_sec_num = float("nan")
 
+        is_time_since_valid = math.isfinite(_time_since_sec_num) and _time_since_sec_num >= 0
         is_stalled = (
             _time_since_sec_num > VM_STALL_THRESHOLD_SECONDS
-            if not math.isnan(_time_since_sec_num)
+            if is_time_since_valid
             else True
         )
         if is_stalled:
-            if _time_since_sec is not None and not (isinstance(_time_since_sec_num, float) and math.isnan(_time_since_sec_num)) and _time_since_sec_num >= 0:
+            if is_time_since_valid:
                 stale_mins = int(_time_since_sec_num // 60)
             else:
                 stale_mins = 999
