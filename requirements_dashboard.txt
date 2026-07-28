@@ -1,0 +1,11 @@
+# Requirements for local monitoring dashboard (MacBook)
+# Install: pip3 install -r requirements_dashboard.txt
+
+streamlit
+streamlit-autorefresh
+plotly
+pandas
+numpy
+python-dotenv
+supabase
+pytz
