@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  swing_trade:
+    build: .
+    container_name: swing_trade_bot
+    restart: always
+    # Automatically inject variables into the container environment
+    env_file:
+      - .env
+    # Mount .env so load_dotenv() in the code can also find it if needed
+    volumes:
+      - ./.env:/app/.env
