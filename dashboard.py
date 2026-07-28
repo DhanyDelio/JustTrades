@@ -38,6 +38,7 @@ class DashboardState:
         self.last_event_time = None  # HH:MM:SS string of last WebSocket event
         self.connected = False
         self.lock = threading.Lock()
+        self.pending_rerun = False   # set True by WS callbacks, cleared after rerun
 
 @st.cache_resource
 def get_global_state():
@@ -107,11 +108,10 @@ async def realtime_loop(state: DashboardState):
 
     # ── Helper: push rerun request to every active Streamlit session ──
     def trigger_ui_update():
-        # Update the global timestamp first — this is what _sync_session_state()
-        # detects on the next render cycle to know new data arrived.
-        # The actual request_rerun() below is best-effort; if it fails,
-        # the user's next interaction will still pick up the latest state.
-        state.last_updated = time.time()
+        # Mark that new data arrived — main() checks this flag at end of render
+        # to decide whether to rerun. Using a boolean flag is more reliable than
+        # timestamp comparison (avoids float precision / same-tick issues).
+        state.pending_rerun = True
         try:
             from streamlit.runtime import get_instance
             runtime = get_instance()
@@ -226,15 +226,8 @@ STARTING_LAB_CAPITAL = 240.0
 
 def _sync_session_state():
     """
-    Detect when the Realtime listener has pushed new data (last_updated changed)
+    Detect when the Realtime listener has pushed new data (pending_rerun=True)
     and ensure the current Streamlit session picks it up.
-
-    We store the last_updated value we rendered in st.session_state.
-    If global_state.last_updated is newer, it means a WebSocket event arrived
-    after our last render — rows in global_state are already up to date
-    (patched in-place by on_spot_change / on_futures_change), so we just
-    need to make sure the session re-renders with the current state.
-    No REST re-fetch needed; the in-memory rows are authoritative.
     """
     seen_ts = st.session_state.get("_last_seen_update", 0.0)
     if global_state.last_updated > seen_ts:
@@ -2065,16 +2058,13 @@ def main():
                 )
 
     # ── Auto-rerun on Realtime update ─────────────────────────────────
-    # If the WebSocket thread pushed new data DURING this render cycle
-    # (last_updated changed since we snapshotted it at the top via
-    # _sync_session_state), schedule one more rerun so the user sees
-    # the latest rows without a manual refresh.
-    # We use a short sleep to prevent an infinite tight rerun loop —
-    # 1s is enough for Streamlit to settle between reruns.
-    _rendered_ts = st.session_state.get("_last_seen_update", 0.0)
-    if global_state.last_updated > _rendered_ts:
+    # If the WebSocket thread pushed new data during or after this render
+    # cycle, pending_rerun will be True. Clear the flag and rerun once so
+    # the user sees the latest rows without a manual refresh.
+    if global_state.pending_rerun:
+        global_state.pending_rerun = False
         st.session_state["_last_seen_update"] = global_state.last_updated
-        time.sleep(1)
+        time.sleep(0.5)
         st.rerun()
 
 
