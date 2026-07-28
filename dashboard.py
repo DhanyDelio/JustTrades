@@ -107,6 +107,11 @@ async def realtime_loop(state: DashboardState):
 
     # ── Helper: push rerun request to every active Streamlit session ──
     def trigger_ui_update():
+        # Update the global timestamp first — this is what _sync_session_state()
+        # detects on the next render cycle to know new data arrived.
+        # The actual request_rerun() below is best-effort; if it fails,
+        # the user's next interaction will still pick up the latest state.
+        state.last_updated = time.time()
         try:
             from streamlit.runtime import get_instance
             runtime = get_instance()
@@ -216,8 +221,27 @@ STARTING_LAB_CAPITAL = 240.0
 
 
 # ---------------------------------------------------------------------------
-# SPOT — data loading + helpers  (unchanged from original)
+# SPOT — data loading + helpers
 # ---------------------------------------------------------------------------
+
+def _sync_session_state():
+    """
+    Detect when the Realtime listener has pushed new data (last_updated changed)
+    and ensure the current Streamlit session picks it up.
+
+    We store the last_updated value we rendered in st.session_state.
+    If global_state.last_updated is newer, it means a WebSocket event arrived
+    after our last render — rows in global_state are already up to date
+    (patched in-place by on_spot_change / on_futures_change), so we just
+    need to make sure the session re-renders with the current state.
+    No REST re-fetch needed; the in-memory rows are authoritative.
+    """
+    seen_ts = st.session_state.get("_last_seen_update", 0.0)
+    if global_state.last_updated > seen_ts:
+        st.session_state["_last_seen_update"] = global_state.last_updated
+
+_sync_session_state()
+
 
 def load_trade_data() -> pd.DataFrame:
     with global_state.lock:
@@ -1618,8 +1642,6 @@ def render_open_positions_tab(
 def main():
     st.title("Swing Trade Dashboard")
 
-
-
     now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
     c_btn, c_info = st.columns([1.5, 8.5])
@@ -2041,6 +2063,20 @@ def main():
                     "Futures pipeline runs independently without ML scoring. "
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
+
+    # ── Auto-rerun on Realtime update ─────────────────────────────────
+    # If the WebSocket thread pushed new data DURING this render cycle
+    # (last_updated changed since we snapshotted it at the top via
+    # _sync_session_state), schedule one more rerun so the user sees
+    # the latest rows without a manual refresh.
+    # We use a short sleep to prevent an infinite tight rerun loop —
+    # 1s is enough for Streamlit to settle between reruns.
+    _rendered_ts = st.session_state.get("_last_seen_update", 0.0)
+    if global_state.last_updated > _rendered_ts:
+        st.session_state["_last_seen_update"] = global_state.last_updated
+        time.sleep(1)
+        st.rerun()
+
 
 if __name__ == "__main__":
     main()
