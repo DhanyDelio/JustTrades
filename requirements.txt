@@ -20,3 +20,7 @@ supabase
 
 # Listener (optional, kept for --test-notify)
 websocket-client
+
+# Added for safety
+joblib
+pytz
