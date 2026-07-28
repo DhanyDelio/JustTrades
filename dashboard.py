@@ -118,14 +118,7 @@ async def realtime_loop(state: DashboardState):
 global_state = get_global_state()
 start_realtime_listener(global_state)
 
-# (Removed st_autorefresh)
 
-if "auto_check_log" not in st.session_state:
-    st.session_state.auto_check_log = ""
-    
-if st.session_state.get("auto_check_enabled", False):
-    # Perform auto check if enabled, maybe we should throttle this if triggered too often
-    pass
 
 
 STARTING_LAB_CAPITAL = 240.0
@@ -1486,18 +1479,13 @@ def main():
 
     now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
-    c_btn, c_toggle, c_info = st.columns([1.5, 2.5, 6])
+    c_btn, c_info = st.columns([1.5, 8.5])
     with c_btn:
         if st.button("🔄 Refresh data"):
             with global_state.lock:
                 global_state.spot_rows = None
                 global_state.futures_rows = None
             st.rerun()
-
-    with c_toggle:
-        st.toggle("Auto Check Positions (1h)", key="auto_check_enabled")
-        if st.session_state.get("auto_check_log"):
-            st.caption(st.session_state.auto_check_log)
 
     with c_info:
         df_spot = load_trade_data()
