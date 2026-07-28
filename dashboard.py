@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 from pathlib import Path
@@ -18,8 +19,91 @@ from services.supabase_client import fetch_all_spot, fetch_all_futures
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
 
-# Auto-refresh every 1 hour (3_600_000 ms)
-refresh_count = st_autorefresh(interval=3600_000, limit=None, key="dashboard_autorefresh")
+import threading
+import asyncio
+import time
+from supabase import create_async_client
+
+class DashboardState:
+    def __init__(self):
+        self.spot_rows = None
+        self.futures_rows = None
+        self.last_updated = time.time()
+        self.connected = False
+        self.lock = threading.Lock()
+
+@st.cache_resource
+def get_global_state():
+    return DashboardState()
+
+@st.cache_resource
+def start_realtime_listener(_state: DashboardState):
+    def run_async_loop():
+        asyncio.run(realtime_loop(_state))
+    
+    t = threading.Thread(target=run_async_loop, daemon=True)
+    t.start()
+    return t
+
+async def realtime_loop(state: DashboardState):
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return
+        
+    client = await create_async_client(url, key)
+    
+    def on_spot_change(payload):
+        with state.lock:
+            record = payload.get("record")
+            if not record or state.spot_rows is None: return
+            
+            found = False
+            for i, row in enumerate(state.spot_rows):
+                if row.get("id") == record.get("id"):
+                    state.spot_rows[i] = record
+                    found = True
+                    break
+            if not found:
+                state.spot_rows.append(record)
+            state.last_updated = time.time()
+            
+    def on_futures_change(payload):
+        with state.lock:
+            record = payload.get("record")
+            if not record or state.futures_rows is None: return
+            
+            found = False
+            for i, row in enumerate(state.futures_rows):
+                if row.get("id") == record.get("id"):
+                    state.futures_rows[i] = record
+                    found = True
+                    break
+            if not found:
+                state.futures_rows.append(record)
+            state.last_updated = time.time()
+
+    channel_spot = client.channel("public:paper_trades_v2")
+    channel_spot.on_postgres_changes(event="*", schema="public", table="paper_trades_v2", callback=on_spot_change)
+    
+    channel_futures = client.channel("public:futures_trades_v1")
+    channel_futures.on_postgres_changes(event="*", schema="public", table="futures_trades_v1", callback=on_futures_change)
+    
+    try:
+        await channel_spot.subscribe()
+        await channel_futures.subscribe()
+        state.connected = True
+        
+        while True:
+            await asyncio.sleep(1)
+    except Exception:
+        state.connected = False
+
+global_state = get_global_state()
+start_realtime_listener(global_state)
+
+# Auto-refresh every 1.5 seconds (1_500 ms) to poll global_state
+refresh_count = st_autorefresh(interval=1500, limit=None, key="dashboard_autorefresh")
 
 if "last_refresh_count" not in st.session_state:
     st.session_state.last_refresh_count = refresh_count
@@ -70,12 +154,15 @@ STARTING_LAB_CAPITAL = 240.0
 # ---------------------------------------------------------------------------
 
 def load_trade_data() -> pd.DataFrame:
-    try:
-        rows = fetch_all_spot()
-    except Exception as exc:
-        st.error("Failed to load spot trades from Supabase.")
-        st.exception(exc)
-        return pd.DataFrame()
+    with global_state.lock:
+        if global_state.spot_rows is None:
+            try:
+                global_state.spot_rows = fetch_all_spot()
+            except Exception as exc:
+                st.error("Failed to load spot trades from Supabase.")
+                st.exception(exc)
+                return pd.DataFrame()
+        rows = list(global_state.spot_rows)
 
     if not rows:
         return pd.DataFrame()
@@ -84,7 +171,7 @@ def load_trade_data() -> pd.DataFrame:
 
     for col in ["realized_pnl_usd", "realized_pnl_pct", "planned_rr",
                 "entry_price", "entry_fill_price", "sl", "tp1",
-                "entry_qty", "entry_notional", "budget_usd"]:
+                "entry_qty", "entry_notional", "budget_usd", "ml_score"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -282,12 +369,15 @@ def build_cluster_breakdown(df: pd.DataFrame):
 
 def load_futures_data() -> pd.DataFrame:
     """Load futures trades from Supabase (trades_futures table). Returns empty DataFrame on error."""
-    try:
-        rows = fetch_all_futures()
-    except Exception as exc:
-        st.error("Failed to load futures trades from Supabase.")
-        st.exception(exc)
-        return pd.DataFrame()
+    with global_state.lock:
+        if global_state.futures_rows is None:
+            try:
+                global_state.futures_rows = fetch_all_futures()
+            except Exception as exc:
+                st.error("Failed to load futures trades from Supabase.")
+                st.exception(exc)
+                return pd.DataFrame()
+        rows = list(global_state.futures_rows)
 
     if not rows:
         return pd.DataFrame()
@@ -1417,6 +1507,9 @@ def main():
     c_btn, c_toggle, c_info = st.columns([1.5, 2.5, 6])
     with c_btn:
         if st.button("🔄 Refresh data"):
+            with global_state.lock:
+                global_state.spot_rows = None
+                global_state.futures_rows = None
             st.rerun()
 
     with c_toggle:
@@ -1425,51 +1518,53 @@ def main():
             st.caption(st.session_state.auto_check_log)
 
     with c_info:
+        df_spot = load_trade_data()
+        df_fut = load_futures_data()
+        
+        max_ts_val = 0.0
+        
+        def get_max_ts(df):
+            if df.empty: return 0.0
+            ts_series = df.get("updated_at")
+            if ts_series is None or ts_series.isna().all():
+                ts_series = df.get("created_at")
+            if ts_series is not None:
+                max_dt = pd.to_datetime(ts_series, errors="coerce").max()
+                if pd.notna(max_dt):
+                    return max_dt.timestamp()
+            return 0.0
+
+        max_ts_val = max(max_ts_val, get_max_ts(df_spot))
+        max_ts_val = max(max_ts_val, get_max_ts(df_fut))
+            
+        now_ts = datetime.now(pytz.UTC).timestamp()
+        is_stalled = (now_ts - max_ts_val) > (75 * 60) if max_ts_val > 0 else False
+
+        conn_color = "#2ca02c" if global_state.connected else "#d62728"
+        conn_text = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        
+        if is_stalled:
+            vm_badge = "🔴 VM Inactive"
+            st.error("⚠️ **WARNING: VM Bot Offline / Stalled (No update in last 75 minutes)**")
+        else:
+            vm_badge = "🟢 VM Active"
+
         components.html(f"""
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
                     display: flex; align-items: center; gap: 15px; color: #555; padding-top: 6px;">
-            <div style="font-size: 14px;">
-                <strong>Last refreshed:</strong> <span style="color: #111;">{now_str}</span>
-            </div>
-            <div style="display: flex; align-items: center; gap: 8px; width: 220px;">
-                <span style="font-size: 13px; color: #777;">Next refresh:</span>
-                <span id="timer" style="font-family: monospace; font-weight: bold; font-size: 14px; width: 45px; color: #333;">60:00</span>
-                <div style="flex-grow: 1; height: 6px; background-color: #e0e0e0; border-radius: 3px; overflow: hidden;">
-                    <div id="bar" style="height: 100%; width: 100%; background-color: #2ca02c; transition: width 1s linear;"></div>
-                </div>
+            <div style="font-size: 14px; display: flex; align-items: center; gap: 8px;">
+                <strong style="color: {conn_color};">{conn_text}</strong> 
+                <span style="color: #ccc;">|</span>
+                <strong>{vm_badge}</strong>
+                <span style="color: #ccc;">|</span>
+                <strong>Last updated:</strong> <span style="color: #111;">{now_str}</span>
             </div>
         </div>
-        <script>
-            const duration = 3600;
-            const start = Date.now();
-            const timerEl = document.getElementById('timer');
-            const barEl = document.getElementById('bar');
-            
-            const interval = setInterval(() => {{
-                const elapsed = Math.floor((Date.now() - start) / 1000);
-                const remain = Math.max(0, duration - elapsed);
-                
-                const m = Math.floor(remain / 60);
-                const s = remain % 60;
-                timerEl.innerText = (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
-                
-                const pct = (remain / duration) * 100;
-                barEl.style.width = pct + '%';
-                
-                if (remain < 60) {{
-                    barEl.style.backgroundColor = '#ff7f0e';
-                }}
-                
-                if (remain <= 0) {{
-                    clearInterval(interval);
-                }}
-            }}, 1000);
-        </script>
         """, height=40)
 
     st.write("")
 
-    tab_spot, tab_futures, tab_open = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions"])
+    tab_spot, tab_futures, tab_open, tab_ml = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions", "🧪 ML Shadow Metrics"])
 
     # ── TAB 1: SPOT ──────────────────────────────────────────────────────────
     with tab_spot:
@@ -1669,14 +1764,20 @@ def main():
 
         # Load raw rows (not the processed DataFrames) so we have all original fields
         try:
-            _spot_rows = fetch_all_spot()
+            with global_state.lock:
+                if global_state.spot_rows is None:
+                    global_state.spot_rows = fetch_all_spot()
+                _spot_rows = list(global_state.spot_rows)
         except Exception as exc:
             st.error("Failed to load spot trades for Open Positions:")
             st.exception(exc)
             _spot_rows = []
 
         try:
-            _futures_rows = fetch_all_futures()
+            with global_state.lock:
+                if global_state.futures_rows is None:
+                    global_state.futures_rows = fetch_all_futures()
+                _futures_rows = list(global_state.futures_rows)
         except Exception as exc:
             st.error("Failed to load futures trades for Open Positions:")
             st.exception(exc)
@@ -1684,6 +1785,149 @@ def main():
 
         render_open_positions_tab(_spot_rows, _futures_rows)
 
+    # ── TAB 4: ML SHADOW METRICS ─────────────────────────────────────────
+    with tab_ml:
+        st.caption("Model: `ml/models/v2.pkl` · Version: `v2.0.0` · Mode: **Observation Only** (no veto)")
+        
+        df_spot_ml = load_trade_data()
+        
+        if df_spot_ml.empty:
+            st.info("No spot trades found.")
+        else:
+            has_ml = df_spot_ml["ml_score"].notna()
+            scored = df_spot_ml[has_ml].copy()
+            unscored = df_spot_ml[~has_ml].copy()
+
+            st.divider()
+
+            # ── KPIs ─────────────────────────────────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Scored Trades", len(scored))
+            m2.metric("Unscored (Legacy)", len(unscored))
+
+            scored_resolved = scored[scored["is_resolved"]].copy()
+            if not scored_resolved.empty:
+                scored_wr = scored_resolved["is_win"].mean() * 100
+                avg_score = scored["ml_score"].mean()
+                m3.metric("Scored Win Rate", f"{scored_wr:.1f}%")
+                m4.metric("Avg ML Score", f"{avg_score:.3f}")
+            else:
+                m3.metric("Scored Win Rate", "—")
+                m4.metric("Avg ML Score", f"{scored['ml_score'].mean():.3f}" if not scored.empty else "—")
+
+            st.divider()
+
+            if scored_resolved.empty:
+                st.warning("No resolved trades with ML scores yet. Waiting for more data...")
+            else:
+                col_left, col_right = st.columns(2)
+
+                # ── Score Distribution: Win vs Loss ──────────────────────
+                with col_left:
+                    st.markdown("#### Score Distribution by Outcome")
+                    scored_resolved["Outcome"] = scored_resolved["is_win"].map(
+                        {True: "✅ Win (TP Hit)", False: "🔴 Loss (SL Hit)"}
+                    )
+                    fig_dist = px.histogram(
+                        scored_resolved, x="ml_score", color="Outcome",
+                        nbins=20, barmode="overlay", opacity=0.7,
+                        color_discrete_map={
+                            "✅ Win (TP Hit)": "#2ca02c",
+                            "🔴 Loss (SL Hit)": "#d62728"
+                        },
+                        labels={"ml_score": "ML Score (P(win))"},
+                    )
+                    fig_dist.update_layout(
+                        template="plotly_white",
+                        xaxis=dict(range=[0, 1]),
+                        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
+                    )
+                    st.plotly_chart(fig_dist, use_container_width=True)
+
+                # ── Box Plot ─────────────────────────────────────────────
+                with col_right:
+                    st.markdown("#### Score Box Plot by Outcome")
+                    fig_box = px.box(
+                        scored_resolved, x="Outcome", y="ml_score",
+                        color="Outcome",
+                        color_discrete_map={
+                            "✅ Win (TP Hit)": "#2ca02c",
+                            "🔴 Loss (SL Hit)": "#d62728"
+                        },
+                        labels={"ml_score": "ML Score"},
+                    )
+                    fig_box.update_layout(template="plotly_white", showlegend=False)
+                    st.plotly_chart(fig_box, use_container_width=True)
+
+                # ── Threshold Simulation ─────────────────────────────────
+                st.markdown("#### 🎯 Threshold Simulation (What-If)")
+                st.caption("If we had used the ML score to filter trades, what would be the impact?")
+
+                thresh_data = []
+                for thresh in np.arange(0.1, 0.95, 0.05):
+                    approved = scored_resolved[scored_resolved["ml_score"] >= thresh]
+                    n_app = len(approved)
+                    if n_app == 0:
+                        continue
+                    wr = approved["is_win"].mean() * 100
+                    pnl = approved["realized_pnl_usd"].sum()
+                    filtered = len(scored_resolved) - n_app
+                    thresh_data.append({
+                        "Threshold": f"≥ {thresh:.2f}",
+                        "Trades": n_app,
+                        "Filtered": filtered,
+                        "Win Rate (%)": round(wr, 1),
+                        "Total PnL ($)": round(pnl, 2),
+                    })
+
+                if thresh_data:
+                    st.dataframe(pd.DataFrame(thresh_data), use_container_width=True, hide_index=True)
+
+                # ── Score vs PnL scatter ─────────────────────────────────
+                st.markdown("#### ML Score vs Realized PnL")
+                fig_scatter = px.scatter(
+                    scored_resolved, x="ml_score", y="realized_pnl_pct",
+                    color="Outcome",
+                    color_discrete_map={
+                        "✅ Win (TP Hit)": "#2ca02c",
+                        "🔴 Loss (SL Hit)": "#d62728"
+                    },
+                    hover_name="symbol",
+                    labels={"ml_score": "ML Score", "realized_pnl_pct": "Realized PnL (%)"},
+                )
+                fig_scatter.add_vline(x=0.5, line_dash="dash", line_color="gray",
+                                      annotation_text="Default threshold")
+                fig_scatter.update_layout(template="plotly_white")
+                st.plotly_chart(fig_scatter, use_container_width=True)
+
+                # ── Diagnostic Summary ───────────────────────────────────
+                st.divider()
+                st.markdown("#### 📊 Diagnostic Summary")
+
+                wins_scored = scored_resolved[scored_resolved["is_win"]]
+                losses_scored = scored_resolved[~scored_resolved["is_win"]]
+                avg_win_score = wins_scored["ml_score"].mean() if not wins_scored.empty else float("nan")
+                avg_loss_score = losses_scored["ml_score"].mean() if not losses_scored.empty else float("nan")
+
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Avg Score (Wins)", f"{avg_win_score:.3f}" if not pd.isna(avg_win_score) else "—")
+                d2.metric("Avg Score (Losses)", f"{avg_loss_score:.3f}" if not pd.isna(avg_loss_score) else "—")
+                score_gap = avg_win_score - avg_loss_score if not (pd.isna(avg_win_score) or pd.isna(avg_loss_score)) else 0
+                d3.metric("Score Gap (Win - Loss)", f"{score_gap:+.3f}")
+
+                if abs(score_gap) < 0.05:
+                    st.warning("⚠️ **Score gap < 0.05** — Model cannot distinguish wins from losses. "
+                               "ROC-AUC ≈ 0.50 (random). Shadow scoring is collecting data only.")
+                elif score_gap > 0.05:
+                    st.success("✅ **Positive score gap detected.** Monitor ROC-AUC trend as N grows.")
+                else:
+                    st.error("🔴 **Negative score gap** — Model is inversely correlated. Needs retraining.")
+
+                st.caption(
+                    "ℹ️ ML v2 Shadow Scoring is **Spot-only**. "
+                    "Futures pipeline runs independently without ML scoring. "
+                    "A dedicated Futures ML model will be trained when Effective N > 100."
+                )
 
 if __name__ == "__main__":
     main()
