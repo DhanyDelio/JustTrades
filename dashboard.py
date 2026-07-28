@@ -1635,6 +1635,19 @@ def render_open_positions_tab(
 def main():
     st.title("Swing Trade Dashboard")
 
+    # ── Auto-rerun once on first load to pick up WebSocket connected state ──
+    # The async thread needs a few seconds to handshake with Supabase.
+    # If this is the first render and WS is not yet connected, schedule
+    # one rerun after a short delay so the status bar shows green without
+    # the user having to manually refresh.
+    if not st.session_state.get("_ws_init_done", False):
+        if not global_state.connected:
+            time.sleep(3)
+            st.session_state["_ws_init_done"] = True
+            st.rerun()
+        else:
+            st.session_state["_ws_init_done"] = True
+
     now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
     c_btn, c_info = st.columns([1.5, 8.5])
