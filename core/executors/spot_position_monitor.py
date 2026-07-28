@@ -231,6 +231,21 @@ class SpotPositionMonitor:
                         trade["oco_order_ids"] = [o["orderId"] for o in oco_orders]
                         trade["oco_list_id"]   = oco_resp.get("orderListId")
                         log_dirty = True
+                        
+                        from services.supabase_client import update_spot_by_order_id
+                        eid = trade.get("entry_order_id")
+                        if eid:
+                            update_spot_by_order_id(eid, {
+                                "entry_status":          trade.get("entry_status"),
+                                "entry_fill_price":      trade.get("entry_fill_price"),
+                                "entry_fill_time":       trade.get("entry_fill_time"),
+                                "entry_qty":             trade.get("entry_qty"),
+                                "slippage_pct":          trade.get("slippage_pct"),
+                                "oco_placed":            True,
+                                "oco_order_ids":         trade.get("oco_order_ids"),
+                                "oco_list_id":           trade.get("oco_list_id"),
+                            })
+                            
                         print(f"  {sym:<10} ✅ OCO placed  List#{trade['oco_list_id']}")
                     else:
                         print(
