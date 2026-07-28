@@ -2070,11 +2070,54 @@ def main():
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
 
-    # ── Auto-rerun on Realtime update ─────────────────────────────────
-    # ── Polling loop: check pending_rerun flag every 3s ──────────────
-    # request_rerun() from async thread is best-effort. This fragment
-    # runs on its own 3s timer and triggers a full rerun if WebSocket
-    # has pushed new data since last render.
+    # ── Scheduled refresh: pull data when next promised cycle arrives ──────
+    # VM promises a new cycle every POLL_INTERVAL seconds (default 3600).
+    # We derive next_cycle_time from the last heartbeat updated_at in Supabase
+    # (already in global_state via last_event_time / last_updated).
+    # Fragment runs every 30s — cheap REST poll only when the clock says
+    # the VM should have finished its cycle. This is independent of WebSocket
+    # and is 100% reliable even if WS events are missed.
+    @st.fragment(run_every=30)
+    def _scheduled_refresh_watcher():
+        import pytz as _pytz
+        from datetime import timezone as _tz
+
+        CYCLE_INTERVAL = 3600  # must match VM POLL_INTERVAL
+
+        # Get the latest updated_at from Supabase (1 row, lightweight)
+        try:
+            from services.supabase_client import get_client
+            result = (get_client()
+                      .table("trades_spot")
+                      .select("updated_at")
+                      .order("updated_at", desc=True)
+                      .limit(1)
+                      .execute())
+            if not result.data:
+                return
+            raw_ts = result.data[0].get("updated_at")
+            if not raw_ts:
+                return
+            last_cycle_dt = datetime.fromisoformat(
+                str(raw_ts).replace("Z", "+00:00")
+            )
+            next_cycle_ts = last_cycle_dt.timestamp() + CYCLE_INTERVAL
+            now_ts = datetime.now(_tz.utc).timestamp()
+
+            # If current time has passed the promised next cycle time,
+            # invalidate in-memory cache and trigger a full re-fetch + rerun.
+            if now_ts >= next_cycle_ts:
+                with global_state.lock:
+                    global_state.spot_rows    = None
+                    global_state.futures_rows = None
+                global_state.pending_rerun = False
+                st.rerun()
+        except Exception:
+            pass
+
+    _scheduled_refresh_watcher()
+
+    # ── WebSocket fallback: immediate rerun if WS event arrived ──────
     @st.fragment(run_every=3)
     def _realtime_watcher():
         if global_state.pending_rerun:
