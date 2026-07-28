@@ -81,7 +81,11 @@ def run_cycle():
     else:
         print("[SKIP] Futures pipeline disabled (ENABLE_FUTURES=0)", flush=True)
 
-    print(f"\n--- Cycle complete. Sleeping {POLL_INTERVAL}s ---", flush=True)
+    print(f"\n--- Cycle complete. Sending Heartbeat ---", flush=True)
+    from services.supabase_client import send_heartbeat
+    send_heartbeat()
+    
+    print(f"--- Sleeping {POLL_INTERVAL}s ---", flush=True)
 
 
 def main():

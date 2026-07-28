@@ -82,7 +82,15 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.spot_rows.append(record)
             state.last_updated = time.time()
-            state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            up_at = record.get("updated_at")
+            if up_at:
+                try:
+                    dt = datetime.fromisoformat(up_at.replace("Z", "+00:00"))
+                    state.last_event_time = dt.astimezone(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+                except Exception:
+                    state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            else:
+                state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
         trigger_ui_update()
             
     def on_futures_change(payload):
@@ -99,14 +107,22 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.futures_rows.append(record)
             state.last_updated = time.time()
-            state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            up_at = record.get("updated_at")
+            if up_at:
+                try:
+                    dt = datetime.fromisoformat(up_at.replace("Z", "+00:00"))
+                    state.last_event_time = dt.astimezone(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+                except Exception:
+                    state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            else:
+                state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
         trigger_ui_update()
 
-    channel_spot = client.channel("public:paper_trades_v2")
-    channel_spot.on_postgres_changes(event="*", schema="public", table="paper_trades_v2", callback=on_spot_change)
+    channel_spot = client.channel("public:trades_spot")
+    channel_spot.on_postgres_changes(event="*", schema="public", table="trades_spot", callback=on_spot_change)
     
-    channel_futures = client.channel("public:futures_trades_v1")
-    channel_futures.on_postgres_changes(event="*", schema="public", table="futures_trades_v1", callback=on_futures_change)
+    channel_futures = client.channel("public:trades_futures")
+    channel_futures.on_postgres_changes(event="*", schema="public", table="trades_futures", callback=on_futures_change)
     
     try:
         await channel_spot.subscribe()
