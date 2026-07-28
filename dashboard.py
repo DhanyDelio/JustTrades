@@ -21,7 +21,12 @@ st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
 import threading
 import asyncio
 import time
-from supabase import create_async_client
+# SDK v2.x: async client lives in supabase._async.client
+try:
+    from supabase._async.client import AsyncClient, create_async_client
+except ImportError:
+    # Fallback for older packaging layouts
+    from supabase import create_async_client  # type: ignore
 
 class DashboardState:
     def __init__(self):
@@ -34,7 +39,40 @@ class DashboardState:
 
 @st.cache_resource
 def get_global_state():
-    return DashboardState()
+    state = DashboardState()
+    # --- Direct initial fetch on first load ---
+    # Populate state immediately via blocking REST call so the UI never
+    # shows "Waiting..." when historical data already exists in the DB.
+    try:
+        from services.supabase_client import fetch_all_spot, fetch_all_futures
+        state.spot_rows    = fetch_all_spot()
+        state.futures_rows = fetch_all_futures()
+        state.last_updated = time.time()
+
+        # Hydrate last_event_time from the most recent updated_at / created_at
+        # across both tables so the status bar shows a real timestamp instantly.
+        _best_ts: float | None = None
+        for row in (state.spot_rows or []) + (state.futures_rows or []):
+            for col in ("updated_at", "created_at"):
+                raw = row.get(col)
+                if not raw:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    ts = dt.timestamp()
+                    if _best_ts is None or ts > _best_ts:
+                        _best_ts = ts
+                        state.last_event_time = (
+                            dt.astimezone(pytz.timezone("Asia/Jakarta"))
+                            .strftime("%H:%M:%S")
+                        )
+                except Exception:
+                    pass
+    except Exception:
+        # If the DB is unreachable at startup, fall through gracefully;
+        # load_trade_data() / load_futures_data() will retry on first render.
+        pass
+    return state
 
 @st.cache_resource
 def start_realtime_listener(_state: DashboardState):
@@ -45,21 +83,39 @@ def start_realtime_listener(_state: DashboardState):
     t.start()
     return t
 
+def _extract_event_time(record: dict) -> str:
+    """Return HH:MM:SS WIB string from updated_at / created_at, or current time."""
+    wib = pytz.timezone("Asia/Jakarta")
+    for col in ("updated_at", "created_at"):
+        raw = record.get(col)
+        if raw:
+            try:
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                return dt.astimezone(wib).strftime("%H:%M:%S")
+            except Exception:
+                pass
+    return datetime.now(wib).strftime("%H:%M:%S")
+
+
 async def realtime_loop(state: DashboardState):
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
         return
-        
-    client = await create_async_client(url, key)
-    
+
+    # ── Helper: push rerun request to every active Streamlit session ──
     def trigger_ui_update():
         try:
             from streamlit.runtime import get_instance
             runtime = get_instance()
-            sessions = getattr(runtime._session_mgr, "list_active_sessions", 
-                               getattr(runtime._session_mgr, "list_sessions", lambda: []))()
-            for session_info in sessions:
+            list_fn = getattr(
+                runtime._session_mgr,
+                "list_active_sessions",
+                getattr(runtime._session_mgr, "list_sessions", None),
+            )
+            if list_fn is None:
+                return
+            for session_info in list_fn():
                 if hasattr(session_info.session, "request_rerun"):
                     try:
                         session_info.session.request_rerun(None)
@@ -68,71 +124,83 @@ async def realtime_loop(state: DashboardState):
         except Exception:
             pass
 
+    # ── Generic upsert helper shared by both callbacks ─────────────────
+    def _upsert_row(rows: list[dict], record: dict) -> list[dict]:
+        """Return a new list with record inserted or updated in-place."""
+        for i, row in enumerate(rows):
+            if row.get("id") == record.get("id"):
+                rows[i] = record
+                return rows
+        rows.append(record)
+        return rows
+
+    # ── Callbacks: handle INSERT *and* UPDATE from postgres_changes ────
     def on_spot_change(payload):
+        record = payload.get("record") or payload.get("new")
+        if not record:
+            return
         with state.lock:
-            record = payload.get("record")
-            if not record or state.spot_rows is None: return
-            
-            found = False
-            for i, row in enumerate(state.spot_rows):
-                if row.get("id") == record.get("id"):
-                    state.spot_rows[i] = record
-                    found = True
-                    break
-            if not found:
-                state.spot_rows.append(record)
-            state.last_updated = time.time()
-            up_at = record.get("updated_at")
-            if up_at:
-                try:
-                    dt = datetime.fromisoformat(up_at.replace("Z", "+00:00"))
-                    state.last_event_time = dt.astimezone(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-                except Exception:
-                    state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-            else:
-                state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-        trigger_ui_update()
-            
-    def on_futures_change(payload):
-        with state.lock:
-            record = payload.get("record")
-            if not record or state.futures_rows is None: return
-            
-            found = False
-            for i, row in enumerate(state.futures_rows):
-                if row.get("id") == record.get("id"):
-                    state.futures_rows[i] = record
-                    found = True
-                    break
-            if not found:
-                state.futures_rows.append(record)
-            state.last_updated = time.time()
-            up_at = record.get("updated_at")
-            if up_at:
-                try:
-                    dt = datetime.fromisoformat(up_at.replace("Z", "+00:00"))
-                    state.last_event_time = dt.astimezone(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-                except Exception:
-                    state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-            else:
-                state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+            if state.spot_rows is None:
+                state.spot_rows = []
+            state.spot_rows = _upsert_row(state.spot_rows, record)
+            state.last_updated  = time.time()
+            state.last_event_time = _extract_event_time(record)
         trigger_ui_update()
 
-    channel_spot = client.channel("public:trades_spot")
-    channel_spot.on_postgres_changes(event="*", schema="public", table="trades_spot", callback=on_spot_change)
-    
-    channel_futures = client.channel("public:trades_futures")
-    channel_futures.on_postgres_changes(event="*", schema="public", table="trades_futures", callback=on_futures_change)
-    
-    try:
-        await channel_spot.subscribe()
-        await channel_futures.subscribe()
-        state.connected = True
-        
-        while True:
-            await asyncio.sleep(1)
-    except Exception:
-        state.connected = False
+    def on_futures_change(payload):
+        record = payload.get("record") or payload.get("new")
+        if not record:
+            return
+        with state.lock:
+            if state.futures_rows is None:
+                state.futures_rows = []
+            state.futures_rows = _upsert_row(state.futures_rows, record)
+            state.last_updated    = time.time()
+            state.last_event_time = _extract_event_time(record)
+        trigger_ui_update()
+
+    # ── Reconnect loop — if WS drops, wait 5s and reconnect ───────────
+    RETRY_DELAY = 5  # seconds
+
+    while True:
+        try:
+            # SDK v2.x: create_async_client from supabase._async.client
+            client = await create_async_client(url, key)
+
+            # Subscribe to trades_spot — capture INSERT and UPDATE
+            channel_spot = client.channel("realtime:trades_spot")
+            channel_spot.on_postgres_changes(
+                event="*",          # catches INSERT + UPDATE + DELETE
+                schema="public",
+                table="trades_spot",
+                callback=on_spot_change,
+            )
+
+            # Subscribe to trades_futures — capture INSERT and UPDATE
+            channel_futures = client.channel("realtime:trades_futures")
+            channel_futures.on_postgres_changes(
+                event="*",
+                schema="public",
+                table="trades_futures",
+                callback=on_futures_change,
+            )
+
+            # SDK v2.x subscribe() is a coroutine — must be awaited
+            await channel_spot.subscribe()
+            await channel_futures.subscribe()
+            state.connected = True
+
+            # Keep the loop alive; sleep in small increments so we can
+            # detect a future cancellation quickly.
+            while True:
+                await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            state.connected = False
+            return
+        except Exception:
+            state.connected = False
+            await asyncio.sleep(RETRY_DELAY)
 
 global_state = get_global_state()
 start_realtime_listener(global_state)
@@ -831,6 +899,7 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             ot_str = str(open_time)
 
     is_filled    = entry_status == "FILLED"
+    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
     status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
     status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
     oco_ok       = oco_placed and oco_list_id
@@ -840,6 +909,18 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
                     (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
                      f"padding:1px 7px;font-size:0.78em'>⚠ NO OCO</span>"
                      if is_filled else ""))
+
+    # PENDING FILL badge — shown when order is NEW or PARTIALLY_FILLED
+    pending_badge = (
+        f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"⏳ PENDING FILL</span>"
+        if entry_status == "NEW" else
+        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"🔄 PARTIAL FILL</span>"
+        if entry_status == "PARTIALLY_FILLED" else ""
+    )
 
     pnl_color    = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
 
@@ -854,6 +935,7 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
                 f"<code style='background:#e8f4e8;color:#1a6b1a;padding:2px 8px;"
                 f"border-radius:4px;font-size:0.9em'>LONG</code>"
                 f"&nbsp;&nbsp;{oco_badge}"
+                f"{'&nbsp;&nbsp;' + pending_badge if pending_badge else ''}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -877,6 +959,18 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
                 f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
                 f"<span style='font-size:1.1em;font-weight:700;color:{pnl_color}'>"
                 f"Unrealized&nbsp;{unreal_pnl:+.4f} USDT</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        elif is_pending:
+            # Distinct amber banner for orders awaiting fill
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:rgba(184,92,0,0.10);border-left:4px solid #b85c00;"
+                f"border-radius:0 6px 6px 0;padding:7px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:700'>{status_icon} {entry_status}</span>"
+                f"<span style='font-size:0.88em;font-weight:700;color:#b85c00'>"
+                f"⏳ Waiting for exchange fill…</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -1036,6 +1130,7 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
             ot_str = str(open_time)
 
     is_filled    = entry_status == "FILLED"
+    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
     is_long      = side == "LONG"
     side_color   = "#1f77b4" if is_long else "#d62728"
     side_bg      = "rgba(31,119,180,0.10)" if is_long else "rgba(214,39,40,0.10)"
@@ -1047,6 +1142,18 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
     regime_icon  = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(str(vol_regime).lower(), "⚪")
     liq_dist_val = float(liq_dist) if liq_dist is not None else None
     liq_warn     = liq_dist_val is not None and liq_dist_val < 10.0
+
+    # PENDING FILL badge — shown when futures order not yet filled
+    pending_badge = (
+        f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"⏳ PENDING FILL</span>"
+        if entry_status == "NEW" else
+        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"🔄 PARTIAL FILL</span>"
+        if entry_status == "PARTIALLY_FILLED" else ""
+    )
 
     with st.container(border=True):
         # ── Header row ────────────────────────────────────────────────
@@ -1061,6 +1168,7 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 f"&nbsp;&nbsp;"
                 f"<span style='background:#f0f0f0;border-radius:4px;padding:2px 8px;"
                 f"font-size:0.82em;color:#444'>{lev_str} {margin_mode}</span>"
+                f"{'&nbsp;&nbsp;' + pending_badge if pending_badge else ''}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -1089,6 +1197,18 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 f"{fund_str}</span>"
                 f"<span style='font-size:1.1em;font-weight:700;color:{pnl_color}'>"
                 f"Unrealized&nbsp;{unreal_pnl:+.4f} USDT</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        elif is_pending:
+            # Distinct amber banner for orders awaiting fill
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:rgba(184,92,0,0.10);border-left:4px solid #b85c00;"
+                f"border-radius:0 6px 6px 0;padding:7px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:700'>{status_icon} {entry_status}</span>"
+                f"<span style='font-size:0.88em;font-weight:700;color:#b85c00'>"
+                f"⏳ Waiting for exchange fill…</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )

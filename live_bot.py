@@ -24,6 +24,7 @@ import time
 import subprocess
 import sys
 from datetime import datetime
+import pytz
 
 # Interval: 1 hour (matches previous GitHub Actions cron schedule)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))
@@ -66,9 +67,14 @@ def run_futures_pipeline():
 
 
 def run_cycle():
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import timezone
+
+    wib = pytz.timezone("Asia/Jakarta")
+    now_wib = datetime.now(timezone.utc).astimezone(wib)
+    timestamp = now_wib.strftime("%Y-%m-%d %H:%M:%S")
+
     print(f"\n{'=' * 60}", flush=True)
-    print(f"[{timestamp}] Starting Trading Cycle", flush=True)
+    print(f"[{timestamp} WIB] Starting Trading Cycle", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
     if ENABLE_SPOT:
@@ -84,8 +90,18 @@ def run_cycle():
     print(f"\n--- Cycle complete. Sending Heartbeat ---", flush=True)
     from services.supabase_client import send_heartbeat
     send_heartbeat()
-    
-    print(f"--- Sleeping {POLL_INTERVAL}s ---", flush=True)
+
+    # ── Sleep + next-run log ──────────────────────────────────────────
+    completed_at = datetime.now(timezone.utc).astimezone(wib)
+    next_run_at  = completed_at.fromtimestamp(
+        completed_at.timestamp() + POLL_INTERVAL, tz=wib
+    )
+    print(
+        f"\n[CYCLE COMPLETE] Completed at {completed_at.strftime('%H:%M:%S')} WIB. "
+        f"Sleeping {POLL_INTERVAL}s. "
+        f"Next run scheduled at {next_run_at.strftime('%H:%M:%S')} WIB.",
+        flush=True,
+    )
 
 
 def main():
