@@ -1727,7 +1727,10 @@ def main():
 
         is_stalled = _time_since_sec > VM_STALL_THRESHOLD_SECONDS
         if is_stalled:
-            stale_mins = int(_time_since_sec // 60)
+            if _time_since_sec is not None and not math.isnan(_time_since_sec):
+                stale_mins = int(_time_since_sec // 60)
+            else:
+                stale_mins = 999
             vm_badge = f"🔴 VM Down (Inactive > {stale_mins} mins)"
         else:
             vm_badge = "🟢 VM Active"
