@@ -116,21 +116,15 @@ def update_futures_by_order_id(entry_order_id: int, fields: dict) -> None:
      .execute())
 
 
-def send_heartbeat() -> None:
-    """
-    Touches the most recent record to trigger a realtime UPDATE event for 'Last Cycle'.
-    No complex condition checks.
-    Wrapped in try-except to never crash the main loop.
-    """
+def send_heartbeat():
     try:
-        client = get_client()
-        res = client.table(TABLE_SPOT).select("id").order("id", desc=True).limit(1).execute()
-        if res.data:
-            rid = res.data[0]["id"]
-            from datetime import datetime, timezone
+        from datetime import datetime, timezone
+        rows = fetch_all_spot()
+        if rows:
+            last_id = rows[-1]['entry_order_id'] # Use the most recent record
             now_iso = datetime.now(timezone.utc).isoformat()
-            client.table(TABLE_SPOT).update({"updated_at": now_iso}).eq("id", rid).execute()
-            print(f"  [Heartbeat] Cycle Done. Pinged Spot ID {rid}", flush=True)
+            update_spot_by_order_id(last_id, {"updated_at": now_iso})
+            print(f"💓 [HEARTBEAT] Pushed for Spot Order ID: {last_id}")
     except Exception as e:
-        print(f"  [Heartbeat] Failed: {e}", flush=True)
+        print(f"⚠️ [HEARTBEAT] Skipped: {e}")
 
