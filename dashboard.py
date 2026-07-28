@@ -1725,10 +1725,19 @@ def main():
         conn_color = "#2ca02c" if global_state.connected else "#d62728"
         conn_text = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
 
-        is_stalled = _time_since_sec > VM_STALL_THRESHOLD_SECONDS
+        try:
+            _time_since_sec_num = float(_time_since_sec)
+        except (TypeError, ValueError):
+            _time_since_sec_num = float("nan")
+
+        is_stalled = (
+            _time_since_sec_num > VM_STALL_THRESHOLD_SECONDS
+            if not math.isnan(_time_since_sec_num)
+            else True
+        )
         if is_stalled:
-            if _time_since_sec is not None and not (isinstance(_time_since_sec, float) and math.isnan(_time_since_sec)) and _time_since_sec >= 0:
-                stale_mins = int(_time_since_sec // 60)
+            if _time_since_sec is not None and not (isinstance(_time_since_sec_num, float) and math.isnan(_time_since_sec_num)) and _time_since_sec_num >= 0:
+                stale_mins = int(_time_since_sec_num // 60)
             else:
                 stale_mins = 999
             vm_badge = f"🔴 VM Down (Inactive > {stale_mins} mins)"
