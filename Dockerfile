@@ -16,4 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Entry point
-CMD ["python", "swing_trade.py"]
+CMD ["python", "live_bot.py"]

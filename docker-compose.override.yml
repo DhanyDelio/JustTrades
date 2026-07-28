@@ -1,0 +1,42 @@
+# docker-compose.override.yml
+# One-shot tasks: training, walk-forward, audit
+# Usage:
+#   docker compose run --rm train_v2
+#   docker compose run --rm walk_forward
+#   docker compose run --rm audit_model
+
+services:
+  train_v2:
+    build: .
+    container_name: swing_trade_train_v2
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+      - ./ml/models:/app/ml/models
+    command: ["python", "ml/train_v2.py"]
+    restart: "no"
+    profiles: ["tools"]
+
+  walk_forward:
+    build: .
+    container_name: swing_trade_walk_forward
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+      - ./data_cache:/app/data_cache
+    command: ["python", "swing_trade.py"]
+    restart: "no"
+    profiles: ["tools"]
+
+  audit_model:
+    build: .
+    container_name: swing_trade_audit
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env
+    command: ["python", "ml/audit_model.py"]
+    restart: "no"
+    profiles: ["tools"]
