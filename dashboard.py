@@ -2071,14 +2071,18 @@ def main():
                 )
 
     # ── Auto-rerun on Realtime update ─────────────────────────────────
-    # If the WebSocket thread pushed new data during or after this render
-    # cycle, pending_rerun will be True. Clear the flag and rerun once so
-    # the user sees the latest rows without a manual refresh.
-    if global_state.pending_rerun:
-        global_state.pending_rerun = False
-        st.session_state["_last_seen_update"] = global_state.last_updated
-        time.sleep(0.5)
-        st.rerun()
+    # ── Polling loop: check pending_rerun flag every 3s ──────────────
+    # request_rerun() from async thread is best-effort. This fragment
+    # runs on its own 3s timer and triggers a full rerun if WebSocket
+    # has pushed new data since last render.
+    @st.fragment(run_every=3)
+    def _realtime_watcher():
+        if global_state.pending_rerun:
+            global_state.pending_rerun = False
+            st.session_state["_last_seen_update"] = global_state.last_updated
+            st.rerun()
+
+    _realtime_watcher()
 
 
 if __name__ == "__main__":
