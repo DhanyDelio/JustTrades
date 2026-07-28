@@ -1546,7 +1546,7 @@ def main():
                 <span style="color: #ccc;">|</span>
                 <strong>{vm_badge}</strong>
                 <span style="color: #ccc;">|</span>
-                <strong>Last Event:</strong> <span style="color: #D1D1D1;">{global_state.last_event_time or 'Waiting...'}</span>
+                <strong>Last Cycle:</strong> <span style="color: #D1D1D1;">{global_state.last_event_time + ' WIB' if global_state.last_event_time else 'Waiting...'}</span>
             </div>
         </div>
         """, height=40)

@@ -118,34 +118,19 @@ def update_futures_by_order_id(entry_order_id: int, fields: dict) -> None:
 
 def send_heartbeat() -> None:
     """
-    Touches the most recent OPEN record to trigger a realtime UPDATE event.
-    If no OPEN records, touches the most recent record.
+    Touches the most recent record to trigger a realtime UPDATE event for 'Last Cycle'.
+    No complex condition checks.
     Wrapped in try-except to never crash the main loop.
     """
     try:
         client = get_client()
-        
-        # 1. Try Spot OPEN
-        res = client.table(TABLE_SPOT).select("id").eq("exit_status", "OPEN").order("id", desc=True).limit(1).execute()
+        res = client.table(TABLE_SPOT).select("id").order("id", desc=True).limit(1).execute()
         if res.data:
-            target, rid = TABLE_SPOT, res.data[0]["id"]
-        else:
-            # 2. Try Futures OPEN
-            res = client.table(TABLE_FUTURES).select("id").eq("exit_status", "OPEN").order("id", desc=True).limit(1).execute()
-            if res.data:
-                target, rid = TABLE_FUTURES, res.data[0]["id"]
-            else:
-                # 3. Fallback: most recent Spot
-                res = client.table(TABLE_SPOT).select("id").order("id", desc=True).limit(1).execute()
-                if res.data:
-                    target, rid = TABLE_SPOT, res.data[0]["id"]
-                else:
-                    return  # DB is completely empty
-                    
-        from datetime import datetime, timezone
-        now_iso = datetime.now(timezone.utc).isoformat()
-        client.table(target).update({"updated_at": now_iso}).eq("id", rid).execute()
-        print(f"  [Heartbeat] Sent realtime ping via {target} ID {rid}", flush=True)
+            rid = res.data[0]["id"]
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            client.table(TABLE_SPOT).update({"updated_at": now_iso}).eq("id", rid).execute()
+            print(f"  [Heartbeat] Cycle Done. Pinged Spot ID {rid}", flush=True)
     except Exception as e:
         print(f"  [Heartbeat] Failed: {e}", flush=True)
 
