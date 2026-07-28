@@ -189,54 +189,48 @@ python3 ml/train_v1.py
 
 ---
 
-## dashboard.py — Monitoring Dashboard
+## dashboard.py — Monitoring Dashboard (Local)
 
 ```bash
 streamlit run dashboard.py
 ```
 
-- Auto-refresh tiap 5 menit
-- Tab: Spot analysis | Futures analysis | Open Positions
-- Open Positions: tombol **📈 Check Spot** dan **⚡ Check Futures** untuk jalankan
-  `--check-positions` langsung dari browser
-- Header: timestamp last refresh + countdown ke refresh berikutnya
+- **Murni Event-Driven**: Menggunakan Supabase Realtime WebSockets. UI hanya re-render seketika saat menerima event `INSERT` atau `UPDATE` dari VM, tanpa polling periodik.
+- **Tab**: 📈 Spot | ⚡ Futures | 📋 Open Positions | 🧪 ML Shadow Metrics
+- **Header Live Indicators**: Menampilkan status koneksi WebSocket (🟢 Realtime Connected), status aktivitas VM bot (🟢 VM Active), dan timestamp event terakhir (Last Event: HH:MM:SS).
+- **Manual Control**: Tombol `🔄 Refresh data` tersedia sebagai fallback. Tab Open Positions masih memiliki tombol untuk menjalankan `--check-positions` secara manual jika diperlukan.
 
 ---
 
-## GitHub Actions — Automated Hourly Trading
+## VM Oracle — 24/7 Live Trading Bot (Docker)
 
-Bot jalan otomatis tiap jam via `.github/workflows/hourly-trade.yml`.
+Bot saat ini berjalan 24/7 di VM Oracle (Singapore) menggunakan Docker, menggantikan sistem cron GitHub Actions lama.
 
-### Arsitektur
+### Arsitektur Deployment
 
 ```
-GitHub Actions (cron tiap 1 jam, self-hosted runner di Mac)
-  ├── paper_trade_executor.py --check-positions
-  ├── futures_trade_executor.py --check-positions
-  ├── paper_trade_executor.py --propose-all --yes
-  └── futures_trade_executor.py --propose --yes
-           ↓
-      Supabase (trades_spot + trades_futures)
-           ↑
-  streamlit run dashboard.py   ← monitoring (read-only)
+VM Oracle (Docker Container)
+  ├── Live Spot Executor Loop (dengan ML Shadow Scoring v2)
+  ├── Live Futures Executor Loop (Terpisah secara independen)
+           ↓ (INSERT/UPDATE realtime)
+       Supabase (trades_spot, trades_futures)
+           ↓ (WebSockets Push)
+MacBook M1 Local (streamlit run dashboard.py) ← Live Monitoring
 ```
 
-### GitHub Secrets (Settings → Secrets and variables → Actions)
+- **Containerization**: Menggunakan `Dockerfile` dan `docker-compose.yml`. Container dikonfigurasi dengan `restart: always`.
+- **Entrypoint**: Container menjalankan loop `while true` (sleep/polling interval) untuk produksi 24/7, menghindari *restart-loop* (`exited with code 0`).
+- **Pemisahan Pipeline**: Pipeline Spot dan Futures berjalan independen. Model ML v2 saat ini dikhususkan untuk Spot sebagai *Shadow Scoring* (pasif, tidak memblokir order) untuk mengumpulkan evaluasi metrik secara live.
 
-| Secret | Sumber |
-|--------|--------|
-| `BINANCE_TESTNET_API_KEY` | testnet.binance.vision |
-| `BINANCE_TESTNET_API_SECRET` | testnet.binance.vision |
-| `BINANCE_FUTURES_TESTNET_API_KEY` | testnet.binancefuture.com |
-| `BINANCE_FUTURES_TESTNET_API_SECRET` | testnet.binancefuture.com |
-| `SUPABASE_URL` | Supabase → Settings → API |
-| `SUPABASE_SERVICE_KEY` | Supabase → service_role key |
-| `TELEGRAM_BOT_TOKEN` | @BotFather |
-| `TELEGRAM_CHAT_ID` | @userinfobot |
+### Menjalankan di VM
 
-### Trigger manual
+```bash
+# Build dan jalankan di background
+docker-compose up -d --build
 
-GitHub → Actions → **Hourly Trade Bot** → **Run workflow**
+# Cek log bot
+docker-compose logs -f
+```
 
 ---
 
