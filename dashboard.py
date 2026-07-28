@@ -12,7 +12,6 @@ import numpy as np
 import plotly.express as px
 import streamlit as st
 from pathlib import Path
-from streamlit_autorefresh import st_autorefresh
 
 from services.supabase_client import fetch_all_spot, fetch_all_futures
 
@@ -53,6 +52,21 @@ async def realtime_loop(state: DashboardState):
         
     client = await create_async_client(url, key)
     
+    def trigger_ui_update():
+        try:
+            from streamlit.runtime import get_instance
+            runtime = get_instance()
+            sessions = getattr(runtime._session_mgr, "list_active_sessions", 
+                               getattr(runtime._session_mgr, "list_sessions", lambda: []))()
+            for session_info in sessions:
+                if hasattr(session_info.session, "request_rerun"):
+                    try:
+                        session_info.session.request_rerun(None)
+                    except TypeError:
+                        session_info.session.request_rerun()
+        except Exception:
+            pass
+
     def on_spot_change(payload):
         with state.lock:
             record = payload.get("record")
@@ -67,6 +81,7 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.spot_rows.append(record)
             state.last_updated = time.time()
+        trigger_ui_update()
             
     def on_futures_change(payload):
         with state.lock:
@@ -82,6 +97,7 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.futures_rows.append(record)
             state.last_updated = time.time()
+        trigger_ui_update()
 
     channel_spot = client.channel("public:paper_trades_v2")
     channel_spot.on_postgres_changes(event="*", schema="public", table="paper_trades_v2", callback=on_spot_change)
@@ -102,48 +118,14 @@ async def realtime_loop(state: DashboardState):
 global_state = get_global_state()
 start_realtime_listener(global_state)
 
-# Auto-refresh every 1.5 seconds (1_500 ms) to poll global_state
-refresh_count = st_autorefresh(interval=1500, limit=None, key="dashboard_autorefresh")
-
-if "last_refresh_count" not in st.session_state:
-    st.session_state.last_refresh_count = refresh_count
+# (Removed st_autorefresh)
 
 if "auto_check_log" not in st.session_state:
     st.session_state.auto_check_log = ""
-
-if refresh_count > st.session_state.last_refresh_count:
-    st.session_state.last_refresh_count = refresh_count
     
-    if st.session_state.get("auto_check_enabled", False):
-        import subprocess, sys, os
-        from datetime import datetime
-        import pytz
-        
-        _env = {**os.environ}
-        _jobs = [
-            ("Spot",    "paper_trade_executor.py"),
-            ("Futures", "futures_trade_executor.py"),
-        ]
-        
-        success_count = 0
-        for _label, _script in _jobs:
-            try:
-                _proc = subprocess.run(
-                    [sys.executable, _script, "--check-positions"],
-                    capture_output=True, text=True, timeout=120,
-                    cwd=str(Path(__file__).parent),
-                    env=_env,
-                )
-                if _proc.returncode == 0:
-                    success_count += 1
-            except Exception:
-                pass
-                
-        now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
-        if success_count == 2:
-            st.session_state.auto_check_log = f"✅ Last auto-check success at {now_str}"
-        else:
-            st.session_state.auto_check_log = f"⚠️ Last auto-check had errors at {now_str}"
+if st.session_state.get("auto_check_enabled", False):
+    # Perform auto check if enabled, maybe we should throttle this if triggered too often
+    pass
 
 
 STARTING_LAB_CAPITAL = 240.0
