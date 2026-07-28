@@ -1,7 +1,7 @@
 """
-ml/ml_scorer.py — Passive ML v1 scoring for paper trading
+ml/ml_scorer.py — Passive ML v2 scoring for paper trading
 ==========================================================
-Loads the trained v1 model and scores trade candidates.
+Loads the trained v2 model and scores trade candidates.
 
 IMPORTANT: This module is OBSERVATION-ONLY.
   - ml_score is logged alongside trades for future analysis
@@ -11,7 +11,7 @@ IMPORTANT: This module is OBSERVATION-ONLY.
 Usage (from paper_trade_executor.py):
     from ml.ml_scorer import compute_ml_score
     result = compute_ml_score(candidate_dict)
-    # result = {"ml_score": 0.73, "ml_model_version": "v1"}
+    # result = {"ml_score": 0.73, "ml_model_version": "v2.0.0"}
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-_MODEL_PATH = Path(__file__).parent / "models" / "v1.pkl"
-_MODEL_VERSION = "v1"
+_MODEL_PATH = Path(__file__).parent / "models" / "v2.pkl"
+_MODEL_VERSION = "v2.0.0"
 
 # ── Cached model singleton ────────────────────────────────────────────────
 _model = None
@@ -95,7 +95,7 @@ def compute_ml_score(cand: dict) -> dict:
 
     Returns dict with:
         ml_score:          float (0.0–1.0 probability of win) or None on failure
-        ml_model_version:  "v1"
+        ml_model_version:  "v2.0.0"
 
     Never raises — scoring failure returns ml_score=None.
     """

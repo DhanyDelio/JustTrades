@@ -117,7 +117,7 @@ Log terpisah di Supabase `trades_futures` — tidak campur dengan spot.
 ### `--propose` — Batch propose (selalu multi)
 
 ```bash
-# Default: up to 2 posisi
+# Default: isi sampai slot penuh (maksimal 20 posisi)
 python3 futures_trade_executor.py --propose
 
 # Tentukan jumlah
@@ -127,14 +127,17 @@ python3 futures_trade_executor.py --propose --count 3
 python3 futures_trade_executor.py --propose --side LONG
 python3 futures_trade_executor.py --propose --side SHORT
 
-# Non-interaktif (CI)
-python3 futures_trade_executor.py --propose --yes
+# Non-interaktif / CI (sekarang DEFAULT ON)
+python3 futures_trade_executor.py --propose
+
+# Interaktif (paksa minta konfirmasi 'y')
+python3 futures_trade_executor.py --propose --no-yes
 ```
 
 Scan tiered — selalu jalan 4 parts × 25 = **100 coin** (LONG + SHORT).
 Throttle adaptif membaca `X-MBX-Used-Weight-1M` (limit 2400/menit).
 
-Satu batch = satu `correlation_cluster_id`. Satu konfirmasi `y` untuk semua.
+Satu batch = satu `correlation_cluster_id`. Satu konfirmasi `y` untuk semua (jika pakai `--no-yes`).
 
 ### `--check-positions` — Monitor + place TP/SL
 
@@ -253,7 +256,7 @@ python3 paper_trade_executor.py --check-positions --verbose
 python3 paper_trade_executor.py --stats
 
 # ── Futures ───────────────────────────────────────────────────
-python3 futures_trade_executor.py --propose                # batch (default 2)
+python3 futures_trade_executor.py --propose                # batch (isi sisa slot sampai 20)
 python3 futures_trade_executor.py --propose --count 3
 python3 futures_trade_executor.py --propose --side LONG
 python3 futures_trade_executor.py --check-positions

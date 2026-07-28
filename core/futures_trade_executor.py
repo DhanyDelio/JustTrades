@@ -94,7 +94,7 @@ VOLATILITY_HIGH_PCT: float   = 66.0   # above 66th percentile → "high"
 ZONE_ENTRY_BUFFER_PCT: float = 0.0015  # 0.15%
 
 # Hard cap on concurrent open futures positions
-MAX_CONCURRENT_POSITIONS: int = 10
+MAX_CONCURRENT_POSITIONS: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -2322,23 +2322,27 @@ def main() -> None:
                        help="Print futures performance statistics (independent from spot)")
 
     parser.add_argument("--scan-n",    type=int, default=DEFAULT_SCAN_N)
-    parser.add_argument("--count",     type=int, default=2,
-                        help="Number of positions to open in one batch (default 2)")
+    parser.add_argument("--count",     type=int, default=MAX_CONCURRENT_POSITIONS,
+                        help=f"Number of positions to open in one batch (default {MAX_CONCURRENT_POSITIONS}, fills up to max slots)")
     parser.add_argument("--side",      type=str, default=None,
                         choices=["LONG", "SHORT"],
                         help="Filter by position side (LONG or SHORT)")
     parser.add_argument("--verbose",   action="store_true",
                         help="Show detailed per-position info")
-    parser.add_argument("--yes",       action="store_true",
-                        help="Auto-confirm order placement (for non-interactive / CI use)")
+    parser.add_argument("--yes",       action="store_true", default=True,
+                        help="Auto-confirm order placement (DEFAULT: on — for unattended VM/CI)")
+    parser.add_argument("--no-yes",    action="store_true",
+                        help="Disable auto-confirm — require interactive 'y' confirmation")
     args = parser.parse_args()
+
+    auto_confirm = args.yes and not args.no_yes
 
     if args.propose:
         cmd_propose_multi_futures(
             scan_n        = args.scan_n,
             count         = args.count,
             side_filter   = args.side,
-            auto_confirm  = args.yes,
+            auto_confirm  = auto_confirm,
         )
     elif args.check_positions:
         cmd_check_futures(verbose=args.verbose)

@@ -450,6 +450,9 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
     best["ml_score"] = ml_result["ml_score"]
     best["ml_model_version"] = ml_result["ml_model_version"]
 
+    if best["ml_score"] is not None:
+        print(f"\n  [ML SHADOW] Score: {best['ml_score']:.2f} | Version: {best['ml_model_version']} | Status: PASSTHROUGH (No Veto)")
+
     # ── Display proposal ──────────────────────────────────────────────
     print_proposal(best)
 
@@ -653,6 +656,9 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
             ml_result = compute_ml_score(cand)
             cand["ml_score"] = ml_result["ml_score"]
             cand["ml_model_version"] = ml_result["ml_model_version"]
+
+            if cand["ml_score"] is not None:
+                print(f"  [ML SHADOW] Score: {cand['ml_score']:.2f} | Version: {cand['ml_model_version']} | Status: PASSTHROUGH (No Veto)")
 
             executor = SpotOrderExecutor(client, auto_confirm=True, repo=repo)
             order = executor.execute(cand, correlation_cluster_id=cluster_id)
