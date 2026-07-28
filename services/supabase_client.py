@@ -59,8 +59,9 @@ def get_client():
 # ---------------------------------------------------------------------------
 # Table constants — single source of truth
 # ---------------------------------------------------------------------------
-TABLE_SPOT    = "trades_spot"
-TABLE_FUTURES = "trades_futures"
+TABLE_SPOT      = "trades_spot"
+TABLE_FUTURES   = "trades_futures"
+TABLE_HEARTBEAT = "system_heartbeat"   # bot liveness + next cycle promise
 
 
 # ---------------------------------------------------------------------------
@@ -127,4 +128,47 @@ def send_heartbeat():
             print(f"💓 [HEARTBEAT] Pushed for Spot Order ID: {last_id}")
     except Exception as e:
         print(f"⚠️ [HEARTBEAT] Skipped: {e}")
+
+
+def upsert_heartbeat(last_seen_at: str, next_expected_at: str) -> None:
+    """
+    Upsert a single row into system_heartbeat (id=1, always the same row).
+    Fields:
+        last_seen_at     — ISO timestamp (UTC) when the cycle completed
+        next_expected_at — ISO timestamp (UTC) of the next promised cycle
+
+    Table DDL (run once in Supabase SQL Editor):
+        CREATE TABLE IF NOT EXISTS system_heartbeat (
+            id               int PRIMARY KEY DEFAULT 1,
+            last_seen_at     timestamptz NOT NULL,
+            next_expected_at timestamptz NOT NULL,
+            updated_at       timestamptz DEFAULT now()
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS system_heartbeat_singleton
+            ON system_heartbeat (id);
+    """
+    try:
+        get_client().table(TABLE_HEARTBEAT).upsert(
+            {
+                "id":               1,
+                "last_seen_at":     last_seen_at,
+                "next_expected_at": next_expected_at,
+                "updated_at":       last_seen_at,
+            },
+            on_conflict="id",
+        ).execute()
+    except Exception as e:
+        print(f"⚠️ [HEARTBEAT] upsert_heartbeat failed: {e}")
+
+
+def fetch_heartbeat() -> dict | None:
+    """
+    Fetch the single system_heartbeat row.
+    Returns dict with last_seen_at / next_expected_at, or None if table not yet created.
+    """
+    try:
+        result = get_client().table(TABLE_HEARTBEAT).select("*").eq("id", 1).execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        return None
 

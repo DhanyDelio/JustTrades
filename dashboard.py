@@ -1,7 +1,7 @@
 import math
 import os
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ import streamlit as st
 from pathlib import Path
 
 from services.supabase_client import fetch_all_spot, fetch_all_futures
+from streamlit_autorefresh import st_autorefresh
 
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
@@ -215,6 +216,35 @@ global_state = get_global_state()
 start_realtime_listener(global_state)
 
 
+WIB = pytz.timezone("Asia/Jakarta")
+VM_STALL_THRESHOLD_SECONDS = 70 * 60
+VM_DOWN_REFRESH_MS = 300_000
+NORMAL_REFRESH_BUFFER_SECONDS = 5
+
+
+def _parse_iso_to_wib(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(WIB)
+    except Exception:
+        return None
+
+
+def _get_next_dashboard_refresh(now_wib: datetime) -> datetime:
+    return (now_wib + timedelta(hours=1)).replace(
+        minute=0,
+        second=NORMAL_REFRESH_BUFFER_SECONDS,
+        microsecond=0,
+    )
+
+
+def _get_autorefresh_interval_ms(now_wib: datetime, is_vm_down: bool) -> int:
+    if is_vm_down:
+        return VM_DOWN_REFRESH_MS
+    target_wib = _get_next_dashboard_refresh(now_wib)
+    seconds_until_next_cycle = max(1, math.ceil((target_wib - now_wib).total_seconds()))
+    return seconds_until_next_cycle * 1000
 
 
 STARTING_LAB_CAPITAL = 240.0
@@ -1648,7 +1678,27 @@ def main():
         else:
             st.session_state["_ws_init_done"] = True
 
-    now_str = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+    now_wib = datetime.now(WIB)
+    now_str = now_wib.strftime("%H:%M:%S")
+
+    # Independent timer-based sync: refresh at :00:05 WIB of the next hour.
+    # If the VM appears down, back off to every 5 minutes until heartbeat resumes.
+    _heartbeat_for_timer = None
+    try:
+        from services.supabase_client import fetch_heartbeat
+        _heartbeat_for_timer = fetch_heartbeat()
+    except Exception:
+        _heartbeat_for_timer = None
+
+    _timer_last_seen_wib = _parse_iso_to_wib((_heartbeat_for_timer or {}).get("last_seen_at"))
+    _timer_time_since_last_seen = (
+        (now_wib - _timer_last_seen_wib).total_seconds()
+        if _timer_last_seen_wib is not None
+        else float("inf")
+    )
+    _timer_vm_down = _timer_time_since_last_seen > VM_STALL_THRESHOLD_SECONDS
+    _autorefresh_interval_ms = _get_autorefresh_interval_ms(now_wib, _timer_vm_down)
+    st_autorefresh(interval=_autorefresh_interval_ms, key="dashboard_sync_watchdog")
 
     c_btn, c_info = st.columns([1.5, 8.5])
     with c_btn:
@@ -1659,34 +1709,26 @@ def main():
             st.rerun()
 
     with c_info:
-        df_spot = load_trade_data()
-        df_fut = load_futures_data()
-        
-        max_ts_val = 0.0
-        
-        def get_max_ts(df):
-            if df.empty: return 0.0
-            ts_series = df.get("updated_at")
-            if ts_series is None or ts_series.isna().all():
-                ts_series = df.get("created_at")
-            if ts_series is not None:
-                max_dt = pd.to_datetime(ts_series, errors="coerce").max()
-                if pd.notna(max_dt):
-                    return max_dt.timestamp()
-            return 0.0
-
-        max_ts_val = max(max_ts_val, get_max_ts(df_spot))
-        max_ts_val = max(max_ts_val, get_max_ts(df_fut))
-            
-        now_ts = datetime.now(pytz.UTC).timestamp()
-        is_stalled = (now_ts - max_ts_val) > (75 * 60) if max_ts_val > 0 else False
+        _hb = _heartbeat_for_timer
+        _last_seen_dt_wib = _parse_iso_to_wib((_hb or {}).get("last_seen_at"))
+        _last_seen_wib = (
+            _last_seen_dt_wib.strftime("%H:%M:%S")
+            if _last_seen_dt_wib is not None
+            else (global_state.last_event_time or "Waiting...")
+        )
+        _time_since_sec = (
+            (now_wib - _last_seen_dt_wib).total_seconds()
+            if _last_seen_dt_wib is not None
+            else float("inf")
+        )
 
         conn_color = "#2ca02c" if global_state.connected else "#d62728"
         conn_text = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
-        
+
+        is_stalled = _time_since_sec > VM_STALL_THRESHOLD_SECONDS
         if is_stalled:
-            vm_badge = "🔴 VM Inactive"
-            st.error("⚠️ **WARNING: VM Bot Offline / Stalled (No update in last 75 minutes)**")
+            stale_mins = int(_time_since_sec // 60)
+            vm_badge = f"🔴 VM Down (Inactive > {stale_mins} mins)"
         else:
             vm_badge = "🟢 VM Active"
 
@@ -1694,14 +1736,14 @@ def main():
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
                     display: flex; align-items: center; gap: 15px; color: #555; padding-top: 6px;">
             <div style="font-size: 14px; display: flex; align-items: center; gap: 8px;">
-                <strong style="color: {conn_color};">{conn_text}</strong> 
+                <strong style="color: {conn_color};">{conn_text}</strong>
                 <span style="color: #ccc;">|</span>
                 <strong>{vm_badge}</strong>
                 <span style="color: #ccc;">|</span>
-                <strong>Last Cycle:</strong> <span style="color: #D1D1D1;">{global_state.last_event_time + ' WIB' if global_state.last_event_time else 'Waiting...'}</span>
+                <strong>Last Cycle: {_last_seen_wib} WIB</strong>
             </div>
         </div>
-        """, height=40)
+        """, height=34)
 
     st.write("")
 
@@ -2070,45 +2112,24 @@ def main():
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
 
-    # ── Scheduled refresh: pull data when next promised cycle arrives ──────
-    # VM promises a new cycle every POLL_INTERVAL seconds (default 3600).
-    # We derive next_cycle_time from the last heartbeat updated_at in Supabase
-    # (already in global_state via last_event_time / last_updated).
-    # Fragment runs every 30s — cheap REST poll only when the clock says
-    # the VM should have finished its cycle. This is independent of WebSocket
-    # and is 100% reliable even if WS events are missed.
-    @st.fragment(run_every=30)
+    # Independent timer-based sync is handled by st_autorefresh above.
+    # Keep a lightweight fallback here to invalidate cached rows after the
+    # expected sync point, even if websocket events were missed.
+    @st.fragment(run_every=60)
     def _scheduled_refresh_watcher():
-        import pytz as _pytz
-        from datetime import timezone as _tz
-
-        CYCLE_INTERVAL = 3600  # must match VM POLL_INTERVAL
-
-        # Get the latest updated_at from Supabase (1 row, lightweight)
         try:
-            from services.supabase_client import get_client
-            result = (get_client()
-                      .table("trades_spot")
-                      .select("updated_at")
-                      .order("updated_at", desc=True)
-                      .limit(1)
-                      .execute())
-            if not result.data:
+            hb = _heartbeat_for_timer
+            if not hb:
                 return
-            raw_ts = result.data[0].get("updated_at")
-            if not raw_ts:
-                return
-            last_cycle_dt = datetime.fromisoformat(
-                str(raw_ts).replace("Z", "+00:00")
-            )
-            next_cycle_ts = last_cycle_dt.timestamp() + CYCLE_INTERVAL
-            now_ts = datetime.now(_tz.utc).timestamp()
 
-            # If current time has passed the promised next cycle time,
-            # invalidate in-memory cache and trigger a full re-fetch + rerun.
-            if now_ts >= next_cycle_ts:
+            next_expected_wib = _parse_iso_to_wib(hb.get("next_expected_at"))
+            if next_expected_wib is None:
+                return
+
+            refresh_target_wib = next_expected_wib + timedelta(seconds=NORMAL_REFRESH_BUFFER_SECONDS)
+            if now_wib >= refresh_target_wib:
                 with global_state.lock:
-                    global_state.spot_rows    = None
+                    global_state.spot_rows = None
                     global_state.futures_rows = None
                 global_state.pending_rerun = False
                 st.rerun()

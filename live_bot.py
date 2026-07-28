@@ -23,7 +23,7 @@ import os
 import time
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import pytz
 
 # Interval: 1 hour (matches previous GitHub Actions cron schedule)
@@ -67,10 +67,9 @@ def run_futures_pipeline():
 
 
 def run_cycle():
-    from datetime import timezone
-
     wib = pytz.timezone("Asia/Jakarta")
-    now_wib = datetime.now(timezone.utc).astimezone(wib)
+    now_utc = datetime.now(timezone.utc)
+    now_wib = now_utc.astimezone(wib)
     timestamp = now_wib.strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"\n{'=' * 60}", flush=True)
@@ -87,21 +86,44 @@ def run_cycle():
     else:
         print("[SKIP] Futures pipeline disabled (ENABLE_FUTURES=0)", flush=True)
 
-    print(f"\n--- Cycle complete. Sending Heartbeat ---", flush=True)
-    from services.supabase_client import send_heartbeat
-    send_heartbeat()
+    # ── Heartbeat + aligned sleep ─────────────────────────────────────
+    completed_utc = datetime.now(timezone.utc)
+    completed_wib = completed_utc.astimezone(wib)
 
-    # ── Sleep + next-run log ──────────────────────────────────────────
-    completed_at = datetime.now(timezone.utc).astimezone(wib)
-    next_run_at  = completed_at.fromtimestamp(
-        completed_at.timestamp() + POLL_INTERVAL, tz=wib
+    # Calculate top of NEXT hour (XX:00:00 WIB)
+    next_hour_wib = (completed_wib + timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
     )
+
+    # Formula requested by architecture spec:
+    # sleep_seconds = (next_hour_00_00 - current_time).total_seconds()
+    sleep_secs = max(0, (next_hour_wib - completed_wib).total_seconds())
+
+    # Upsert heartbeat with promised next cycle time
+    print(f"\n--- Cycle complete. Sending Heartbeat ---", flush=True)
+    try:
+        from services.supabase_client import upsert_heartbeat, send_heartbeat
+        upsert_heartbeat(
+            last_seen_at=completed_utc.isoformat(),
+            next_expected_at=next_hour_wib.isoformat(),
+        )
+        send_heartbeat()
+        print(
+            f"💓 [HEARTBEAT] last_seen={completed_wib.strftime('%H:%M:%S')} WIB  "
+            f"next_expected={next_hour_wib.strftime('%H:%M:%S')} WIB",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"⚠️ [HEARTBEAT] Failed: {e}", flush=True)
+
+    # Aligned sleep — wake exactly at top of next hour
     print(
-        f"\n[CYCLE COMPLETE] Completed at {completed_at.strftime('%H:%M:%S')} WIB. "
-        f"Sleeping {POLL_INTERVAL}s. "
-        f"Next run scheduled at {next_run_at.strftime('%H:%M:%S')} WIB.",
+        f"\n[CYCLE COMPLETE] Completed at {completed_wib.strftime('%H:%M:%S')} WIB. "
+        f"Sleeping {sleep_secs:.0f}s. "
+        f"Next run scheduled at {next_hour_wib.strftime('%H:%M:%S')} WIB.",
         flush=True,
     )
+    return sleep_secs
 
 
 def main():
@@ -109,16 +131,17 @@ def main():
     print("  Live Trading Bot — Production Mode (24/7)", flush=True)
     print(f"  Spot Pipeline:    {'ENABLED (ML v2 Shadow)' if ENABLE_SPOT else 'DISABLED'}", flush=True)
     print(f"  Futures Pipeline: {'ENABLED (Rule-Based)' if ENABLE_FUTURES else 'DISABLED'}", flush=True)
-    print(f"  Poll Interval:    {POLL_INTERVAL}s", flush=True)
+    print(f"  Sleep mode:       Aligned to top of next hour (WIB)", flush=True)
     print("=" * 60, flush=True)
 
     while True:
+        sleep_secs = POLL_INTERVAL  # fallback if run_cycle throws
         try:
-            run_cycle()
+            sleep_secs = run_cycle()
         except Exception as e:
             print(f"[ERROR] Cycle failed: {e}", flush=True)
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(max(sleep_secs, 60))  # never sleep less than 60s
 
 
 if __name__ == "__main__":
