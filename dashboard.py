@@ -1727,7 +1727,7 @@ def main():
 
         is_stalled = _time_since_sec > VM_STALL_THRESHOLD_SECONDS
         if is_stalled:
-            if _time_since_sec is not None and not math.isnan(_time_since_sec):
+            if _time_since_sec is not None and not (isinstance(_time_since_sec, float) and math.isnan(_time_since_sec)) and _time_since_sec >= 0:
                 stale_mins = int(_time_since_sec // 60)
             else:
                 stale_mins = 999
