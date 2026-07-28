@@ -28,6 +28,7 @@ class DashboardState:
         self.spot_rows = None
         self.futures_rows = None
         self.last_updated = time.time()
+        self.last_event_time = None  # HH:MM:SS string of last WebSocket event
         self.connected = False
         self.lock = threading.Lock()
 
@@ -81,6 +82,7 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.spot_rows.append(record)
             state.last_updated = time.time()
+            state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
         trigger_ui_update()
             
     def on_futures_change(payload):
@@ -97,6 +99,7 @@ async def realtime_loop(state: DashboardState):
             if not found:
                 state.futures_rows.append(record)
             state.last_updated = time.time()
+            state.last_event_time = datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
         trigger_ui_update()
 
     channel_spot = client.channel("public:paper_trades_v2")
@@ -1527,7 +1530,7 @@ def main():
                 <span style="color: #ccc;">|</span>
                 <strong>{vm_badge}</strong>
                 <span style="color: #ccc;">|</span>
-                <strong>Last updated:</strong> <span style="color: #111;">{now_str}</span>
+                <strong>Last Event:</strong> <span style="color: #111;">{global_state.last_event_time or 'Waiting...'}</span>
             </div>
         </div>
         """, height=40)
