@@ -1,13 +1,16 @@
-version: '3.8'
-
 services:
+  # ── Production Bot (24/7 polling loop) ──────────────────────
+  # Runs both Spot (with ML v2 Shadow Scoring) and Futures
+  # (rule-based, no ML) pipelines every hour.
+  # Use ENABLE_SPOT=0 or ENABLE_FUTURES=0 to disable a pipeline.
   swing_trade:
     build: .
     container_name: swing_trade_bot
     restart: always
-    # Automatically inject variables into the container environment
     env_file:
       - .env
-    # Mount .env so load_dotenv() in the code can also find it if needed
     volumes:
       - ./.env:/app/.env
+    # Ensure Python output is not buffered (visible in docker logs)
+    environment:
+      - PYTHONUNBUFFERED=1
