@@ -21,11 +21,13 @@ st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
 import threading
 import asyncio
 import time
-# SDK v2.x: async client lives in supabase._async.client
+# SDK v2.x: create_async_client is exported from top-level supabase package.
+# supabase._async.client exposes create_client (not create_async_client) internally,
+# so always import from the top-level package to avoid ImportError.
 try:
-    from supabase._async.client import AsyncClient, create_async_client
+    from supabase import create_async_client
+    from supabase._async.client import AsyncClient  # type annotation only
 except ImportError:
-    # Fallback for older packaging layouts
     from supabase import create_async_client  # type: ignore
 
 class DashboardState:
@@ -168,21 +170,23 @@ async def realtime_loop(state: DashboardState):
             client = await create_async_client(url, key)
 
             # Subscribe to trades_spot — capture INSERT and UPDATE
-            channel_spot = client.channel("realtime:trades_spot")
+            # on_postgres_changes signature: (event, callback, table=None, schema=None)
+            # callback is positional arg 2 — must come before table/schema keywords
+            channel_spot = client.channel("public:trades_spot")
             channel_spot.on_postgres_changes(
                 event="*",          # catches INSERT + UPDATE + DELETE
+                callback=on_spot_change,
                 schema="public",
                 table="trades_spot",
-                callback=on_spot_change,
             )
 
             # Subscribe to trades_futures — capture INSERT and UPDATE
-            channel_futures = client.channel("realtime:trades_futures")
+            channel_futures = client.channel("public:trades_futures")
             channel_futures.on_postgres_changes(
                 event="*",
+                callback=on_futures_change,
                 schema="public",
                 table="trades_futures",
-                callback=on_futures_change,
             )
 
             # SDK v2.x subscribe() is a coroutine — must be awaited
