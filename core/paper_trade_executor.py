@@ -649,6 +649,7 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
         return
 
     placed, failed = 0, 0
+    placed_list: list[str] = []   # collect for Telegram summary
     from ml.ml_scorer import compute_ml_score
     for cand in candidates:
         try:
@@ -667,12 +668,27 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
             print(f"  ✅ {cand['symbol']:<12} order #{order.get('orderId')}  "
                   f"price={order.get('price')}{ml_tag}{rank_tag}")
             placed += 1
+            placed_list.append(
+                f"  {cand['symbol']} @ {ca._fmt_price(cand['entry_price']).strip()}"
+                f"  SL {ca._fmt_price(cand['sl']).strip()}"
+                f"  TP {ca._fmt_price(cand['tp1']).strip()}"
+                f"  R:R {cand['rr']:.1f}"
+            )
         except Exception as e:
             print(f"  ❌ {cand['symbol']:<12} FAILED: {e}")
             failed += 1
 
     print(f"\n  Placed: {placed}  Failed: {failed}  Cluster: {cluster_id}")
     print(f"  Run --check-positions to monitor.")
+
+    # Telegram summary — satu notif untuk seluruh batch
+    if placed_list:
+        lines = "\n".join(placed_list)
+        _send_telegram(
+            f"📋 [SPOT] {placed} order masuk  (cluster {cluster_id})\n"
+            f"{lines}"
+            + (f"\n❌ {failed} gagal" if failed else "")
+        )
 
 
 # ---------------------------------------------------------------------------
