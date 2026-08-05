@@ -248,9 +248,9 @@ jobs:
                     "cd ~/JustTrades && git rev-parse --short HEAD" 2>/dev/null || echo "unknown")
 
           MESSAGE="✅ Deploy berhasil ke commit ${NEW_HASH}
-Repo: ${{ github.repository }}
-Branch: ${{ github.ref_name }}
-Pushed by: ${{ github.actor }}"
+          Repo: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Pushed by: ${{ github.actor }}"
 
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -273,10 +273,10 @@ Pushed by: ${{ github.actor }}"
                      "grep PREV_HASH /tmp/deploy_state | cut -d= -f2" 2>/dev/null || echo "unknown")
 
           MESSAGE="⚠️ Deploy GAGAL — sudah di-rollback ke commit ${PREV_HASH}
-Repo: ${{ github.repository }}
-Branch: ${{ github.ref_name }}
-Triggered by push dari: ${{ github.actor }}
-Cek GitHub Actions untuk detail error."
+          Repo: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Triggered by push dari: ${{ github.actor }}
+          Cek GitHub Actions untuk detail error."
 
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
