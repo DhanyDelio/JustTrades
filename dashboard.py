@@ -1677,20 +1677,56 @@ def render_open_positions_tab(
     spot_syms    = list({t["symbol"] for t in spot_open    if t.get("symbol")})
     futures_syms = list({t["symbol"] for t in futures_open if t.get("symbol")})
 
+    spot_prices: dict    = {}
+    futures_prices: dict = {}
+    spot_px_ok:    bool  = True
+    futures_px_ok: bool  = True
+
     with st.spinner("Fetching live prices..."):
         try:
             spot_prices = _fetch_spot_prices(spot_syms)
-        except Exception as e:
-            st.error("Failed to fetch live spot prices.")
-            st.exception(e)
+        except Exception:
+            spot_px_ok  = False
             spot_prices = {}
-            
+
         try:
             futures_prices = _fetch_futures_prices(futures_syms)
-        except Exception as e:
-            st.error("Failed to fetch live futures prices.")
-            st.exception(e)
-            futures_prices = {}
+        except Exception:
+            futures_px_ok    = False
+            futures_prices   = {}
+
+    # ── Exchange status banner ────────────────────────────────────────
+    # Mainnet prices (spot) come from Binance mainnet — usually always up.
+    # Testnet prices (futures) come from testnet — subject to maintenance.
+    # If a fetch returned an empty dict for symbols that SHOULD have prices,
+    # treat that as a sign the exchange may be unavailable.
+    _spot_unavailable    = spot_syms    and not spot_px_ok
+    _futures_unavailable = futures_syms and not futures_px_ok
+    # Also flag when prices are empty despite having open positions
+    _spot_no_prices      = bool(spot_open)    and not spot_prices    and spot_syms
+    _futures_no_prices   = bool(futures_open) and not futures_prices and futures_syms
+
+    _spot_status_ok    = not (_spot_unavailable    or _spot_no_prices)
+    _futures_status_ok = not (_futures_unavailable or _futures_no_prices)
+
+    if not _spot_status_ok or not _futures_status_ok:
+        with st.expander("⚠️ Exchange Status — click to expand", expanded=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                if _spot_status_ok:
+                    st.markdown("🟢 **Spot Testnet** — Online")
+                else:
+                    st.markdown("🔴 **Spot Testnet** — Maintenance / Unavailable")
+                    st.caption("Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase.")
+            with c2:
+                if _futures_status_ok:
+                    st.markdown("🟢 **Futures Testnet** — Online")
+                else:
+                    st.markdown("🔴 **Futures Testnet** — Maintenance / Unavailable")
+                    st.caption("Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase.")
+    else:
+        # Both OK — show compact inline status
+        st.caption("Exchange Status: 🟢 Spot Testnet  ·  🟢 Futures Testnet")
 
     # ── Sub-tabs ──────────────────────────────────────────────────────
     sub_spot, sub_futures = st.tabs([

@@ -588,8 +588,13 @@ def cmd_propose_futures(
             raise RuntimeError("Ping failed")
         print("✅ Futures testnet connected")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "futures")
+        if outage:
+            print(f"⚠️ Binance Futures Testnet unavailable ({outage.reason}). Skipping Futures cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     # Gather candidates (LONG + SHORT)
     candidates = gather_futures_candidates(scan_n)
@@ -712,8 +717,13 @@ def cmd_propose_multi_futures(
             raise RuntimeError("Ping failed")
         print("✅ Futures testnet connected")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "futures")
+        if outage:
+            print(f"⚠️ Binance Futures Testnet unavailable ({outage.reason}). Skipping Futures cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     # Check concurrent-position cap
     open_trades  = [t for t in load_futures_log() if t.get("exit_status") == "OPEN"]
@@ -861,8 +871,13 @@ def cmd_check_futures(verbose: bool = False) -> None:
             raise RuntimeError("Ping failed")
         print("✅ Futures testnet connected")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "futures")
+        if outage:
+            print(f"⚠️ Binance Futures Testnet unavailable ({outage.reason}). Skipping Futures cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     check_futures_positions(client, verbose=verbose)
 

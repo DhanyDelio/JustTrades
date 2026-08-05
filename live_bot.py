@@ -17,6 +17,13 @@ Architecture:
   └─────────────────────────────────────────────────────┘
 
 Entry point for Docker: runs forever, never exits.
+
+Exchange maintenance handling:
+  - Executors exit with code 2 when Binance testnet is unavailable (502/timeout).
+  - live_bot.py detects rc=2, marks pipeline as SKIPPED (MAINTENANCE).
+  - A single Telegram alert is sent per cycle if any exchange is down.
+  - Heartbeat is always sent regardless of exchange status.
+  - Bot never crashes or spams retries — it sleeps until the next cycle.
 """
 
 import os
@@ -34,39 +41,117 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))
 ENABLE_SPOT    = os.environ.get("ENABLE_SPOT", "1") == "1"
 ENABLE_FUTURES = os.environ.get("ENABLE_FUTURES", "1") == "1"
 
+# Exit code produced by executors when exchange is down (maintenance/outage)
+_RC_MAINTENANCE = 2
 
-def run_spot_pipeline():
+# ── Pipeline result constants ─────────────────────────────────────
+_STATUS_SUCCESS     = "SUCCESS"
+_STATUS_MAINTENANCE = "SKIPPED (Maintenance)"
+_STATUS_ERROR       = "ERROR"
+
+
+def _run_step(cmd: list[str]) -> str:
+    """
+    Run a single executor step and return its pipeline status string.
+
+    Returns:
+        _STATUS_SUCCESS      — rc == 0
+        _STATUS_MAINTENANCE  — rc == 2 (exchange outage)
+        _STATUS_ERROR        — any other non-zero rc
+    """
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        return _STATUS_SUCCESS
+    if result.returncode == _RC_MAINTENANCE:
+        return _STATUS_MAINTENANCE
+    return _STATUS_ERROR
+
+
+def run_spot_pipeline() -> str:
     """
     Spot pipeline — includes ML v2 Shadow Scoring.
-    ML model: ml/models/v2.pkl (Spot-only, trained on trades_spot).
-    Scoring is passive: logged to Supabase but never vetoes trades.
+    Returns pipeline status string for cycle summary.
     """
-    print("─── SPOT PIPELINE (ML v2 Shadow Scoring Active) ───", flush=True)
+    print(f"\n{'=' * 50}", flush=True)
+    print("  SPOT PIPELINE", flush=True)
+    print(f"{'=' * 50}", flush=True)
 
     print("[Spot 1/2] Checking Spot Positions...", flush=True)
-    subprocess.run([sys.executable, "paper_trade_executor.py", "--check-positions"])
+    status = _run_step([sys.executable, "paper_trade_executor.py", "--check-positions"])
+    if status == _STATUS_MAINTENANCE:
+        print("⚠️ Binance Spot Testnet unavailable. Skipping Spot pipeline.", flush=True)
+        return _STATUS_MAINTENANCE
 
     print("[Spot 2/2] Proposing New Spot Trades + Shadow Scoring...", flush=True)
-    subprocess.run([sys.executable, "paper_trade_executor.py", "--propose-all", "--yes"])
+    step2 = _run_step([sys.executable, "paper_trade_executor.py", "--propose-all", "--yes"])
+    if step2 == _STATUS_MAINTENANCE:
+        print("⚠️ Binance Spot Testnet unavailable on propose step.", flush=True)
+        return _STATUS_MAINTENANCE
+
+    return _STATUS_SUCCESS if step2 == _STATUS_SUCCESS else _STATUS_ERROR
 
 
-def run_futures_pipeline():
+def run_futures_pipeline() -> str:
     """
     Futures pipeline — fully independent, NO ML scoring.
-    Uses pure rule-based selection only.
-    A dedicated Futures ML model will be trained separately
-    once Effective N (closed futures trades) reaches ~100+.
+    Returns pipeline status string for cycle summary.
     """
-    print("─── FUTURES PIPELINE (Rule-Based, No ML) ───", flush=True)
+    print(f"\n{'=' * 50}", flush=True)
+    print("  FUTURES PIPELINE", flush=True)
+    print(f"{'=' * 50}", flush=True)
 
     print("[Futures 1/2] Checking Futures Positions...", flush=True)
-    subprocess.run([sys.executable, "futures_trade_executor.py", "--check-positions"])
+    status = _run_step([sys.executable, "futures_trade_executor.py", "--check-positions"])
+    if status == _STATUS_MAINTENANCE:
+        print("⚠️ Binance Futures Testnet unavailable. Skipping Futures pipeline.", flush=True)
+        return _STATUS_MAINTENANCE
 
     print("[Futures 2/2] Proposing New Futures Trades...", flush=True)
-    subprocess.run([sys.executable, "futures_trade_executor.py", "--propose"])
+    step2 = _run_step([sys.executable, "futures_trade_executor.py", "--propose"])
+    if step2 == _STATUS_MAINTENANCE:
+        print("⚠️ Binance Futures Testnet unavailable on propose step.", flush=True)
+        return _STATUS_MAINTENANCE
+
+    return _STATUS_SUCCESS if step2 == _STATUS_SUCCESS else _STATUS_ERROR
 
 
-def run_cycle():
+def _send_outage_telegram(spot_status: str, futures_status: str) -> None:
+    """
+    Kirim SATU Telegram alert kalau ada pipeline yang kena maintenance.
+    Tidak dipanggil kalau keduanya sukses.
+    """
+    try:
+        from core.utils.telegram import send_telegram
+    except ImportError:
+        return
+
+    lines = ["⚠️ Exchange Alert"]
+
+    if spot_status == _STATUS_MAINTENANCE:
+        lines.append("")
+        lines.append("Spot Testnet:")
+        lines.append("  Tidak tersedia (maintenance / outage)")
+        lines.append("  Trading Spot dilewati.")
+
+    if futures_status == _STATUS_MAINTENANCE:
+        lines.append("")
+        lines.append("Futures Testnet:")
+        lines.append("  Tidak tersedia (maintenance / outage)")
+        lines.append("  Trading Futures dilewati.")
+
+    if spot_status == _STATUS_MAINTENANCE and futures_status == _STATUS_MAINTENANCE:
+        lines.append("")
+        lines.append("Semua trading dilewati.")
+    else:
+        lines.append("")
+        lines.append("Pipeline lain tetap berjalan normal.")
+
+    lines.append("")
+    lines.append("Bot tetap hidup dan akan mencoba lagi pada cycle berikutnya.")
+    send_telegram("\n".join(lines))
+
+
+def run_cycle() -> float:
     wib = pytz.timezone("Asia/Jakarta")
     now_utc = datetime.now(timezone.utc)
     now_wib = now_utc.astimezone(wib)
@@ -76,30 +161,48 @@ def run_cycle():
     print(f"[{timestamp} WIB] Starting Trading Cycle", flush=True)
     print(f"{'=' * 60}\n", flush=True)
 
+    spot_status    = _STATUS_SUCCESS
+    futures_status = _STATUS_SUCCESS
+
     if ENABLE_SPOT:
-        run_spot_pipeline()
+        spot_status = run_spot_pipeline()
     else:
         print("[SKIP] Spot pipeline disabled (ENABLE_SPOT=0)", flush=True)
+        spot_status = "DISABLED"
 
     if ENABLE_FUTURES:
-        run_futures_pipeline()
+        futures_status = run_futures_pipeline()
     else:
         print("[SKIP] Futures pipeline disabled (ENABLE_FUTURES=0)", flush=True)
+        futures_status = "DISABLED"
 
-    # ── Heartbeat + aligned sleep ─────────────────────────────────────
+    # ── Kirim Telegram alert jika ada outage (sekali per cycle) ──────
+    any_maintenance = (
+        spot_status    == _STATUS_MAINTENANCE or
+        futures_status == _STATUS_MAINTENANCE
+    )
+    if any_maintenance:
+        _send_outage_telegram(spot_status, futures_status)
+
+    # ── Heartbeat — selalu dikirim, meski exchange down ───────────────
     completed_utc = datetime.now(timezone.utc)
     completed_wib = completed_utc.astimezone(wib)
 
-    # Calculate top of NEXT hour (XX:00:00 WIB)
     next_hour_wib = (completed_wib + timedelta(hours=1)).replace(
         minute=0, second=0, microsecond=0
     )
-
-    # Formula requested by architecture spec:
-    # sleep_seconds = (next_hour_00_00 - current_time).total_seconds()
     sleep_secs = max(0, (next_hour_wib - completed_wib).total_seconds())
 
-    # Upsert heartbeat with promised next cycle time
+    # Tentukan bot_status untuk heartbeat
+    if spot_status == _STATUS_MAINTENANCE and futures_status == _STATUS_MAINTENANCE:
+        bot_status = "EXCHANGE_DOWN"
+    elif spot_status == _STATUS_MAINTENANCE:
+        bot_status = "SPOT_MAINTENANCE"
+    elif futures_status == _STATUS_MAINTENANCE:
+        bot_status = "FUTURES_MAINTENANCE"
+    else:
+        bot_status = "ONLINE"
+
     print(f"\n--- Cycle complete. Sending Heartbeat ---", flush=True)
     try:
         from services.supabase_client import upsert_heartbeat, send_heartbeat
@@ -110,13 +213,22 @@ def run_cycle():
         send_heartbeat()
         print(
             f"💓 [HEARTBEAT] last_seen={completed_wib.strftime('%H:%M:%S')} WIB  "
-            f"next_expected={next_hour_wib.strftime('%H:%M:%S')} WIB",
+            f"next_expected={next_hour_wib.strftime('%H:%M:%S')} WIB  "
+            f"status={bot_status}",
             flush=True,
         )
     except Exception as e:
         print(f"⚠️ [HEARTBEAT] Failed: {e}", flush=True)
 
-    # Aligned sleep — wake exactly at top of next hour
+    # ── Cycle summary ─────────────────────────────────────────────────
+    print(f"\n{'=' * 50}", flush=True)
+    print("  Cycle Summary", flush=True)
+    print(f"{'=' * 50}", flush=True)
+    print(f"  Spot     : {spot_status}", flush=True)
+    print(f"  Futures  : {futures_status}", flush=True)
+    print(f"  Heartbeat: SENT  (status={bot_status})", flush=True)
+    print(f"{'=' * 50}", flush=True)
+
     print(
         f"\n[CYCLE COMPLETE] Completed at {completed_wib.strftime('%H:%M:%S')} WIB. "
         f"Sleeping {sleep_secs:.0f}s. "
@@ -132,6 +244,7 @@ def main():
     print(f"  Spot Pipeline:    {'ENABLED (ML v2 Shadow)' if ENABLE_SPOT else 'DISABLED'}", flush=True)
     print(f"  Futures Pipeline: {'ENABLED (Rule-Based)' if ENABLE_FUTURES else 'DISABLED'}", flush=True)
     print(f"  Sleep mode:       Aligned to top of next hour (WIB)", flush=True)
+    print(f"  Outage handling:  rc=2 → skip pipeline, Telegram alert, heartbeat sent", flush=True)
     print("=" * 60, flush=True)
 
     while True:

@@ -331,8 +331,13 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
         client.ping()
         print("✅ Testnet connected")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "spot")
+        if outage:
+            print(f"⚠️ Binance Spot Testnet unavailable ({outage.reason}). Skipping Spot cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Testnet connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     # ── Simulated balance (Task 3 correction) ────────────────────────
     # Use simulated capital (BUDGET_USD + closed PnL), NOT real testnet wallet.
@@ -518,8 +523,13 @@ def cmd_check_positions(verbose: bool = False, mode: str = "all") -> None:
         client.ping()
         print("✅ Testnet connected")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "spot")
+        if outage:
+            print(f"⚠️ Binance Spot Testnet unavailable ({outage.reason}). Skipping Spot cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Testnet connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     from core.executors.spot_position_monitor import SpotPositionMonitor
     executor = SpotOrderExecutor(client)
@@ -551,8 +561,13 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
         client.ping()
         print("✅ Testnet connected\n")
     except Exception as e:
+        from core.utils.exchange_status import classify_connection_error, EXIT_MAINTENANCE, EXIT_FATAL
+        outage = classify_connection_error(e, "spot")
+        if outage:
+            print(f"⚠️ Binance Spot Testnet unavailable ({outage.reason}). Skipping Spot cycle.")
+            sys.exit(EXIT_MAINTENANCE)
         print(f"❌ Testnet connection failed: {e}")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
 
     open_trades = [t for t in repo.load_trade_log() if t.get("exit_status") == "OPEN"]
     open_symbols = {t["symbol"] for t in open_trades}
