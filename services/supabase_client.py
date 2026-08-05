@@ -14,7 +14,10 @@ Call get_client() everywhere — it returns the cached instance.
 from __future__ import annotations
 
 import os
+import time
 from functools import lru_cache
+
+from services.timing_logger import log_timing
 
 try:
     from dotenv import load_dotenv
@@ -74,8 +77,11 @@ def fetch_all_spot() -> list[dict]:
     Columns match the JSON schema used by paper_trade_executor.py
     (field names are identical to trade_log.json keys).
     """
+    _t0 = time.perf_counter()
     client = get_client()
     result = client.table(TABLE_SPOT).select("*").order("id").execute()
+    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+    log_timing(f"[TIMING] query_fetch_all_spot: {_elapsed_ms:.0f}ms")
     return result.data or []
 
 
@@ -84,8 +90,11 @@ def fetch_all_futures() -> list[dict]:
     Return all rows from trades_futures as list[dict].
     Field names match trade_futures.json keys.
     """
+    _t0 = time.perf_counter()
     client = get_client()
     result = client.table(TABLE_FUTURES).select("*").order("id").execute()
+    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+    log_timing(f"[TIMING] query_fetch_all_futures: {_elapsed_ms:.0f}ms")
     return result.data or []
 
 
@@ -166,9 +175,13 @@ def fetch_heartbeat() -> dict | None:
     Fetch the single system_heartbeat row.
     Returns dict with last_seen_at / next_expected_at, or None if table not yet created.
     """
+    _t0 = time.perf_counter()
     try:
         result = get_client().table(TABLE_HEARTBEAT).select("*").eq("id", 1).execute()
         return result.data[0] if result.data else None
     except Exception:
         return None
+    finally:
+        _elapsed_ms = (time.perf_counter() - _t0) * 1000
+        log_timing(f"[TIMING] query_fetch_heartbeat: {_elapsed_ms:.0f}ms")
 

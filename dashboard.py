@@ -13,7 +13,8 @@ import plotly.express as px
 import streamlit as st
 from pathlib import Path
 
-from services.supabase_client import fetch_all_spot, fetch_all_futures
+from services.supabase_client import fetch_all_spot, fetch_all_futures, fetch_heartbeat
+from services.timing_logger import log_timing
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -31,6 +32,7 @@ try:
 except ImportError:
     from supabase import create_async_client  # type: ignore
 
+
 class DashboardState:
     def __init__(self):
         self.spot_rows = None
@@ -39,18 +41,42 @@ class DashboardState:
         self.last_event_time = None  # HH:MM:SS string of last WebSocket event
         self.connected = False
         self.lock = threading.Lock()
-        self.pending_rerun = False   # set True by WS callbacks, cleared after rerun
+        # Producers only queue an update; _realtime_watcher is the one place
+        # that turns it into a Streamlit rerun.
+        self.pending_rerun = False
+        self.pending_rerun_key = None
+        self.last_handled_update_key = None
+
+@st.cache_data(ttl=10)
+def get_fresh_snapshot() -> dict:
+    _t0 = time.perf_counter()
+    log_timing("[TIMING] get_fresh_snapshot: cache-miss, fetching from Supabase...")
+    heartbeat = fetch_heartbeat()
+    spot_rows = fetch_all_spot()
+    futures_rows = fetch_all_futures()
+    fetched_at = datetime.now(WIB).isoformat()
+    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+    log_timing(f"[TIMING] get_fresh_snapshot: cache-miss complete in {_elapsed_ms:.0f}ms")
+    return {
+        "heartbeat": heartbeat,
+        "spot_rows": spot_rows,
+        "futures_rows": futures_rows,
+        "fetched_at": fetched_at,
+    }
+
 
 @st.cache_resource
 def get_global_state():
     state = DashboardState()
     # --- Direct initial fetch on first load ---
-    # Populate state immediately via blocking REST call so the UI never
+    # Populate state immediately via blocking snapshot so the UI never
     # shows "Waiting..." when historical data already exists in the DB.
     try:
-        from services.supabase_client import fetch_all_spot, fetch_all_futures
-        state.spot_rows    = fetch_all_spot()
-        state.futures_rows = fetch_all_futures()
+        _t0 = time.perf_counter()
+        snapshot = get_fresh_snapshot()
+        log_timing(f"[TIMING] dashboard.get_global_state.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        state.spot_rows = snapshot.get("spot_rows")
+        state.futures_rows = snapshot.get("futures_rows")
         state.last_updated = time.time()
 
         # Hydrate last_event_time from the most recent updated_at / created_at
@@ -101,36 +127,79 @@ def _extract_event_time(record: dict) -> str:
     return datetime.now(wib).strftime("%H:%M:%S")
 
 
+def _watcher_tick_context(counter_key: str) -> str:
+    """Return stable diagnostics for a watcher tick within one browser session."""
+    tick = int(st.session_state.get(counter_key, 0)) + 1
+    st.session_state[counter_key] = tick
+
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx(suppress_warning=True)
+        session_id = ctx.session_id if ctx is not None else "unknown"
+    except Exception:
+        session_id = "unknown"
+
+    return f"pid={os.getpid()} session_id={session_id} tick={tick}"
+
+
+def _update_key(table_name: str, event_type: str, record: dict) -> str:
+    """Return a stable key so one database update produces one UI rerun."""
+    if table_name == "system_heartbeat":
+        # last_seen_at changes exactly once when a cycle finishes, and is the
+        # same value visible to both Realtime and the polling fallback.
+        marker = record.get("last_seen_at") or record.get("updated_at")
+        return f"{table_name}:{marker}"
+
+    marker = record.get("updated_at") or record.get("created_at") or record.get("id")
+    return f"{table_name}:{event_type}:{record.get('id')}:{marker}"
+
+
+def _queue_dashboard_update(
+    state: DashboardState,
+    *,
+    update_key: str,
+    source: str,
+) -> bool:
+    """Idempotently queue a rerun; the fragment watcher consumes the queue."""
+    with state.lock:
+        # st.cache_resource can retain a DashboardState created by an earlier
+        # source version during Streamlit hot reload.  Lazily add new fields so
+        # an in-flight dashboard upgrades safely instead of losing its cycle.
+        if not hasattr(state, "pending_rerun_key"):
+            state.pending_rerun_key = None
+        if not hasattr(state, "last_handled_update_key"):
+            state.last_handled_update_key = None
+
+        if update_key in (state.pending_rerun_key, state.last_handled_update_key):
+            return False
+        state.pending_rerun = True
+        state.pending_rerun_key = update_key
+
+    log_timing(f"[TIMING] dashboard_update_queued: source={source} key={update_key}")
+    return True
+
+
 async def realtime_loop(state: DashboardState):
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
         return
 
-    # ── Helper: push rerun request to every active Streamlit session ──
-    def trigger_ui_update():
-        # Mark that new data arrived — main() checks this flag at end of render
-        # to decide whether to rerun. Using a boolean flag is more reliable than
-        # timestamp comparison (avoids float precision / same-tick issues).
-        state.pending_rerun = True
-        try:
-            from streamlit.runtime import get_instance
-            runtime = get_instance()
-            list_fn = getattr(
-                runtime._session_mgr,
-                "list_active_sessions",
-                getattr(runtime._session_mgr, "list_sessions", None),
-            )
-            if list_fn is None:
-                return
-            for session_info in list_fn():
-                if hasattr(session_info.session, "request_rerun"):
-                    try:
-                        session_info.session.request_rerun(None)
-                    except TypeError:
-                        session_info.session.request_rerun()
-        except Exception:
-            pass
+    # ── Helper: mark that UI should rerun on the next realtime watcher tick ──
+    def trigger_ui_update(event_type: str, table_name: str, record: dict):
+        # Mark that new data arrived — _realtime_watcher() is the sole place
+        # that converts this flag into st.rerun(), keeping rerun cadence bounded.
+        update_key = _update_key(table_name, event_type, record)
+        queued = _queue_dashboard_update(
+            state,
+            update_key=update_key,
+            source=f"realtime:{table_name}:{event_type}",
+        )
+        log_timing(
+            f"[TIMING] trigger_ui_update: table={table_name} event={event_type} "
+            f"key={update_key} queued={queued}",
+            echo=queued,
+        )
 
     # ── Generic upsert helper shared by both callbacks ─────────────────
     def _upsert_row(rows: list[dict], record: dict) -> list[dict]:
@@ -147,25 +216,39 @@ async def realtime_loop(state: DashboardState):
         record = payload.get("record") or payload.get("new")
         if not record:
             return
+        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
         with state.lock:
             if state.spot_rows is None:
                 state.spot_rows = []
             state.spot_rows = _upsert_row(state.spot_rows, record)
             state.last_updated  = time.time()
             state.last_event_time = _extract_event_time(record)
-        trigger_ui_update()
+        trigger_ui_update(event_type, "trades_spot", record)
 
     def on_futures_change(payload):
         record = payload.get("record") or payload.get("new")
         if not record:
             return
+        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
         with state.lock:
             if state.futures_rows is None:
                 state.futures_rows = []
             state.futures_rows = _upsert_row(state.futures_rows, record)
             state.last_updated    = time.time()
             state.last_event_time = _extract_event_time(record)
-        trigger_ui_update()
+        trigger_ui_update(event_type, "trades_futures", record)
+
+    def on_heartbeat_change(payload):
+        record = payload.get("record") or payload.get("new")
+        if not record:
+            return
+        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
+        with state.lock:
+            state.last_updated = time.time()
+            state.last_event_time = _extract_event_time(record)
+        # Do not call st.rerun() from this async callback.  It joins the same
+        # idempotent queue as trade events and polling fallback.
+        trigger_ui_update(event_type, "system_heartbeat", record)
 
     # ── Reconnect loop — if WS drops, wait 5s and reconnect ───────────
     RETRY_DELAY = 5  # seconds
@@ -175,29 +258,58 @@ async def realtime_loop(state: DashboardState):
             # SDK v2.x: create_async_client from supabase._async.client
             client = await create_async_client(url, key)
 
-            # Subscribe to trades_spot — capture INSERT and UPDATE
+            # Subscribe to trades_spot — capture only INSERT and UPDATE
             # on_postgres_changes signature: (event, callback, table=None, schema=None)
             # callback is positional arg 2 — must come before table/schema keywords
             channel_spot = client.channel("public:trades_spot")
             channel_spot.on_postgres_changes(
-                event="*",          # catches INSERT + UPDATE + DELETE
+                event="INSERT",
+                callback=on_spot_change,
+                schema="public",
+                table="trades_spot",
+            )
+            channel_spot.on_postgres_changes(
+                event="UPDATE",
                 callback=on_spot_change,
                 schema="public",
                 table="trades_spot",
             )
 
-            # Subscribe to trades_futures — capture INSERT and UPDATE
+            # Subscribe to trades_futures — capture only INSERT and UPDATE
             channel_futures = client.channel("public:trades_futures")
             channel_futures.on_postgres_changes(
-                event="*",
+                event="INSERT",
+                callback=on_futures_change,
+                schema="public",
+                table="trades_futures",
+            )
+            channel_futures.on_postgres_changes(
+                event="UPDATE",
                 callback=on_futures_change,
                 schema="public",
                 table="trades_futures",
             )
 
+            # A completed bot cycle updates this singleton even when no trade
+            # row changes.  Listening here keeps the status bar current.
+            channel_heartbeat = client.channel("public:system_heartbeat")
+            channel_heartbeat.on_postgres_changes(
+                event="INSERT",
+                callback=on_heartbeat_change,
+                schema="public",
+                table="system_heartbeat",
+            )
+            channel_heartbeat.on_postgres_changes(
+                event="UPDATE",
+                callback=on_heartbeat_change,
+                schema="public",
+                table="system_heartbeat",
+            )
+
             # SDK v2.x subscribe() is a coroutine — must be awaited
             await channel_spot.subscribe()
             await channel_futures.subscribe()
+            await channel_heartbeat.subscribe()
             state.connected = True
 
             # Keep the loop alive; sleep in small increments so we can
@@ -220,6 +332,8 @@ WIB = pytz.timezone("Asia/Jakarta")
 VM_STALL_THRESHOLD_SECONDS = 70 * 60
 VM_DOWN_REFRESH_MS = 300_000
 NORMAL_REFRESH_BUFFER_SECONDS = 5
+HEARTBEAT_FALLBACK_POLL_SECONDS = 20
+HEARTBEAT_FALLBACK_WINDOW_SECONDS = 5 * 60
 
 
 def _parse_iso_to_wib(raw: str | None) -> datetime | None:
@@ -267,15 +381,17 @@ _sync_session_state()
 
 
 def load_trade_data() -> pd.DataFrame:
-    with global_state.lock:
-        if global_state.spot_rows is None:
-            try:
-                global_state.spot_rows = fetch_all_spot()
-            except Exception as exc:
-                st.error("Failed to load spot trades from Supabase.")
-                st.exception(exc)
-                return pd.DataFrame()
-        rows = list(global_state.spot_rows)
+    try:
+        _t0 = time.perf_counter()
+        snapshot = get_fresh_snapshot()
+        log_timing(f"[TIMING] dashboard.load_trade_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        rows = list(snapshot.get("spot_rows") or [])
+        with global_state.lock:
+            global_state.spot_rows = rows
+    except Exception as exc:
+        st.error("Failed to load spot trades from Supabase.")
+        st.exception(exc)
+        return pd.DataFrame()
 
     if not rows:
         return pd.DataFrame()
@@ -482,15 +598,17 @@ def build_cluster_breakdown(df: pd.DataFrame):
 
 def load_futures_data() -> pd.DataFrame:
     """Load futures trades from Supabase (trades_futures table). Returns empty DataFrame on error."""
-    with global_state.lock:
-        if global_state.futures_rows is None:
-            try:
-                global_state.futures_rows = fetch_all_futures()
-            except Exception as exc:
-                st.error("Failed to load futures trades from Supabase.")
-                st.exception(exc)
-                return pd.DataFrame()
-        rows = list(global_state.futures_rows)
+    try:
+        _t0 = time.perf_counter()
+        snapshot = get_fresh_snapshot()
+        log_timing(f"[TIMING] dashboard.load_futures_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        rows = list(snapshot.get("futures_rows") or [])
+        with global_state.lock:
+            global_state.futures_rows = rows
+    except Exception as exc:
+        st.error("Failed to load futures trades from Supabase.")
+        st.exception(exc)
+        return pd.DataFrame()
 
     if not rows:
         return pd.DataFrame()
@@ -1685,8 +1803,14 @@ def main():
     # If the VM appears down, back off to every 5 minutes until heartbeat resumes.
     _heartbeat_for_timer = None
     try:
-        from services.supabase_client import fetch_heartbeat
-        _heartbeat_for_timer = fetch_heartbeat()
+        _t0 = time.perf_counter()
+        snapshot = get_fresh_snapshot()
+        log_timing(f"[TIMING] dashboard.main.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        _heartbeat_for_timer = snapshot.get("heartbeat")
+        log_timing(
+            "[TIMING] get_fresh_snapshot: cache-hit or warmed snapshot used by main()",
+            echo=False,
+        )
     except Exception:
         _heartbeat_for_timer = None
 
@@ -1698,6 +1822,10 @@ def main():
     )
     _timer_vm_down = _timer_time_since_last_seen > VM_STALL_THRESHOLD_SECONDS
     _autorefresh_interval_ms = _get_autorefresh_interval_ms(now_wib, _timer_vm_down)
+    log_timing(
+        f"[TIMING] autorefresh_calc: now_wib={now_wib.isoformat()} "
+        f"vm_down={_timer_vm_down} interval_ms={_autorefresh_interval_ms}"
+    )
     st_autorefresh(interval=_autorefresh_interval_ms, key="dashboard_sync_watchdog")
 
     c_btn, c_info = st.columns([1.5, 8.5])
@@ -1709,7 +1837,14 @@ def main():
             st.rerun()
 
     with c_info:
-        _hb = _heartbeat_for_timer
+        try:
+            _t0 = time.perf_counter()
+            _badge_snapshot = get_fresh_snapshot()
+            log_timing(f"[TIMING] dashboard.badge.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            _hb = _badge_snapshot.get("heartbeat")
+        except Exception:
+            _hb = _heartbeat_for_timer
+
         _last_seen_dt_wib = _parse_iso_to_wib((_hb or {}).get("last_seen_at"))
         _last_seen_wib = (
             _last_seen_dt_wib.strftime("%H:%M:%S")
@@ -1960,20 +2095,24 @@ def main():
 
         # Load raw rows (not the processed DataFrames) so we have all original fields
         try:
+            _t0 = time.perf_counter()
+            snapshot = get_fresh_snapshot()
+            log_timing(f"[TIMING] dashboard.tab_open.get_fresh_snapshot.spot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            _spot_rows = list(snapshot.get("spot_rows") or [])
             with global_state.lock:
-                if global_state.spot_rows is None:
-                    global_state.spot_rows = fetch_all_spot()
-                _spot_rows = list(global_state.spot_rows)
+                global_state.spot_rows = _spot_rows
         except Exception as exc:
             st.error("Failed to load spot trades for Open Positions:")
             st.exception(exc)
             _spot_rows = []
 
         try:
+            _t0 = time.perf_counter()
+            snapshot = get_fresh_snapshot()
+            log_timing(f"[TIMING] dashboard.tab_open.get_fresh_snapshot.futures: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            _futures_rows = list(snapshot.get("futures_rows") or [])
             with global_state.lock:
-                if global_state.futures_rows is None:
-                    global_state.futures_rows = fetch_all_futures()
-                _futures_rows = list(global_state.futures_rows)
+                global_state.futures_rows = _futures_rows
         except Exception as exc:
             st.error("Failed to load futures trades for Open Positions:")
             st.exception(exc)
@@ -2125,37 +2264,127 @@ def main():
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
 
-    # Independent timer-based sync is handled by st_autorefresh above.
-    # Keep a lightweight fallback here to invalidate cached rows after the
-    # expected sync point, even if websocket events were missed.
-    @st.fragment(run_every=60)
+    # Realtime is the normal path.  This is its bounded fallback for a missed
+    # WebSocket event: query only in the short period after an expected cycle,
+    # and only queue the shared idempotent rerun gate after a new heartbeat.
+    LOG_ROTATION_DAYS = 7
+    LOG_ROTATION_PATH = Path(__file__).parent / "logs" / "dashboard_timing.log"
+
+    @st.fragment(run_every=HEARTBEAT_FALLBACK_POLL_SECONDS)
     def _scheduled_refresh_watcher():
+        watcher_context = _watcher_tick_context("_scheduled_refresh_watcher_tick_count")
         try:
+            # This fragment reruns independently of main(), so compute time here
+            # rather than using the now_wib value captured by the last full rerun.
+            watcher_now_wib = datetime.now(WIB)
+
+            # ── Log rotation: cek umur file via mtime, tanpa baca isinya ──
+            # Guard idempoten: catat epoch-hari terakhir rotasi agar penghapusan
+            # hanya terjadi SEKALI per periode 7 hari, bukan di setiap tick.
+            _today_epoch_day = int(time.time() // 86400)
+            _last_rotated_day = st.session_state.get("_log_last_rotated_day", -1)
+            if _last_rotated_day != _today_epoch_day and LOG_ROTATION_PATH.exists():
+                try:
+                    _mtime = LOG_ROTATION_PATH.stat().st_mtime
+                    _age_days = (time.time() - _mtime) / 86400
+                    if _age_days > LOG_ROTATION_DAYS:
+                        LOG_ROTATION_PATH.unlink()
+                        st.session_state["_log_last_rotated_day"] = _today_epoch_day
+                        log_timing(
+                            f"[TIMING] log_rotation: deleted {LOG_ROTATION_PATH.name} "
+                            f"(age={_age_days:.1f}d > {LOG_ROTATION_DAYS}d)"
+                        )
+                    else:
+                        # File masih muda — tandai hari ini agar tidak di-cek lagi hari ini.
+                        st.session_state["_log_last_rotated_day"] = _today_epoch_day
+                except Exception as _rot_exc:
+                    log_timing(f"[TIMING] log_rotation_error: {_rot_exc}")
+            # ── end log rotation ───────────────────────────────────────
             hb = _heartbeat_for_timer
             if not hb:
+                log_timing(
+                    f"[TIMING] scheduled_refresh_watcher_tick: {watcher_context} hb=None -> skip",
+                    echo=False,
+                )
                 return
 
             next_expected_wib = _parse_iso_to_wib(hb.get("next_expected_at"))
             if next_expected_wib is None:
+                log_timing(
+                    f"[TIMING] scheduled_refresh_watcher_tick: {watcher_context} "
+                    "next_expected_wib=None -> skip",
+                    echo=False,
+                )
                 return
 
             refresh_target_wib = next_expected_wib + timedelta(seconds=NORMAL_REFRESH_BUFFER_SECONDS)
-            if now_wib >= refresh_target_wib:
-                with global_state.lock:
-                    global_state.spot_rows = None
-                    global_state.futures_rows = None
-                global_state.pending_rerun = False
-                st.rerun()
-        except Exception:
-            pass
+            fallback_window_end_wib = refresh_target_wib + timedelta(
+                seconds=HEARTBEAT_FALLBACK_WINDOW_SECONDS
+            )
+            should_poll = refresh_target_wib <= watcher_now_wib < fallback_window_end_wib
+            log_timing(
+                f"[TIMING] scheduled_refresh_watcher_tick: "
+                f"{watcher_context} "
+                f"now_wib={watcher_now_wib.isoformat()} "
+                f"refresh_target_wib={refresh_target_wib.isoformat()} "
+                f"fallback_window_end_wib={fallback_window_end_wib.isoformat()} "
+                f"should_poll={should_poll}",
+                echo=False,
+            )
+            if not should_poll:
+                return
+
+            # Bypass the 10-second UI snapshot cache: this check exists to
+            # detect the *new* heartbeat as soon as the bot writes it.
+            current_heartbeat = fetch_heartbeat()
+            current_last_seen_wib = _parse_iso_to_wib(
+                (current_heartbeat or {}).get("last_seen_at")
+            )
+            if current_last_seen_wib is None or current_last_seen_wib < next_expected_wib:
+                log_timing(
+                    f"[TIMING] scheduled_refresh_watcher_poll: {watcher_context} "
+                    "heartbeat_not_advanced=True",
+                    echo=False,
+                )
+                return
+
+            update_key = _update_key("system_heartbeat", "UPDATE", current_heartbeat)
+            queued = _queue_dashboard_update(
+                global_state,
+                update_key=update_key,
+                source="heartbeat_fallback_poll",
+            )
+            log_timing(
+                f"[TIMING] scheduled_refresh_watcher_poll: {watcher_context} "
+                f"heartbeat_advanced=True key={update_key} queued={queued}",
+                echo=queued,
+            )
+        except Exception as exc:
+            log_timing(f"[TIMING] scheduled_refresh_watcher_error: {exc}")
 
     _scheduled_refresh_watcher()
 
     # ── WebSocket fallback: immediate rerun if WS event arrived ──────
     @st.fragment(run_every=3)
     def _realtime_watcher():
-        if global_state.pending_rerun:
-            global_state.pending_rerun = False
+        watcher_context = _watcher_tick_context("_realtime_watcher_tick_count")
+        with global_state.lock:
+            should_rerun = global_state.pending_rerun
+            update_key = getattr(global_state, "pending_rerun_key", None)
+            if should_rerun:
+                # Claim the key before rerunning.  A duplicate event from the
+                # fallback or WebSocket now sees it as handled and cannot
+                # create a second rerun for the same heartbeat update.
+                global_state.pending_rerun = False
+                global_state.pending_rerun_key = None
+                global_state.last_handled_update_key = update_key
+        log_timing(
+            f"[TIMING] realtime_watcher_tick: {watcher_context} "
+            f"pending_rerun={should_rerun} update_key={update_key}",
+            echo=should_rerun,
+        )
+        if should_rerun:
+            get_fresh_snapshot.clear()
             st.session_state["_last_seen_update"] = global_state.last_updated
             st.rerun()
 
