@@ -1,0 +1,289 @@
+name: Deploy to Oracle VM
+
+# ── Triggers ────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # manual trigger for safe first-run testing
+    inputs:
+      force_window:
+        description: "Skip safe-window check (use 'yes' to force deploy any time)"
+        required: false
+        default: "no"
+
+# Prevent two deploys running in parallel — second push waits, does not cancel.
+# Cancelling mid-deploy would leave the container in an unknown state.
+concurrency:
+  group: deploy-oracle-vm
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy → Oracle VM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Safe-window check ─────────────────────────────────────────────
+      # Bot cycle runs at the top of every hour (WIB).
+      # Avoid deploying in the :50–:10 window (20 min straddling the cycle)
+      # to ensure the bot is not mid-cycle when the container restarts.
+      # Window is in WIB (UTC+7).  Logic: allow deploy only if minute ∈ [10, 50).
+      - name: Safe-window check (WIB :10–:50 only)
+        id: window_check
+        run: |
+          if [ "${{ github.event.inputs.force_window }}" = "yes" ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            echo "🔓 Safe-window check bypassed via workflow_dispatch force_window=yes"
+            exit 0
+          fi
+
+          # Current minute in WIB (UTC+7 = UTC+420 minutes)
+          MINUTE=$(TZ="Asia/Jakarta" date +%M)
+          MINUTE=${MINUTE#0}   # strip leading zero so bash treats it as decimal
+          echo "Current WIB minute: $MINUTE"
+
+          if [ "$MINUTE" -ge 10 ] && [ "$MINUTE" -lt 50 ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Within safe deploy window (:$MINUTE WIB)"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo "⏸️  Outside safe deploy window (:$MINUTE WIB)."
+            echo "    Deploy window is :10–:50 WIB. Re-push or use workflow_dispatch"
+            echo "    with force_window=yes to override."
+          fi
+
+      - name: Skip if outside safe window
+        if: steps.window_check.outputs.safe != 'true'
+        run: |
+          echo "Skipping deploy — outside safe window. This is not a failure."
+          exit 0
+
+      # ── 2. SSH deploy ────────────────────────────────────────────────────
+      - name: Set up SSH key
+        if: steps.window_check.outputs.safe == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy via SSH
+        if: steps.window_check.outputs.safe == 'true'
+        id: deploy
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=15 \
+              "${VM_USER}@${VM_HOST}" \
+          'bash -s' << 'REMOTE'
+            set -e
+
+            cd ~/JustTrades
+
+            # Capture current commit hash BEFORE pull for rollback
+            PREV_HASH=$(git rev-parse --short HEAD)
+            echo "PREV_HASH=${PREV_HASH}" >> /tmp/deploy_state
+            echo "Pre-deploy commit: ${PREV_HASH}"
+
+            # Pull latest changes
+            git pull origin main
+
+            NEW_HASH=$(git rev-parse --short HEAD)
+            echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
+            echo "Post-pull commit: ${NEW_HASH}"
+
+            # Rebuild and restart container
+            docker compose down
+            docker compose up -d --build
+
+            echo "Container restarted. Waiting for health check..."
+          REMOTE
+
+      # ── 3. Health check ──────────────────────────────────────────────────
+      # Wait 2.5 minutes after container restart before checking.
+      - name: Wait for container startup
+        if: steps.window_check.outputs.safe == 'true' && steps.deploy.outcome == 'success'
+        run: sleep 150
+
+      - name: Health check — container status
+        if: steps.window_check.outputs.safe == 'true' && steps.deploy.outcome == 'success'
+        id: health_container
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          RESULT=$(ssh -i ~/.ssh/deploy_key \
+                       -o StrictHostKeyChecking=no \
+                       "${VM_USER}@${VM_HOST}" \
+                   "cd ~/JustTrades && docker compose ps --format json 2>/dev/null || docker compose ps")
+
+          echo "docker compose ps output:"
+          echo "$RESULT"
+
+          # Fail if container is Restarting or Exited
+          if echo "$RESULT" | grep -qiE '"State"\s*:\s*"(restarting|exited|dead)"'; then
+            echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+            echo "❌ Container is in a bad state (Restarting/Exited/Dead)"
+            exit 1
+          elif echo "$RESULT" | grep -qiE 'Restarting|Exited|Exit \('; then
+            echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+            echo "❌ Container is in a bad state"
+            exit 1
+          else
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "✅ Container is Up"
+          fi
+
+      - name: Health check — Supabase heartbeat
+        if: >
+          steps.window_check.outputs.safe == 'true' &&
+          steps.deploy.outcome == 'success' &&
+          steps.health_container.outputs.status == 'healthy'
+        id: health_heartbeat
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          # Fetch system_heartbeat row from Supabase REST API
+          RESPONSE=$(curl -sf \
+            -H "apikey: ${SUPABASE_SERVICE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Accept: application/json" \
+            "${SUPABASE_URL}/rest/v1/system_heartbeat?id=eq.1&select=last_seen_at" \
+            2>&1)
+
+          echo "Heartbeat response: ${RESPONSE}"
+
+          # Extract last_seen_at (ISO timestamp)
+          LAST_SEEN=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          if data:
+              print(data[0].get('last_seen_at', ''))
+          ")
+
+          echo "last_seen_at: ${LAST_SEEN}"
+
+          if [ -z "$LAST_SEEN" ]; then
+            echo "status=no_heartbeat" >> "$GITHUB_OUTPUT"
+            echo "⚠️  No heartbeat row found — bot may not have run yet (acceptable on first deploy)"
+            # Not a hard failure — the bot hasn't cycled yet after restart
+            exit 0
+          fi
+
+          # Check if heartbeat was within the last 90 minutes
+          # (allows for up to one full hour cycle to complete post-restart)
+          LAST_SEEN_EPOCH=$(python3 -c "
+          from datetime import datetime, timezone
+          import sys
+          raw = '${LAST_SEEN}'.replace('Z', '+00:00')
+          dt = datetime.fromisoformat(raw)
+          print(int(dt.timestamp()))
+          " 2>/dev/null || echo "0")
+
+          NOW_EPOCH=$(date +%s)
+          AGE_MINUTES=$(( (NOW_EPOCH - LAST_SEEN_EPOCH) / 60 ))
+          echo "Heartbeat age: ${AGE_MINUTES} minutes"
+
+          if [ "$AGE_MINUTES" -le 90 ]; then
+            echo "status=fresh" >> "$GITHUB_OUTPUT"
+            echo "✅ Heartbeat is fresh (${AGE_MINUTES} min old)"
+          else
+            echo "status=stale" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Heartbeat is stale (${AGE_MINUTES} min old) — bot may not be running"
+            # Stale heartbeat is a warning, not a hard rollback trigger.
+            # The bot cycles hourly; a stale heartbeat right after deploy is expected.
+          fi
+
+      # ── 4. Rollback on hard failure ──────────────────────────────────────
+      # Only triggered if container health check explicitly marked unhealthy.
+      - name: Rollback — restore previous commit and rebuild
+        if: >
+          steps.window_check.outputs.safe == 'true' &&
+          steps.health_container.outputs.status == 'unhealthy'
+        id: rollback
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          echo "🔄 Starting rollback..."
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${VM_USER}@${VM_HOST}" \
+          'bash -s' << 'REMOTE'
+            set -e
+            cd ~/JustTrades
+
+            # Read saved pre-deploy hash
+            PREV_HASH=$(grep PREV_HASH /tmp/deploy_state | cut -d= -f2)
+            echo "Rolling back to: ${PREV_HASH}"
+
+            git checkout "${PREV_HASH}" -- .
+
+            docker compose down
+            docker compose up -d --build
+
+            echo "Rollback complete. Running on: $(git rev-parse --short HEAD)"
+          REMOTE
+
+      # ── 5. Telegram notifications ────────────────────────────────────────
+      - name: Notify Telegram — deploy successful
+        if: >
+          steps.window_check.outputs.safe == 'true' &&
+          steps.deploy.outcome == 'success' &&
+          steps.health_container.outputs.status == 'healthy'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          NEW_HASH=$(ssh -i ~/.ssh/deploy_key \
+                        -o StrictHostKeyChecking=no \
+                        "${VM_USER}@${VM_HOST}" \
+                    "cd ~/JustTrades && git rev-parse --short HEAD" 2>/dev/null || echo "unknown")
+
+          MESSAGE="✅ Deploy berhasil ke commit ${NEW_HASH}
+Repo: ${{ github.repository }}
+Branch: ${{ github.ref_name }}
+Pushed by: ${{ github.actor }}"
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MESSAGE}" > /dev/null
+
+      - name: Notify Telegram — rollback triggered
+        if: >
+          steps.window_check.outputs.safe == 'true' &&
+          steps.health_container.outputs.status == 'unhealthy'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          PREV_HASH=$(ssh -i ~/.ssh/deploy_key \
+                         -o StrictHostKeyChecking=no \
+                         "${VM_USER}@${VM_HOST}" \
+                     "grep PREV_HASH /tmp/deploy_state | cut -d= -f2" 2>/dev/null || echo "unknown")
+
+          MESSAGE="⚠️ Deploy GAGAL — sudah di-rollback ke commit ${PREV_HASH}
+Repo: ${{ github.repository }}
+Branch: ${{ github.ref_name }}
+Triggered by push dari: ${{ github.actor }}
+Cek GitHub Actions untuk detail error."
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MESSAGE}" > /dev/null
+
+      # ── 6. Cleanup ───────────────────────────────────────────────────────
+      - name: Remove SSH key from runner
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
