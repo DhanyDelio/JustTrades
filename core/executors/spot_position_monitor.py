@@ -315,8 +315,9 @@ class SpotPositionMonitor:
                         # Do NOT infer SL executed — no fill, no sold balance confirmed.
                         _is_missing = "-2018" in err_str or "-2013" in err_str
                         if _is_missing:
-                            prev_recon = trade.get("oco_reconciliation_status", "")
-                            trade["oco_reconciliation_status"] = "UNPROTECTED"
+                            prev_recon  = trade.get("oco_reconciliation_status", "")
+                            new_recon   = "UNPROTECTED"
+                            trade["oco_reconciliation_status"] = new_recon
                             log_dirty = True
                             oco_str = "⚠ UNPROTECTED"
                             print(
@@ -324,7 +325,11 @@ class SpotPositionMonitor:
                                 f"Position UNPROTECTED. "
                                 f"oco_list_id={trade.get('oco_list_id')} error: {err_str[:60]}"
                             )
-                            if prev_recon != "UNPROTECTED":
+                            # Alert only when state actually transitions into this status.
+                            # prev_recon != new_recon catches the first detection correctly.
+                            # If prev was UNPROTECTED_SL_BREACH and we re-detect UNPROTECTED
+                            # (price moved back above SL), that is also a new transition.
+                            if prev_recon != new_recon:
                                 cur_disp = ca._fmt_price(price_map.get(sym)).strip() if price_map.get(sym) else "?"
                                 _send_telegram(
                                     f"🚨 [SPOT] UNPROTECTED POSITION: {sym}\n"
@@ -369,6 +374,8 @@ class SpotPositionMonitor:
                     if sl_breached and recon_status in ("UNPROTECTED", "UNPROTECTED_SL_BREACH"):
                         entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
                         est_pnl    = trade.get("entry_qty", 0) * (current - entry_fill)
+                        prev_recon = recon_status
+                        new_recon  = "UNPROTECTED_SL_BREACH"
                         print(
                             f"  🚨 [{sym}] UNPROTECTED_SL_BREACH: "
                             f"price {current:.6f} below SL {sl_level:.6f}, "
@@ -376,9 +383,18 @@ class SpotPositionMonitor:
                             f"Est. unrealized loss: ${est_pnl:+.4f} USDT. "
                             f"Manual intervention required."
                         )
-                        if recon_status != "UNPROTECTED_SL_BREACH":
-                            trade["oco_reconciliation_status"] = "UNPROTECTED_SL_BREACH"
+                        if prev_recon != new_recon:
+                            trade["oco_reconciliation_status"] = new_recon
                             log_dirty = True
+                            # Alert only on transition into this state (not every cycle).
+                            _send_telegram(
+                                f"🚨 [SPOT] UNPROTECTED SL BREACH: {sym}\n"
+                                f"Price {ca._fmt_price(current).strip()} is below SL "
+                                f"{ca._fmt_price(trade.get('sl')).strip()}.\n"
+                                f"OCO is MISSING — asset NOT sold, position still open.\n"
+                                f"Est. unrealized loss: ${est_pnl:+.4f} USDT\n"
+                                f"Manual intervention required."
+                            )
                         oco_str = "🚨 UNPROTECTED_SL_BREACH"
 
                     elif sl_breached and trade.get("oco_placed"):
