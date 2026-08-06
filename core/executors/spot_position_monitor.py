@@ -120,55 +120,100 @@ class SpotPositionMonitor:
                 eid  = trade.get("entry_order_id")
     
                 # ── Step 1: Query entry order ──────────────────────────────
+                # If entry order returns -2013 (purged after testnet reset):
+                #   - local entry_status=FILLED  → use persisted state, continue to OCO
+                #   - local entry_status=PENDING  → ambiguous, mark RECONCILIATION_REQUIRED
+                #   - other errors               → skip this trade this cycle
+                _entry_order_missing = False
                 try:
                     entry_order  = client.get_order(symbol=sym, orderId=eid)
                     entry_status = entry_order.get("status", "UNKNOWN")
                 except Exception as e:
-                    print(f"  {sym:<10} ⚠ Could not query: {e}")
-                    continue
+                    err_str      = str(e)
+                    _purged      = "-2013" in err_str or "Order does not exist" in err_str
+                    local_status = trade.get("entry_status", "")
+
+                    if _purged and local_status == "FILLED":
+                        # Entry order history gone but position was already FILLED.
+                        # Persisted entry_status / entry_fill_price / entry_qty are
+                        # sufficient — proceed directly to OCO reconciliation.
+                        entry_status         = "FILLED"
+                        _entry_order_missing = True
+                        print(
+                            f"  {sym:<10} ℹ Entry order {eid} not found (purged). "
+                            f"Using persisted FILLED state — continuing to OCO check."
+                        )
+                    elif _purged and local_status in ("NEW", "PARTIALLY_FILLED", ""):
+                        # Pending entry order purged — cannot confirm fill.
+                        entry_status = local_status or "UNKNOWN"
+                        trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
+                        log_dirty = True
+                        print(
+                            f"  {sym:<10} ⚠ Entry order {eid} not found, "
+                            f"local_status={local_status!r}. RECONCILIATION_REQUIRED."
+                        )
+                        continue
+                    else:
+                        # Non-purge error (network, auth, etc.) — skip this cycle.
+                        print(f"  {sym:<10} ⚠ Could not query entry order: {e}")
+                        continue
     
-                filled_qty  = float(entry_order.get("executedQty", 0))
-                actual_fill = float(entry_order.get("cummulativeQuoteQty", 0))
-                # Primary: cummulativeQuoteQty / executedQty (most accurate)
-                # Binance Spot Testnet often returns cummulativeQuoteQty=0 for LIMIT fills,
-                # so we fall through a chain of alternatives before using the limit price.
-                if filled_qty > 0 and actual_fill > 0:
-                    fill_price = actual_fill / filled_qty
+                # If entry order was purged, skip fill-price derivation and
+                # use values already persisted in the trade dict.
+                if _entry_order_missing:
+                    filled_qty  = float(trade.get("entry_qty") or 0)
+                    fill_price  = float(trade.get("entry_fill_price") or trade.get("entry_price") or 0)
+                    # entry_status is already set above; nothing more to derive here.
+                    # Jump past all entry-order-derived logic below.
+                    # The goto-equivalent: set entry_order to an empty dict so
+                    # downstream reads like entry_order.get(...) return None safely.
+                    entry_order = {}
                 else:
-                    # Fallback 1: /api/v3/myTrades — most reliable actual fill price
-                    _fill_resolved = False
-                    try:
-                        my_trades = client.get_my_trades(symbol=sym, orderId=eid, limit=5)
-                        if my_trades:
-                            total_qty   = sum(float(t["qty"])   for t in my_trades)
-                            total_quote = sum(float(t["quoteQty"]) for t in my_trades)
-                            if total_qty > 0 and total_quote > 0:
-                                fill_price = total_quote / total_qty
-                                _fill_resolved = True
-                    except Exception:
-                        pass
-                    if not _fill_resolved:
-                        # Fallback 2: limit price from the order (same as entry_price for our GTC orders)
-                        fill_price = float(entry_order.get("price", trade["entry_price"]))
+                    filled_qty  = float(entry_order.get("executedQty", 0))
+                    actual_fill = float(entry_order.get("cummulativeQuoteQty", 0))
+                # fill_price derivation — only when entry order was actually fetched
+                if not _entry_order_missing:
+                    if filled_qty > 0 and actual_fill > 0:
+                        fill_price = actual_fill / filled_qty
+                    else:
+                        # Fallback 1: /api/v3/myTrades — most reliable actual fill price
+                        _fill_resolved = False
+                        try:
+                            my_trades = client.get_my_trades(symbol=sym, orderId=eid, limit=5)
+                            if my_trades:
+                                total_qty   = sum(float(t["qty"])   for t in my_trades)
+                                total_quote = sum(float(t["quoteQty"]) for t in my_trades)
+                                if total_qty > 0 and total_quote > 0:
+                                    fill_price = total_quote / total_qty
+                                    _fill_resolved = True
+                        except Exception:
+                            pass
+                        if not _fill_resolved:
+                            # Fallback 2: limit price from the order
+                            fill_price = float(entry_order.get("price", trade["entry_price"]))
     
                 if trade.get("entry_status") != entry_status:
                     trade["entry_status"] = entry_status
                     log_dirty = True
-                if entry_status == "FILLED" and trade.get("entry_fill_price") is None:
-                    trade["entry_fill_price"] = fill_price
-                    trade["entry_fill_time"]  = entry_order.get("updateTime")
-                    trade["entry_qty"]        = filled_qty
-                    planned = trade.get("entry_price", fill_price)
-                    trade["slippage_pct"] = round(
-                        (fill_price - planned) / planned * 100, 4
-                    ) if planned else None
-                    log_dirty = True
-                    # Notify on NEW → FILLED transition
-                    _send_telegram(
-                        f"✅ Filled: {sym} {trade.get('direction','').lower()} @ {ca._fmt_price(fill_price).strip()}"
-                        f" | SL: {ca._fmt_price(trade.get('sl')).strip()}"
-                        f" | TP: {ca._fmt_price(trade.get('tp1')).strip()}"
-                    )
+                # Only update fill details from exchange if entry order was fetched.
+                # For purged orders (_entry_order_missing), fill details are already
+                # persisted in the trade dict — do not overwrite with None/defaults.
+                if not _entry_order_missing:
+                    if entry_status == "FILLED" and trade.get("entry_fill_price") is None:
+                        trade["entry_fill_price"] = fill_price
+                        trade["entry_fill_time"]  = entry_order.get("updateTime")
+                        trade["entry_qty"]        = filled_qty
+                        planned = trade.get("entry_price", fill_price)
+                        trade["slippage_pct"] = round(
+                            (fill_price - planned) / planned * 100, 4
+                        ) if planned else None
+                        log_dirty = True
+                        # Notify on NEW → FILLED transition
+                        _send_telegram(
+                            f"✅ Filled: {sym} {trade.get('direction','').lower()} @ {ca._fmt_price(fill_price).strip()}"
+                            f" | SL: {ca._fmt_price(trade.get('sl')).strip()}"
+                            f" | TP: {ca._fmt_price(trade.get('tp1')).strip()}"
+                        )
     
                 # ── Step 2: Place OCO if filled and no OCO yet ─────────────
                 if entry_status == "FILLED" and not trade.get("oco_placed"):

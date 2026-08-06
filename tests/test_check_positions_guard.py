@@ -530,6 +530,115 @@ class CheckPositionsGuardTests(unittest.TestCase):
         self.assertIn("PnL/Info", out)
         self.assertNotIn("╔", out)
 
+    # ── Regression: entry order purged (-2013) must not block OCO reconciliation ──
+
+    def test_entry_order_purged_filled_position_reaches_oco_reconciliation(self):
+        """
+        CASE_1: local entry_status=FILLED, entry_order=-2013, OCO=-2018, asset held.
+        Entry-order error must NOT abort. OCO reconciliation must run.
+        exit_status=OPEN, realized_pnl_usd=None.
+        """
+        import io
+        from binance.exceptions import BinanceAPIException
+
+        class FakeClient:
+            def get_order(self, symbol, orderId):
+                raise BinanceAPIException(
+                    None, -2013, '{"code":-2013,"msg":"Order does not exist."}'
+                )
+            def get_all_tickers(self):
+                return [{"symbol": "XLMUSDT", "price": "0.1600"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "0.1600"}
+            def v3_get_order_list(self, orderListId):
+                raise BinanceAPIException(
+                    None, -2018, '{"code":-2018,"msg":"Order list does not exist."}'
+                )
+
+        trade = {
+            "symbol": "XLMUSDT", "direction": "long",
+            "entry_order_id": 943778, "entry_status": "FILLED",
+            "entry_price": 0.1691, "entry_fill_price": 0.1691,
+            "entry_fill_time": 1000000, "entry_qty": 70.0,
+            "entry_notional": 11.837, "exit_status": "OPEN",
+            "oco_placed": True, "oco_list_id": 645378,
+            "oco_order_ids": [951495, 951496],
+            "sl": 0.1657, "tp1": 0.1810, "realized_pnl_usd": None,
+        }
+
+        with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
+             patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
+             patch("core.paper_trade_executor._send_telegram"), \
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
+                 "lab_capital": 100.0, "closed_cluster_pnl": 0.0,
+                 "deployed_capital": 0.0, "available_capital": 100.0,
+                 "max_new_positions": 1, "deployed_count": 0,
+             }):
+            buf2 = io.StringIO()
+            with redirect_stdout(buf2):
+                from core.executors.spot_position_monitor import SpotPositionMonitor
+                from core.executors.spot_order_executor import SpotOrderExecutor
+                c = FakeClient()
+                SpotPositionMonitor(c, pte.repo, SpotOrderExecutor(c)).check_positions()
+
+        out2 = buf2.getvalue()
+        self.assertNotIn("Could not query entry order", out2,
+                         "Entry -2013 must not abort position processing")
+        recon = trade.get("oco_reconciliation_status", "")
+        self.assertIn(recon, ("UNPROTECTED", "UNPROTECTED_SL_BREACH"),
+                      f"Expected UNPROTECTED*, got {recon!r}")
+        self.assertEqual(trade.get("exit_status"), "OPEN")
+        self.assertIsNone(trade.get("realized_pnl_usd"))
+
+    def test_entry_order_purged_pending_position_sets_reconciliation_required(self):
+        """
+        CASE_2: local entry_status=NEW (pending), entry_order=-2013.
+        Must NOT assume FILLED. Must set RECONCILIATION_REQUIRED.
+        """
+        import io
+        from binance.exceptions import BinanceAPIException
+
+        class FakeClient:
+            def get_order(self, symbol, orderId):
+                raise BinanceAPIException(
+                    None, -2013, '{"code":-2013,"msg":"Order does not exist."}'
+                )
+            def get_all_tickers(self):
+                return [{"symbol": "BTCUSDT", "price": "100"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "100"}
+
+        trade = {
+            "symbol": "BTCUSDT", "direction": "long",
+            "entry_order_id": 99999, "entry_status": "NEW",
+            "entry_price": 100.0, "entry_qty": None,
+            "entry_fill_price": None, "exit_status": "OPEN",
+            "oco_placed": False, "sl": 95.0, "tp1": 110.0,
+            "entry_notional": 100.0, "realized_pnl_usd": None,
+        }
+
+        with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
+             patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
+             patch("core.paper_trade_executor._send_telegram"), \
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
+                 "lab_capital": 100.0, "closed_cluster_pnl": 0.0,
+                 "deployed_capital": 0.0, "available_capital": 100.0,
+                 "max_new_positions": 1, "deployed_count": 0,
+             }):
+            buf3 = io.StringIO()
+            with redirect_stdout(buf3):
+                from core.executors.spot_position_monitor import SpotPositionMonitor
+                from core.executors.spot_order_executor import SpotOrderExecutor
+                c = FakeClient()
+                SpotPositionMonitor(c, pte.repo, SpotOrderExecutor(c)).check_positions()
+
+        self.assertNotEqual(trade.get("entry_status"), "FILLED")
+        self.assertEqual(trade.get("oco_reconciliation_status"), "RECONCILIATION_REQUIRED")
+        self.assertEqual(trade.get("exit_status"), "OPEN")
+        self.assertIsNone(trade.get("realized_pnl_usd"))
+
 
 if __name__ == "__main__":
     unittest.main()
