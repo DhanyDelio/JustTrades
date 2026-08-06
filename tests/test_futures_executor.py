@@ -389,6 +389,49 @@ class TestFuturesCheckPositions(unittest.TestCase):
               f"at price 135 (below SL 140)")
         print(f"✓ PnL={pnl:.4f}")
 
+    @patch("services.supabase_client.fetch_all_futures")
+    @patch("services.supabase_client.update_futures_by_order_id")
+    @patch("core.futures_trade_executor.accrue_funding", return_value=False)
+    def test_production_price_guard_closes_exchange_before_db_resolution(
+            self, _funding, mock_update, mock_fetch):
+        from core.executors.futures_position_monitor import FuturesPositionMonitor
+
+        trade = self._base_trade(
+            entry_status="FILLED", entry_fill_price=150.0,
+            entry_fill_time=1700000000000, entry_qty=1.2,
+            exit_orders_placed=True, tp_algo_id=9001, sl_algo_id=9002,
+        )
+        mock_fetch.return_value = [trade]
+        client = MagicMock()
+        client.futures_symbol_ticker.return_value = [
+            {"symbol": "SOLUSDT", "price": "135.0"}
+        ]
+        client.futures_get_order.return_value = {
+            "status": "FILLED", "executedQty": "1.2",
+            "cumQuote": "180.0", "avgPrice": "150.0",
+            "price": "150.0", "updateTime": 1700000000000,
+        }
+        client.futures_get_algo_order.return_value = {"algoStatus": "NEW"}
+        client.futures_get_open_algo_orders.return_value = []
+        client.futures_get_open_orders.return_value = []
+        client.futures_create_order.return_value = {
+            "orderId": 9100, "executedQty": "1.2",
+            "cumQuote": "162.0", "avgPrice": "135.0",
+            "updateTime": 1700000001000,
+        }
+
+        FuturesPositionMonitor(client).check_positions()
+
+        client.futures_create_order.assert_called_once_with(
+            symbol="SOLUSDT", side="SELL", type="MARKET",
+            quantity="1.2", positionSide="BOTH", reduceOnly=True,
+        )
+        persisted = {}
+        for call in mock_update.call_args_list:
+            persisted.update(call.args[1])
+        self.assertEqual(persisted["exit_status"], "SL_HIT")
+        self.assertEqual(persisted["exit_price"], 135.0)
+
 
 # =============================================================================
 # TEST: log_trade

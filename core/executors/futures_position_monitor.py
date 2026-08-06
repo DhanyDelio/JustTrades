@@ -246,16 +246,44 @@ class FuturesPositionMonitor:
                 )
                 if breached:
                     print(f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl_lv:.4f} "
-                          f"— resolving as SL_HIT.")
+                          f"— closing position with reduce-only MARKET order.")
                     ef      = trade.get("entry_fill_price") or trade["entry_price"]
                     qty     = trade.get("entry_qty", 0)
                     mult    = 1 if side == "LONG" else -1
-                    pnl_usd = (current - ef) * qty * mult
+                    close_side = "SELL" if side == "LONG" else "BUY"
+                    try:
+                        close_resp = client.futures_create_order(
+                            symbol=sym,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=str(qty),
+                            positionSide="BOTH",
+                            reduceOnly=True,
+                        )
+                    except Exception as exc:
+                        print(f"  🚨 [{sym}] MARKET close failed; DB remains OPEN: {exc}")
+                        _send_telegram(
+                            f"🚨 [FUTURES] SL BREACH CLOSE FAILED: {sym} {side}\n"
+                            f"Position remains OPEN on exchange.\n{exc}"
+                        )
+                        continue
+
+                    executed_qty = float(close_resp.get("executedQty", 0) or 0)
+                    cum_quote = float(close_resp.get("cumQuote", 0)
+                                      or close_resp.get("cumQuoteQty", 0)
+                                      or close_resp.get("cummulativeQuoteQty", 0) or 0)
+                    fill_px = float(close_resp.get("avgPrice", 0) or 0)
+                    if not fill_px and executed_qty > 0 and cum_quote > 0:
+                        fill_px = cum_quote / executed_qty
+                    fill_px = fill_px or current
+                    pnl_usd = (fill_px - ef) * qty * mult
                     pnl_pct = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
-                    exit_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    exit_ms = int(close_resp.get("updateTime", 0)
+                                  or close_resp.get("time", 0)
+                                  or datetime.now(timezone.utc).timestamp() * 1000)
                     trade.update({
                         "exit_status":      "SL_HIT",
-                        "exit_price":       round(current, 6),
+                        "exit_price":       round(fill_px, 6),
                         "exit_time":        exit_ms,
                         "realized_pnl_usd": round(pnl_usd, 4),
                         "realized_pnl_pct": round(pnl_pct, 2),
@@ -268,7 +296,7 @@ class FuturesPositionMonitor:
                     resolved_this_run.append((sym, "SL_HIT", pnl_usd, side))
                     _send_telegram(
                         f"🛑 [FUTURES] SL_HIT (price-guard): {sym} {side}"
-                        f" @ {ca._fmt_price(current).strip()}  |  PnL: ${pnl_usd:+.2f}"
+                        f" @ {ca._fmt_price(fill_px).strip()}  |  PnL: ${pnl_usd:+.2f}"
                     )
                     continue
 

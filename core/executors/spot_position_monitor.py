@@ -20,7 +20,8 @@ class SpotPositionMonitor:
         self.repo = repo
         self.order_executor = order_executor
 
-    def check_positions(self, verbose: bool = False, mode: str = "all") -> None:
+    def check_positions(self, verbose: bool = False, mode: str = "all",
+                        recover_unprotected: bool = False) -> None:
         client = self.client
         repo = self.repo
         SpotOrderExecutor = lambda c: self.order_executor  # wrapper to mock SpotOrderExecutor(client) calls inside
@@ -406,6 +407,10 @@ class SpotPositionMonitor:
                     sl_breached = sl_level and current <= float(sl_level)
 
                     if _oco_missing and sl_breached:
+                        if recover_unprotected and self._recover_missing_oco(
+                                trade, current, resolved_this_run):
+                            log_dirty = True
+                            continue
                         # Final state: OCO missing + price below SL = highest severity
                         final_state = "UNPROTECTED_SL_BREACH"
                         entry_fill  = trade.get("entry_fill_price") or trade["entry_price"]
@@ -431,6 +436,11 @@ class SpotPositionMonitor:
                         oco_str = "🚨 UNPROTECTED_SL_BREACH"
 
                     elif _oco_missing and not sl_breached:
+                        if recover_unprotected and self._recover_missing_oco(
+                                trade, current, resolved_this_run):
+                            log_dirty = True
+                            oco_str = "✅ RECOVERED"
+                            continue
                         # Final state: OCO missing but price still above SL
                         final_state = "UNPROTECTED"
                         print(
@@ -647,6 +657,90 @@ class SpotPositionMonitor:
             print(f"\n  ℹ️  Use --verbose for detailed per-position cards.")
         print("\n  Run --check-positions again to refresh.")
         print("  To manually close: testnet.binance.vision → spot trading → cancel OCO")
+
+    def _recover_missing_oco(self, trade: dict, current: float,
+                             resolved_this_run: list) -> bool:
+        """Restore missing protection only after confirming the asset is free."""
+        sym = trade["symbol"]
+        qty = float(trade.get("entry_qty") or 0)
+        asset = sym[:-4] if sym.endswith("USDT") else sym
+
+        try:
+            balance = self.client.get_asset_balance(asset=asset) or {}
+            free_qty = float(balance.get("free") or 0)
+        except Exception as exc:
+            print(f"  ⚠  [{sym}] Recovery skipped: balance check failed: {exc}")
+            return False
+
+        if qty <= 0 or free_qty + 1e-12 < qty:
+            print(
+                f"  ⚠  [{sym}] Recovery skipped: free {asset}={free_qty:.8f}, "
+                f"required={qty:.8f}."
+            )
+            return False
+
+        try:
+            response = self.order_executor.place_oco_order(trade)
+        except RuntimeError as exc:
+            print(f"  ⚠  [{sym}] Recovery failed: {exc}")
+            return False
+
+        if trade.pop("_market_sold", False):
+            exit_px = None
+            fills = response.get("fills", []) if response else []
+            if fills:
+                exit_px = float(fills[0].get("price", 0) or 0)
+            if not exit_px and response:
+                exec_qty = float(response.get("executedQty", 0) or 0)
+                quote = float(response.get("cummulativeQuoteQty", 0) or 0)
+                exit_px = quote / exec_qty if exec_qty > 0 else None
+            exit_px = exit_px or current
+            entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+            pnl_usd = (exit_px - entry_fill) * qty
+            pnl_pct = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+            exit_ts = (response or {}).get("transactTime") or int(
+                datetime.now(timezone.utc).timestamp() * 1000
+            )
+            trade.update({
+                "exit_status": "SL_HIT",
+                "exit_price": round(exit_px, 6),
+                "exit_time": int(exit_ts),
+                "realized_pnl_usd": round(pnl_usd, 4),
+                "realized_pnl_pct": round(pnl_pct, 2),
+                "oco_placed": False,
+                "oco_order_ids": None,
+                "oco_list_id": None,
+                "oco_reconciliation_status": "RECOVERED_SL_HIT",
+            })
+            fill_ts = trade.get("entry_fill_time")
+            if fill_ts:
+                trade["time_to_resolution_sec"] = (
+                    int(exit_ts) - int(fill_ts)
+                ) // 1000
+            resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+            print(f"  ✅ [{sym}] Reset recovery: market sold and logged SL_HIT.")
+            return True
+
+        reports = response.get("orderReports", []) if response else []
+        list_id = response.get("orderListId") if response else None
+        if not list_id:
+            print(f"  ⚠  [{sym}] Recovery failed: exchange returned no OCO list id.")
+            return False
+
+        trade.update({
+            "oco_placed": True,
+            "oco_order_ids": [row["orderId"] for row in reports],
+            "oco_list_id": list_id,
+            "oco_reconciliation_status": "PROTECTED",
+        })
+        _send_telegram(
+            f"🛡️ [SPOT] OCO RECOVERED: {sym}\n"
+            f"New OCO: {list_id}\n"
+            f"SL: {ca._fmt_price(trade.get('sl')).strip()}  "
+            f"TP: {ca._fmt_price(trade.get('tp1')).strip()}"
+        )
+        print(f"  ✅ [{sym}] Reset recovery: OCO restored List#{list_id}.")
+        return True
     
     
     # ---------------------------------------------------------------------------

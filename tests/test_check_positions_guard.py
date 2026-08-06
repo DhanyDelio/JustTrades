@@ -735,5 +735,92 @@ class CheckPositionsGuardTests(unittest.TestCase):
         self.assertEqual(telegram.call_count, 0)
         self.assertEqual(update_spot.call_count, 0)
 
+    def test_reset_recovery_restores_oco_after_balance_confirmation(self):
+        from unittest.mock import MagicMock
+        from core.executors.spot_position_monitor import SpotPositionMonitor
+
+        client = MagicMock()
+        client.get_asset_balance.return_value = {"free": "70.0"}
+        executor = MagicMock()
+        executor.place_oco_order.return_value = {
+            "orderListId": 9001,
+            "orderReports": [{"orderId": 11}, {"orderId": 12}],
+        }
+        trade = {
+            "symbol": "XLMUSDT", "entry_qty": 70.0,
+            "entry_price": 0.1691, "entry_fill_price": 0.1691,
+            "entry_notional": 11.837, "entry_fill_time": 1000,
+            "sl": 0.1657, "tp1": 0.1810, "exit_status": "OPEN",
+        }
+
+        with patch("core.executors.spot_position_monitor._send_telegram") as notify:
+            recovered = SpotPositionMonitor(
+                client, pte.repo, executor
+            )._recover_missing_oco(trade, 0.1700, [])
+
+        self.assertTrue(recovered)
+        client.get_asset_balance.assert_called_once_with(asset="XLM")
+        executor.place_oco_order.assert_called_once_with(trade)
+        self.assertTrue(trade["oco_placed"])
+        self.assertEqual(trade["oco_list_id"], 9001)
+        self.assertEqual(trade["oco_reconciliation_status"], "PROTECTED")
+        notify.assert_called_once()
+
+    def test_reset_recovery_market_sells_position_past_sl(self):
+        from unittest.mock import MagicMock
+        from core.executors.spot_position_monitor import SpotPositionMonitor
+
+        client = MagicMock()
+        client.get_asset_balance.return_value = {"free": "70.0"}
+        executor = MagicMock()
+
+        def market_sell(trade):
+            trade["_market_sold"] = True
+            return {
+                "transactTime": 2000,
+                "executedQty": "70",
+                "cummulativeQuoteQty": "11.2",
+            }
+
+        executor.place_oco_order.side_effect = market_sell
+        trade = {
+            "symbol": "XLMUSDT", "entry_qty": 70.0,
+            "entry_price": 0.1691, "entry_fill_price": 0.1691,
+            "entry_notional": 11.837, "entry_fill_time": 1000,
+            "sl": 0.1657, "tp1": 0.1810, "exit_status": "OPEN",
+            "oco_placed": True, "oco_list_id": 645378,
+        }
+        resolved = []
+
+        recovered = SpotPositionMonitor(
+            client, pte.repo, executor
+        )._recover_missing_oco(trade, 0.1600, resolved)
+
+        self.assertTrue(recovered)
+        self.assertEqual(trade["exit_status"], "SL_HIT")
+        self.assertAlmostEqual(trade["exit_price"], 0.16)
+        self.assertEqual(trade["oco_reconciliation_status"], "RECOVERED_SL_HIT")
+        self.assertFalse(trade["oco_placed"])
+        self.assertEqual(resolved[0][0:2], ("XLMUSDT", "SL_HIT"))
+
+    def test_reset_recovery_refuses_insufficient_free_balance(self):
+        from unittest.mock import MagicMock
+        from core.executors.spot_position_monitor import SpotPositionMonitor
+
+        client = MagicMock()
+        client.get_asset_balance.return_value = {"free": "10.0"}
+        executor = MagicMock()
+        trade = {
+            "symbol": "XLMUSDT", "entry_qty": 70.0,
+            "entry_price": 0.1691, "sl": 0.1657, "tp1": 0.1810,
+        }
+
+        recovered = SpotPositionMonitor(
+            client, pte.repo, executor
+        )._recover_missing_oco(trade, 0.1700, [])
+
+        self.assertFalse(recovered)
+        executor.place_oco_order.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

@@ -513,7 +513,8 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
         print(f"\n  ℹ️  {remaining_slots} slot(s) still available for another position.")
 
 
-def cmd_check_positions(verbose: bool = False, mode: str = "all") -> None:
+def cmd_check_positions(verbose: bool = False, mode: str = "all",
+                        recover_unprotected: bool = False) -> None:
     print("=" * 70)
     print("Paper Trade Executor — Position Status")
     print("=" * 70)
@@ -534,7 +535,11 @@ def cmd_check_positions(verbose: bool = False, mode: str = "all") -> None:
     from core.executors.spot_position_monitor import SpotPositionMonitor
     executor = SpotOrderExecutor(client)
     monitor = SpotPositionMonitor(client, repo, executor)
-    monitor.check_positions(verbose=verbose, mode=mode)
+    monitor.check_positions(
+        verbose=verbose,
+        mode=mode,
+        recover_unprotected=recover_unprotected,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +820,8 @@ def main():
                         help="--propose-all: show batch table but don't place orders")
     parser.add_argument("--verbose",        action="store_true",
                         help="--check-positions: show detailed per-position cards")
+    parser.add_argument("--recover-unprotected", action="store_true",
+                        help="--check-positions: restore missing OCO or sell past-SL assets after balance verification")
     parser.add_argument("--mode", choices=["single", "lab", "all"], default="all",
                         help="Filter trades by mode: single (no cluster id), lab (clustered), or all")
     parser.add_argument("--export-clean", action="store_true",
@@ -831,7 +838,11 @@ def main():
         cmd_propose_all(scan_n=args.scan_n, dry_run=args.dry_run,
                         auto_confirm=args.yes)
     elif args.check_positions:
-        cmd_check_positions(verbose=args.verbose, mode=args.mode)
+        cmd_check_positions(
+            verbose=args.verbose,
+            mode=args.mode,
+            recover_unprotected=args.recover_unprotected,
+        )
     elif args.stats:
         cmd_stats(mode=args.mode)
 

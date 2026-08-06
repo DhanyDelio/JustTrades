@@ -77,7 +77,12 @@ def run_spot_pipeline() -> str:
     print(f"{'=' * 50}", flush=True)
 
     print("[Spot 1/2] Checking Spot Positions...", flush=True)
-    status = _run_step([sys.executable, "paper_trade_executor.py", "--check-positions"])
+    status = _run_step([
+        sys.executable,
+        "paper_trade_executor.py",
+        "--check-positions",
+        "--recover-unprotected",
+    ])
     if status == _STATUS_MAINTENANCE:
         print("⚠️ Binance Spot Testnet unavailable. Skipping Spot pipeline.", flush=True)
         return _STATUS_MAINTENANCE
