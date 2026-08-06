@@ -306,6 +306,8 @@ class SpotPositionMonitor:
                         atexit.register(lambda: sys.exit(2))
     
                 # ── Step 3: Check OCO status ────────────────────────────────
+                prev_recon = trade.get("oco_reconciliation_status", "")
+                _oco_missing = False
                 oco_str = "n/a"
                 if trade.get("oco_placed") and trade.get("oco_list_id"):
                     try:
@@ -360,34 +362,24 @@ class SpotPositionMonitor:
                         # Do NOT infer SL executed — no fill, no sold balance confirmed.
                         _is_missing = "-2018" in err_str or "-2013" in err_str
                         if _is_missing:
-                            prev_recon  = trade.get("oco_reconciliation_status", "")
-                            new_recon   = "UNPROTECTED"
-                            trade["oco_reconciliation_status"] = new_recon
-                            log_dirty = True
+                            # OCO order-not-found: protection is missing.
+                            # Do NOT set state or send alert here.
+                            # Final state (UNPROTECTED vs UNPROTECTED_SL_BREACH) is
+                            # determined below in Step 3.5 after fetching current price.
+                            # This prevents the in-memory UNPROTECTED interim value from
+                            # causing a spurious alert on every cycle.
+                            _oco_missing = True
                             oco_str = "⚠ UNPROTECTED"
                             print(
                                 f"  ⚠  [{sym}] OCO missing on exchange (order-not-found). "
-                                f"Position UNPROTECTED. "
                                 f"oco_list_id={trade.get('oco_list_id')} error: {err_str[:60]}"
                             )
-                            # Alert only when state actually transitions into this status.
-                            # prev_recon != new_recon catches the first detection correctly.
-                            # If prev was UNPROTECTED_SL_BREACH and we re-detect UNPROTECTED
-                            # (price moved back above SL), that is also a new transition.
-                            if prev_recon != new_recon:
-                                cur_disp = ca._fmt_price(price_map.get(sym)).strip() if price_map.get(sym) else "?"
-                                _send_telegram(
-                                    f"🚨 [SPOT] UNPROTECTED POSITION: {sym}\n"
-                                    f"OCO {trade.get('oco_list_id')} not found on exchange.\n"
-                                    f"Cause: testnet reset / OCO purged.\n"
-                                    f"SL: {ca._fmt_price(trade.get('sl')).strip()}  Current: {cur_disp}\n"
-                                    f"Asset still in wallet — NOT auto-sold.\n"
-                                    f"Manual intervention required."
-                                )
                         else:
                             # Transient API error — do not change protection status
-                            trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
-                            log_dirty = True
+                            if trade.get("oco_reconciliation_status") not in (
+                                    "UNPROTECTED", "UNPROTECTED_SL_BREACH"):
+                                trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
+                                log_dirty = True
                             oco_str = f"⚠ {err_str[:30]}"
     
                 if not repo.should_show_live_position(trade, entry_status):
@@ -402,25 +394,22 @@ class SpotPositionMonitor:
                 except Exception:
                     current = None
     
-                # ── Step 3.5: SL breach handling — two distinct cases ──────────
-                # Case A: OCO confirmed MISSING (UNPROTECTED) + price below SL
-                #   → UNPROTECTED_SL_BREACH: asset still held, NO execution occurred.
-                #   → Do NOT set exit_status=SL_HIT. Log state, alert, require manual action.
-                # Case B: OCO was placed + price below SL (testnet OCO didn't trigger)
-                #   → Price-guard: safe to infer SL execution (OCO existence was confirmed
-                #     in Step 3 because no -2018/-2013 error was returned).
-                recon_status = trade.get("oco_reconciliation_status", "")
+                # ── Step 3.5: Final-state OCO reconciliation + SL breach handling ──
+                # Derive one final state from OCO presence and current price.
+                # Compare it with the state loaded from Supabase before sending
+                # or persisting, so an invocation never emits an interim state.
+
                 if (entry_status == "FILLED"
                         and trade.get("exit_status") == "OPEN"
                         and current is not None):
-                    sl_level   = trade.get("sl")
+                    sl_level    = trade.get("sl")
                     sl_breached = sl_level and current <= float(sl_level)
 
-                    if sl_breached and recon_status in ("UNPROTECTED", "UNPROTECTED_SL_BREACH"):
-                        entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
-                        est_pnl    = trade.get("entry_qty", 0) * (current - entry_fill)
-                        prev_recon = recon_status
-                        new_recon  = "UNPROTECTED_SL_BREACH"
+                    if _oco_missing and sl_breached:
+                        # Final state: OCO missing + price below SL = highest severity
+                        final_state = "UNPROTECTED_SL_BREACH"
+                        entry_fill  = trade.get("entry_fill_price") or trade["entry_price"]
+                        est_pnl     = trade.get("entry_qty", 0) * (current - entry_fill)
                         print(
                             f"  🚨 [{sym}] UNPROTECTED_SL_BREACH: "
                             f"price {current:.6f} below SL {sl_level:.6f}, "
@@ -428,21 +417,40 @@ class SpotPositionMonitor:
                             f"Est. unrealized loss: ${est_pnl:+.4f} USDT. "
                             f"Manual intervention required."
                         )
-                        if prev_recon != new_recon:
-                            trade["oco_reconciliation_status"] = new_recon
+                        if prev_recon != final_state:
+                            trade["oco_reconciliation_status"] = final_state
                             log_dirty = True
-                            # Alert only on transition into this state (not every cycle).
                             _send_telegram(
                                 f"🚨 [SPOT] UNPROTECTED SL BREACH: {sym}\n"
-                                f"Price {ca._fmt_price(current).strip()} is below SL "
+                                f"Price {ca._fmt_price(current).strip()} below SL "
                                 f"{ca._fmt_price(trade.get('sl')).strip()}.\n"
-                                f"OCO is MISSING — asset NOT sold, position still open.\n"
+                                f"OCO MISSING — asset NOT sold, position still open.\n"
                                 f"Est. unrealized loss: ${est_pnl:+.4f} USDT\n"
                                 f"Manual intervention required."
                             )
                         oco_str = "🚨 UNPROTECTED_SL_BREACH"
 
-                    elif sl_breached and trade.get("oco_placed"):
+                    elif _oco_missing and not sl_breached:
+                        # Final state: OCO missing but price still above SL
+                        final_state = "UNPROTECTED"
+                        print(
+                            f"  ⚠  [{sym}] UNPROTECTED: OCO missing, price above SL."
+                        )
+                        if prev_recon != final_state:
+                            trade["oco_reconciliation_status"] = final_state
+                            log_dirty = True
+                            cur_disp = ca._fmt_price(price_map.get(sym)).strip() if price_map.get(sym) else "?"
+                            _send_telegram(
+                                f"🚨 [SPOT] UNPROTECTED POSITION: {sym}\n"
+                                f"OCO {trade.get('oco_list_id')} not found on exchange.\n"
+                                f"Cause: testnet reset / OCO purged.\n"
+                                f"SL: {ca._fmt_price(trade.get('sl')).strip()}  Current: {cur_disp}\n"
+                                f"Asset still in wallet — NOT auto-sold.\n"
+                                f"Manual intervention required."
+                            )
+                        oco_str = "⚠ UNPROTECTED"
+
+                    elif (sl_breached and not _oco_missing and trade.get("oco_placed")):
                         # OCO exists on exchange (confirmed in Step 3) but didn't fire.
                         # Price-guard: safe to resolve as SL_HIT.
                         print(

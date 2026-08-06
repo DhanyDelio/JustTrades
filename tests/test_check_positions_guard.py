@@ -63,6 +63,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
              patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
@@ -124,6 +125,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
              patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
@@ -509,6 +511,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
              patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
              patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool", return_value={
                  "lab_capital": 100.0,
                  "closed_cluster_pnl": 0.0,
@@ -639,6 +642,98 @@ class CheckPositionsGuardTests(unittest.TestCase):
         self.assertEqual(trade.get("exit_status"), "OPEN")
         self.assertIsNone(trade.get("realized_pnl_usd"))
 
+
+
+    def test_oco_reconciliation_no_duplicate_telegram_on_second_invocation(self):
+        """A second process load deduplicates from the first persisted state."""
+        from copy import deepcopy
+        from unittest.mock import MagicMock
+        from binance.exceptions import BinanceAPIException
+
+        class _FakeXLM:
+            def get_order(self, symbol, orderId):
+                raise BinanceAPIException(
+                    None, -2013, '{"code":-2013,"msg":"Order does not exist."}')
+            def get_all_tickers(self):
+                return [{"symbol": "XLMUSDT", "price": "0.1600"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "0.1600"}
+            def v3_get_order_list(self, orderListId):
+                raise BinanceAPIException(
+                    None, -2018, '{"code":-2018,"msg":"Order list does not exist."}')
+
+        base = {
+            "symbol": "XLMUSDT", "direction": "long",
+            "entry_order_id": 943778, "entry_status": "FILLED",
+            "entry_price": 0.1691, "entry_fill_price": 0.1691,
+            "entry_fill_time": 1000000, "entry_qty": 70.0,
+            "entry_notional": 11.837, "exit_status": "OPEN",
+            "oco_placed": True, "oco_list_id": 645378,
+            "sl": 0.1657, "tp1": 0.1810, "realized_pnl_usd": None,
+        }
+        pool = {
+            "lab_capital": 100.0, "closed_cluster_pnl": 0.0,
+            "deployed_capital": 0.0, "available_capital": 100.0,
+            "max_new_positions": 1, "deployed_count": 0,
+        }
+        persisted = {**base, "oco_reconciliation_status": None}
+        loaded = []
+
+        def load_trade_log():
+            row = deepcopy(persisted)
+            loaded.append(row)
+            return [row]
+
+        def update_spot_by_order_id(entry_order_id, fields):
+            self.assertEqual(entry_order_id, base["entry_order_id"])
+            persisted.update(deepcopy(fields))
+
+        telegram = MagicMock()
+
+        # ── Invocation 1: DB state = None ────────────────────────────────
+        with patch.object(pte.repo, "load_trade_log", side_effect=load_trade_log), \
+             patch.object(pte.repo, "save_trade_log"), \
+             patch("services.supabase_client.update_spot_by_order_id",
+                   side_effect=update_spot_by_order_id) as update_spot, \
+             patch("core.executors.spot_position_monitor._send_telegram", telegram), \
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                   return_value=pool):
+            from core.executors.spot_position_monitor import SpotPositionMonitor
+            from core.executors.spot_order_executor import SpotOrderExecutor
+            client1 = _FakeXLM()
+            SpotPositionMonitor(
+                client1, pte.repo, SpotOrderExecutor(client1)
+            ).check_positions()
+
+            self.assertEqual(telegram.call_count, 1)
+            self.assertEqual(
+                persisted["oco_reconciliation_status"],
+                "UNPROTECTED_SL_BREACH",
+            )
+            self.assertTrue(any(
+                call.args[1] == {
+                    "oco_reconciliation_status": "UNPROTECTED_SL_BREACH"
+                }
+                for call in update_spot.call_args_list
+            ))
+
+            telegram.reset_mock()
+            update_spot.reset_mock()
+            client2 = _FakeXLM()
+            SpotPositionMonitor(
+                client2, pte.repo, SpotOrderExecutor(client2)
+            ).check_positions()
+
+        self.assertEqual(len(loaded), 2)
+        self.assertIsNot(loaded[0], loaded[1])
+        self.assertEqual(
+            loaded[1]["oco_reconciliation_status"],
+            "UNPROTECTED_SL_BREACH",
+        )
+        self.assertEqual(loaded[1]["exit_status"], "OPEN")
+        self.assertIsNone(loaded[1]["realized_pnl_usd"])
+        self.assertEqual(telegram.call_count, 0)
+        self.assertEqual(update_spot.call_count, 0)
 
 if __name__ == "__main__":
     unittest.main()
