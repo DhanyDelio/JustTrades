@@ -306,7 +306,39 @@ class SpotPositionMonitor:
                             if trade.get("exit_status") != "OPEN":
                                 continue
                     except Exception as e:
-                        oco_str = f"⚠ {e}"
+                        err_str = str(e)
+                        # ── Step 3a: OCO Protection Reconciliation ─────────
+                        # -2018: order list does not exist (purged / testnet reset)
+                        # -2013: child order does not exist
+                        # Either means oco_placed=True in DB but exchange has no record.
+                        # SAFE RULE: order-not-found = MISSING PROTECTION.
+                        # Do NOT infer SL executed — no fill, no sold balance confirmed.
+                        _is_missing = "-2018" in err_str or "-2013" in err_str
+                        if _is_missing:
+                            prev_recon = trade.get("oco_reconciliation_status", "")
+                            trade["oco_reconciliation_status"] = "UNPROTECTED"
+                            log_dirty = True
+                            oco_str = "⚠ UNPROTECTED"
+                            print(
+                                f"  ⚠  [{sym}] OCO missing on exchange (order-not-found). "
+                                f"Position UNPROTECTED. "
+                                f"oco_list_id={trade.get('oco_list_id')} error: {err_str[:60]}"
+                            )
+                            if prev_recon != "UNPROTECTED":
+                                cur_disp = ca._fmt_price(price_map.get(sym)).strip() if price_map.get(sym) else "?"
+                                _send_telegram(
+                                    f"🚨 [SPOT] UNPROTECTED POSITION: {sym}\n"
+                                    f"OCO {trade.get('oco_list_id')} not found on exchange.\n"
+                                    f"Cause: testnet reset / OCO purged.\n"
+                                    f"SL: {ca._fmt_price(trade.get('sl')).strip()}  Current: {cur_disp}\n"
+                                    f"Asset still in wallet — NOT auto-sold.\n"
+                                    f"Manual intervention required."
+                                )
+                        else:
+                            # Transient API error — do not change protection status
+                            trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
+                            log_dirty = True
+                            oco_str = f"⚠ {err_str[:30]}"
     
                 if not repo.should_show_live_position(trade, entry_status):
                     continue
@@ -320,20 +352,46 @@ class SpotPositionMonitor:
                 except Exception:
                     current = None
     
-                # ── Step 3.5: Price-guard — catch SL breaches testnet missed ─
-                # Spot is always LONG — SL is below entry price.
+                # ── Step 3.5: SL breach handling — two distinct cases ──────────
+                # Case A: OCO confirmed MISSING (UNPROTECTED) + price below SL
+                #   → UNPROTECTED_SL_BREACH: asset still held, NO execution occurred.
+                #   → Do NOT set exit_status=SL_HIT. Log state, alert, require manual action.
+                # Case B: OCO was placed + price below SL (testnet OCO didn't trigger)
+                #   → Price-guard: safe to infer SL execution (OCO existence was confirmed
+                #     in Step 3 because no -2018/-2013 error was returned).
+                recon_status = trade.get("oco_reconciliation_status", "")
                 if (entry_status == "FILLED"
                         and trade.get("exit_status") == "OPEN"
-                        and current is not None
-                        and trade.get("oco_placed")):
-                    sl = trade.get("sl")
-                    if sl and current <= sl:
-                        print(f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl:.4f} "
-                              f"— OCO may have failed. Resolving as SL_HIT.")
+                        and current is not None):
+                    sl_level   = trade.get("sl")
+                    sl_breached = sl_level and current <= float(sl_level)
+
+                    if sl_breached and recon_status in ("UNPROTECTED", "UNPROTECTED_SL_BREACH"):
                         entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
-                        qty        = trade.get("entry_qty", 0)
-                        pnl_usd    = qty * (current - entry_fill)
-                        pnl_pct    = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+                        est_pnl    = trade.get("entry_qty", 0) * (current - entry_fill)
+                        print(
+                            f"  🚨 [{sym}] UNPROTECTED_SL_BREACH: "
+                            f"price {current:.6f} below SL {sl_level:.6f}, "
+                            f"OCO missing, asset NOT sold. "
+                            f"Est. unrealized loss: ${est_pnl:+.4f} USDT. "
+                            f"Manual intervention required."
+                        )
+                        if recon_status != "UNPROTECTED_SL_BREACH":
+                            trade["oco_reconciliation_status"] = "UNPROTECTED_SL_BREACH"
+                            log_dirty = True
+                        oco_str = "🚨 UNPROTECTED_SL_BREACH"
+
+                    elif sl_breached and trade.get("oco_placed"):
+                        # OCO exists on exchange (confirmed in Step 3) but didn't fire.
+                        # Price-guard: safe to resolve as SL_HIT.
+                        print(
+                            f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl_level:.4f} "
+                            f"— OCO confirmed placed but not triggered. Resolving as SL_HIT."
+                        )
+                        entry_fill   = trade.get("entry_fill_price") or trade["entry_price"]
+                        qty          = trade.get("entry_qty", 0)
+                        pnl_usd      = qty * (current - entry_fill)
+                        pnl_pct      = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
                         exit_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                         trade["exit_status"]      = "SL_HIT"
                         trade["exit_price"]       = round(current, 6)
@@ -341,11 +399,14 @@ class SpotPositionMonitor:
                         trade["realized_pnl_usd"] = round(pnl_usd, 4)
                         trade["realized_pnl_pct"] = round(pnl_pct, 2)
                         if trade.get("entry_fill_time") and exit_time_ms:
-                            trade["time_to_resolution_sec"] = (exit_time_ms - int(trade["entry_fill_time"])) // 1000
+                            trade["time_to_resolution_sec"] = (
+                                exit_time_ms - int(trade["entry_fill_time"])
+                            ) // 1000
                         log_dirty = True
                         resolved_this_run.append((sym, "SL_HIT", pnl_usd))
                         _send_telegram(
-                            f"🛑 [SPOT] SL_HIT (price-guard): {sym} @ {ca._fmt_price(current).strip()}"
+                            f"🛑 [SPOT] SL_HIT (price-guard, OCO confirmed): "
+                            f"{sym} @ {ca._fmt_price(current).strip()}"
                             f"  |  PnL: ${pnl_usd:+.2f}"
                         )
                         continue
@@ -486,22 +547,32 @@ class SpotPositionMonitor:
                 if not eid:
                     continue
                 update_spot_by_order_id(eid, {
-                    "entry_status":          ot.get("entry_status"),
-                    "entry_fill_price":      ot.get("entry_fill_price"),
-                    "entry_fill_time":       ot.get("entry_fill_time"),
-                    "entry_qty":             ot.get("entry_qty"),
-                    "slippage_pct":          ot.get("slippage_pct"),
-                    "oco_placed":            ot.get("oco_placed"),
-                    "oco_order_ids":         ot.get("oco_order_ids"),
-                    "oco_list_id":           ot.get("oco_list_id"),
-                    "tp1":                   ot.get("tp1"),   # may be adjusted by OCO race-condition handler
-                    "exit_status":           ot.get("exit_status"),
-                    "exit_price":            ot.get("exit_price"),
-                    "exit_time":             ot.get("exit_time"),
-                    "realized_pnl_usd":      ot.get("realized_pnl_usd"),
-                    "realized_pnl_pct":      ot.get("realized_pnl_pct"),
-                    "time_to_resolution_sec": ot.get("time_to_resolution_sec"),
+                    "entry_status":               ot.get("entry_status"),
+                    "entry_fill_price":           ot.get("entry_fill_price"),
+                    "entry_fill_time":            ot.get("entry_fill_time"),
+                    "entry_qty":                  ot.get("entry_qty"),
+                    "slippage_pct":               ot.get("slippage_pct"),
+                    "oco_placed":                 ot.get("oco_placed"),
+                    "oco_order_ids":              ot.get("oco_order_ids"),
+                    "oco_list_id":                ot.get("oco_list_id"),
+                    "tp1":                        ot.get("tp1"),
+                    "exit_status":                ot.get("exit_status"),
+                    "exit_price":                 ot.get("exit_price"),
+                    "exit_time":                  ot.get("exit_time"),
+                    "realized_pnl_usd":           ot.get("realized_pnl_usd"),
+                    "realized_pnl_pct":           ot.get("realized_pnl_pct"),
+                    "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
                 })
+                # Persist oco_reconciliation_status separately — requires
+                # the column to exist in trades_spot (see docs/migrations/).
+                # Safe to skip if column not yet present; in-memory state is
+                # still correct for this cycle.
+                recon = ot.get("oco_reconciliation_status")
+                if recon:
+                    try:
+                        update_spot_by_order_id(eid, {"oco_reconciliation_status": recon})
+                    except Exception:
+                        pass  # column not yet migrated — silently skip
     
         if not verbose and len(open_trades) > 1:
             print(f"\n  ℹ️  Use --verbose for detailed per-position cards.")

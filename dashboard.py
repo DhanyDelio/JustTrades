@@ -1072,12 +1072,24 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
     status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
     oco_ok       = oco_placed and oco_list_id
-    oco_badge    = (f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
-                    f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>"
-                    if oco_ok else
-                    (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em'>⚠ NO OCO</span>"
-                     if is_filled else ""))
+    recon_status = trade.get("oco_reconciliation_status", "")
+    _oco_unprotected = recon_status in ("UNPROTECTED", "UNPROTECTED_SL_BREACH", "RECONCILIATION_REQUIRED")
+    if _oco_unprotected and recon_status == "UNPROTECTED_SL_BREACH":
+        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"🚨 SL BREACH UNPROTECTED</span>")
+    elif _oco_unprotected:
+        oco_badge = (f"<span style='background:#cc4400;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"⚠ OCO MISSING</span>")
+    elif oco_ok:
+        oco_badge = (f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
+    elif is_filled:
+        oco_badge = (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em'>⚠ NO OCO</span>")
+    else:
+        oco_badge = ""
 
     # PENDING FILL badge — shown when order is NEW or PARTIALLY_FILLED
     pending_badge = (
