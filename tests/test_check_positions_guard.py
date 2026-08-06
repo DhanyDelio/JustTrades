@@ -735,6 +735,129 @@ class CheckPositionsGuardTests(unittest.TestCase):
         self.assertEqual(telegram.call_count, 0)
         self.assertEqual(update_spot.call_count, 0)
 
+    def test_confirmed_missing_oco_may_enter_recovery(self):
+        from unittest.mock import MagicMock
+        from binance.exceptions import BinanceAPIException
+        from core.executors.spot_position_monitor import SpotPositionMonitor
+
+        client = MagicMock()
+        client.get_order.return_value = {
+            "status": "FILLED", "executedQty": "70",
+            "cummulativeQuoteQty": "11.837", "updateTime": 1000,
+        }
+        client.get_all_tickers.return_value = [
+            {"symbol": "XLMUSDT", "price": "0.1700"}
+        ]
+        client.v3_get_order_list.side_effect = BinanceAPIException(
+            None, -2018, '{"code":-2018,"msg":"Order list does not exist."}'
+        )
+        client.get_asset_balance.return_value = {"free": "70"}
+        executor = MagicMock()
+        executor.place_oco_order.return_value = {
+            "orderListId": 9001,
+            "orderReports": [{"orderId": 11}, {"orderId": 12}],
+        }
+        trade = {
+            "symbol": "XLMUSDT", "direction": "long",
+            "entry_order_id": 1, "entry_status": "FILLED",
+            "entry_price": 0.1691, "entry_fill_price": 0.1691,
+            "entry_fill_time": 1000, "entry_qty": 70.0,
+            "entry_notional": 11.837, "exit_status": "OPEN",
+            "oco_placed": True, "oco_list_id": 645378,
+            "oco_order_ids": [1, 2], "sl": 0.1657, "tp1": 0.1810,
+        }
+
+        with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
+             patch("services.supabase_client.update_spot_by_order_id"), \
+             patch("core.executors.spot_position_monitor._send_telegram"), \
+             patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                   return_value={"lab_capital": 100.0, "closed_cluster_pnl": 0.0,
+                                 "deployed_capital": 0.0, "available_capital": 100.0,
+                                 "max_new_positions": 1, "deployed_count": 0}):
+            SpotPositionMonitor(client, pte.repo, executor).check_positions(
+                recover_unprotected=True
+            )
+
+        executor.place_oco_order.assert_called_once_with(trade)
+        self.assertEqual(trade["oco_list_id"], 9001)
+        self.assertEqual(trade["oco_reconciliation_status"], "PROTECTED")
+
+    def test_transient_oco_failures_never_enter_missing_or_recovery(self):
+        from unittest.mock import MagicMock
+        from binance.exceptions import BinanceAPIException
+        from core.executors.spot_position_monitor import SpotPositionMonitor
+
+        class Http500Error(RuntimeError):
+            status_code = 500
+
+        failures = [
+            ("list", TimeoutError("read timed out")),
+            ("list", Http500Error("500 Internal Server Error")),
+            ("list", BinanceAPIException(
+                None, -1003, '{"code":-1003,"msg":"Too many requests."}')),
+            ("child", TimeoutError("child order read timed out")),
+        ]
+
+        for location, failure in failures:
+            with self.subTest(location=location, failure=type(failure).__name__):
+                client = MagicMock()
+                entry_order = {
+                    "status": "FILLED", "executedQty": "70",
+                    "cummulativeQuoteQty": "11.837", "updateTime": 1000,
+                }
+                client.get_order.return_value = entry_order
+                client.get_all_tickers.return_value = [
+                    {"symbol": "XLMUSDT", "price": "0.1600"}
+                ]
+                if location == "list":
+                    client.v3_get_order_list.side_effect = failure
+                else:
+                    client.v3_get_order_list.return_value = {
+                        "listOrderStatus": "ALL_DONE",
+                        "orders": [{"orderId": 951495}],
+                    }
+                    client.get_order.side_effect = [entry_order, failure]
+                executor = MagicMock()
+                trade = {
+                    "symbol": "XLMUSDT", "direction": "long",
+                    "entry_order_id": 1, "entry_status": "FILLED",
+                    "entry_price": 0.1691, "entry_fill_price": 0.1691,
+                    "entry_fill_time": 1000, "entry_qty": 70.0,
+                    "entry_notional": 11.837, "exit_status": "OPEN",
+                    "oco_placed": True, "oco_list_id": 645378,
+                    "oco_order_ids": [951495, 951496],
+                    "oco_reconciliation_status": "PROTECTED",
+                    "sl": 0.1657, "tp1": 0.1810,
+                    "realized_pnl_usd": None,
+                }
+
+                with patch.object(pte.repo, "load_trade_log", return_value=[trade]), \
+                     patch("services.supabase_client.update_spot_by_order_id"), \
+                     patch("core.executors.spot_position_monitor._send_telegram") as notify, \
+                     patch("core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                           return_value={"lab_capital": 100.0,
+                                         "closed_cluster_pnl": 0.0,
+                                         "deployed_capital": 0.0,
+                                         "available_capital": 100.0,
+                                         "max_new_positions": 1,
+                                         "deployed_count": 0}):
+                    SpotPositionMonitor(client, pte.repo, executor).check_positions(
+                        recover_unprotected=True
+                    )
+
+                executor.place_oco_order.assert_not_called()
+                client.get_asset_balance.assert_not_called()
+                self.assertEqual(trade["exit_status"], "OPEN")
+                self.assertIsNone(trade["realized_pnl_usd"])
+                self.assertTrue(trade["oco_placed"])
+                self.assertEqual(trade["oco_list_id"], 645378)
+                self.assertEqual(trade["oco_order_ids"], [951495, 951496])
+                self.assertEqual(
+                    trade["oco_reconciliation_status"],
+                    "RECONCILIATION_REQUIRED",
+                )
+                notify.assert_not_called()
+
     def test_reset_recovery_restores_oco_after_balance_confirmation(self):
         from unittest.mock import MagicMock
         from core.executors.spot_position_monitor import SpotPositionMonitor

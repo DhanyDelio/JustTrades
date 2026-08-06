@@ -1,6 +1,7 @@
 
 import sys
 import atexit
+import re
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 
@@ -13,6 +14,15 @@ from core.paper_trade_executor import (
     PER_TRADE_BUDGET
 )
 from core.managers.portfolio_manager import PortfolioManager
+
+
+def _is_confirmed_missing_oco_error(exc: Exception) -> bool:
+    """True only when Binance explicitly reports an expected OCO order absent."""
+    code = getattr(exc, "code", None)
+    if code in (-2018, -2013):
+        return True
+    message = str(exc)
+    return bool(re.search(r"(?:code\s*[=:]\s*|\"code\"\s*:\s*)(-2018|-2013)\b", message))
 
 class SpotPositionMonitor:
     def __init__(self, client, repo, order_executor):
@@ -309,10 +319,12 @@ class SpotPositionMonitor:
                 # ── Step 3: Check OCO status ────────────────────────────────
                 prev_recon = trade.get("oco_reconciliation_status", "")
                 _oco_missing = False
+                _oco_query_confirmed = False
                 oco_str = "n/a"
                 if trade.get("oco_placed") and trade.get("oco_list_id"):
                     try:
                         oco_status  = client.v3_get_order_list(orderListId=trade["oco_list_id"])
+                        _oco_query_confirmed = True
                         list_status = oco_status.get("listOrderStatus", "UNKNOWN")
                         oco_str     = list_status
     
@@ -354,6 +366,9 @@ class SpotPositionMonitor:
                             if trade.get("exit_status") != "OPEN":
                                 continue
                     except Exception as e:
+                        # The whole OCO/child query must complete before protection
+                        # can be treated as confirmed for downstream price guards.
+                        _oco_query_confirmed = False
                         err_str = str(e)
                         # ── Step 3a: OCO Protection Reconciliation ─────────
                         # -2018: order list does not exist (purged / testnet reset)
@@ -361,7 +376,7 @@ class SpotPositionMonitor:
                         # Either means oco_placed=True in DB but exchange has no record.
                         # SAFE RULE: order-not-found = MISSING PROTECTION.
                         # Do NOT infer SL executed — no fill, no sold balance confirmed.
-                        _is_missing = "-2018" in err_str or "-2013" in err_str
+                        _is_missing = _is_confirmed_missing_oco_error(e)
                         if _is_missing:
                             # OCO order-not-found: protection is missing.
                             # Do NOT set state or send alert here.
@@ -376,9 +391,9 @@ class SpotPositionMonitor:
                                 f"oco_list_id={trade.get('oco_list_id')} error: {err_str[:60]}"
                             )
                         else:
-                            # Transient API error — do not change protection status
-                            if trade.get("oco_reconciliation_status") not in (
-                                    "UNPROTECTED", "UNPROTECTED_SL_BREACH"):
+                            # Unknown is not missing. Preserve OCO IDs/placement data,
+                            # record the query uncertainty, and forbid recovery/guards.
+                            if trade.get("oco_reconciliation_status") != "RECONCILIATION_REQUIRED":
                                 trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
                                 log_dirty = True
                             oco_str = f"⚠ {err_str[:30]}"
@@ -460,7 +475,8 @@ class SpotPositionMonitor:
                             )
                         oco_str = "⚠ UNPROTECTED"
 
-                    elif (sl_breached and not _oco_missing and trade.get("oco_placed")):
+                    elif (sl_breached and _oco_query_confirmed
+                          and not _oco_missing and trade.get("oco_placed")):
                         # OCO exists on exchange (confirmed in Step 3) but didn't fire.
                         # Price-guard: safe to resolve as SL_HIT.
                         print(
