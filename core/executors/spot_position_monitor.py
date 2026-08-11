@@ -267,6 +267,7 @@ class SpotPositionMonitor:
                         trade["exit_status"]      = "SL_HIT"
                         trade["exit_price"]       = round(exit_px, 6)
                         trade["exit_time"]        = int(exit_ts)
+                        trade["exit_reason"]      = "SL_HIT"
                         trade["realized_pnl_usd"] = round(pnl_usd, 4)
                         trade["realized_pnl_pct"] = round(pnl_pct, 2)
                         # time_to_resolution_sec from fill to market sell
@@ -343,6 +344,7 @@ class SpotPositionMonitor:
                                     trade["exit_status"]     = exit_status
                                     trade["exit_price"]      = round(exit_price, 6)
                                     trade["exit_time"]       = leg.get("updateTime")
+                                    trade["exit_reason"]     = exit_status
                                     trade["realized_pnl_usd"] = round(pnl_usd, 4)
                                     trade["realized_pnl_pct"] = round(pnl_pct, 2)
                                     fill_t = trade.get("entry_fill_time")
@@ -419,39 +421,72 @@ class SpotPositionMonitor:
                         and trade.get("exit_status") == "OPEN"
                         and current is not None):
                     sl_level    = trade.get("sl")
-                    sl_breached = sl_level and current <= float(sl_level)
+                    tp_level    = trade.get("tp1")
+                    sl_breached = sl_level is not None and current <= float(sl_level)
+                    tp_breached = tp_level is not None and current >= float(tp_level)
 
                     if _oco_missing and sl_breached:
-                        if recover_unprotected and self._recover_missing_oco(
-                                trade, current, resolved_this_run):
+                        # OCO missing + price below SL → emergency close immediately.
+                        # This path does NOT require --recover-unprotected; it is
+                        # unconditional because the risk contract has already been
+                        # violated and the asset must be sold.
+                        if prev_recon != "UNPROTECTED_SL_BREACH":
+                            trade["oco_reconciliation_status"] = "UNPROTECTED_SL_BREACH"
                             log_dirty = True
-                            continue
-                        # Final state: OCO missing + price below SL = highest severity
-                        final_state = "UNPROTECTED_SL_BREACH"
-                        entry_fill  = trade.get("entry_fill_price") or trade["entry_price"]
-                        est_pnl     = trade.get("entry_qty", 0) * (current - entry_fill)
                         print(
                             f"  🚨 [{sym}] UNPROTECTED_SL_BREACH: "
-                            f"price {current:.6f} below SL {sl_level:.6f}, "
-                            f"OCO missing, asset NOT sold. "
-                            f"Est. unrealized loss: ${est_pnl:+.4f} USDT. "
-                            f"Manual intervention required."
+                            f"price {current:.6f} below SL {sl_level:.6f}. "
+                            f"Executing emergency close."
                         )
-                        if prev_recon != final_state:
-                            trade["oco_reconciliation_status"] = final_state
+                        if self._emergency_close(
+                                trade, current, resolved_this_run,
+                                exit_reason="UNPROTECTED_SL_BREACH"):
                             log_dirty = True
+                            oco_str = "🔴 EMERGENCY_CLOSED"
+                            continue
+                        # _emergency_close() failed (balance check or sell error).
+                        # Fall back to alert so the operator can act manually.
+                        entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+                        est_pnl    = trade.get("entry_qty", 0) * (current - entry_fill)
+                        if prev_recon != "UNPROTECTED_SL_BREACH":
                             _send_telegram(
                                 f"🚨 [SPOT] UNPROTECTED SL BREACH: {sym}\n"
                                 f"Price {ca._fmt_price(current).strip()} below SL "
                                 f"{ca._fmt_price(trade.get('sl')).strip()}.\n"
-                                f"OCO MISSING — asset NOT sold, position still open.\n"
+                                f"OCO MISSING — emergency close FAILED.\n"
                                 f"Est. unrealized loss: ${est_pnl:+.4f} USDT\n"
-                                f"Manual intervention required."
+                                f"Manual intervention required immediately."
                             )
                         oco_str = "🚨 UNPROTECTED_SL_BREACH"
 
-                    elif _oco_missing and not sl_breached:
-                        if recover_unprotected and self._recover_missing_oco(
+                    elif _oco_missing and tp_breached:
+                        print(
+                            f"  🚨 [{sym}] UNPROTECTED_TP_BREACH: "
+                            f"price {current:.6f} reached TP {tp_level:.6f}. "
+                            f"Executing emergency close."
+                        )
+                        if self._emergency_close(
+                                trade, current, resolved_this_run,
+                                exit_reason="UNPROTECTED_TP_BREACH"):
+                            log_dirty = True
+                            oco_str = "🟢 EMERGENCY_CLOSED"
+                            continue
+                        if prev_recon != "UNPROTECTED_TP_BREACH":
+                            trade["oco_reconciliation_status"] = "UNPROTECTED_TP_BREACH"
+                            log_dirty = True
+                            _send_telegram(
+                                f"🚨 [SPOT] UNPROTECTED TP BREACH: {sym}\n"
+                                f"Price {ca._fmt_price(current).strip()} reached TP "
+                                f"{ca._fmt_price(tp_level).strip()}.\n"
+                                f"OCO MISSING — emergency close FAILED.\n"
+                                f"Manual intervention required immediately."
+                            )
+                        oco_str = "🚨 UNPROTECTED_TP_BREACH"
+
+                    elif _oco_missing:
+                        # Missing protection is always recovered while the original
+                        # contract remains live; this is no longer opt-in.
+                        if self._recover_missing_oco(
                                 trade, current, resolved_this_run):
                             log_dirty = True
                             oco_str = "✅ RECOVERED"
@@ -491,6 +526,7 @@ class SpotPositionMonitor:
                         trade["exit_status"]      = "SL_HIT"
                         trade["exit_price"]       = round(current, 6)
                         trade["exit_time"]        = exit_time_ms
+                        trade["exit_reason"]      = "SL_HIT"
                         trade["realized_pnl_usd"] = round(pnl_usd, 4)
                         trade["realized_pnl_pct"] = round(pnl_pct, 2)
                         if trade.get("entry_fill_time") and exit_time_ms:
@@ -654,6 +690,7 @@ class SpotPositionMonitor:
                     "exit_status":                ot.get("exit_status"),
                     "exit_price":                 ot.get("exit_price"),
                     "exit_time":                  ot.get("exit_time"),
+                    "exit_reason":                ot.get("exit_reason"),
                     "realized_pnl_usd":           ot.get("realized_pnl_usd"),
                     "realized_pnl_pct":           ot.get("realized_pnl_pct"),
                     "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
@@ -673,6 +710,141 @@ class SpotPositionMonitor:
             print(f"\n  ℹ️  Use --verbose for detailed per-position cards.")
         print("\n  Run --check-positions again to refresh.")
         print("  To manually close: testnet.binance.vision → spot trading → cancel OCO")
+
+    def _emergency_close(self, trade: dict, current: float,
+                          resolved_this_run: list,
+                          exit_reason: str = "UNPROTECTED_SL_BREACH") -> bool:
+        """
+        Close a position whose missing OCO has crossed its stored SL or TP.
+
+        This is the last-resort enforcement of the risk contract.  It MUST
+        NOT be gated behind --recover-unprotected; it fires automatically
+        whenever either unprotected boundary breach is detected.
+
+        Design:
+        - Idempotency guard: if exit_status != "OPEN" (already closed by a
+          concurrent path or a previous cycle), return True silently.
+        - Reuses the spot executor's close_position() market-sell path.
+        - Records the supplied infrastructure-specific exit reason.
+        - On exchange or balance failure: returns False so the caller can
+          fall back to a manual-intervention alert.
+
+        Returns True if the position was successfully closed.
+        """
+        sym = trade["symbol"]
+
+        # ── Idempotency guard ─────────────────────────────────────────
+        if trade.get("exit_status") != "OPEN":
+            # Position already closed by a concurrent path — do not sell again.
+            return True
+
+        qty   = float(trade.get("entry_qty") or 0)
+        asset = sym[:-4] if sym.endswith("USDT") else sym
+        exit_status = "TP_HIT" if exit_reason == "UNPROTECTED_TP_BREACH" else "SL_HIT"
+
+        if qty <= 0:
+            print(f"  ⚠  [{sym}] Emergency close skipped: entry_qty={qty} — cannot size sell.")
+            return False
+
+        # ── Balance confirmation before selling ───────────────────────
+        # Prevents a double-sell if another path already sold the asset.
+        try:
+            balance  = self.client.get_asset_balance(asset=asset) or {}
+            free_qty = float(balance.get("free") or 0)
+        except Exception as exc:
+            print(f"  ⚠  [{sym}] Emergency close: balance check failed — {exc}")
+            return False
+
+        if free_qty + 1e-12 < qty:
+            # Asset no longer free → position was already closed externally.
+            # Mark as closed so downstream stops processing this trade.
+            print(
+                f"  ℹ  [{sym}] Emergency close: free {asset}={free_qty:.8f} < "
+                f"required {qty:.8f}. Position already closed externally — "
+                f"updating state only."
+            )
+            entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+            pnl_usd    = qty * (current - entry_fill)
+            pnl_pct    = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+            exit_ms    = int(datetime.now(timezone.utc).timestamp() * 1000)
+            trade.update({
+                "exit_status":      exit_status,
+                "exit_price":       round(current, 6),
+                "exit_time":        exit_ms,
+                "exit_reason":      exit_reason,
+                "realized_pnl_usd": round(pnl_usd, 4),
+                "realized_pnl_pct": round(pnl_pct, 2),
+                "oco_placed":       False,
+                "oco_list_id":      None,
+                "oco_reconciliation_status": "EMERGENCY_CLOSED",
+            })
+            fill_ts = trade.get("entry_fill_time")
+            if fill_ts:
+                trade["time_to_resolution_sec"] = (exit_ms - int(fill_ts)) // 1000
+            resolved_this_run.append((sym, exit_status, pnl_usd))
+            _send_telegram(
+                f"🛑 [SPOT] EMERGENCY_CLOSED (externally): {sym}\n"
+                f"Price {ca._fmt_price(current).strip()} crossed the stored "
+                f"{exit_status} contract.\n"
+                f"Asset already sold — state updated.\n"
+                f"PnL: ${pnl_usd:+.4f} USDT"
+            )
+            return True
+
+        # ── Issue market sell via the existing spot order executor ────
+        try:
+            resp = self.order_executor.close_position(trade)
+        except RuntimeError as exc:
+            print(f"  ⚠  [{sym}] Emergency close: market sell failed — {exc}")
+            return False
+
+        # ── Market sell succeeded — resolve the trade ─────────────────
+        exit_px    = None
+        fills      = resp.get("fills", []) if resp else []
+        if fills:
+            exit_px = float(fills[0].get("price", 0) or 0)
+        if not exit_px and resp:
+            exec_qty  = float(resp.get("executedQty", 0) or 0)
+            cum_quote = float(resp.get("cummulativeQuoteQty", 0) or 0)
+            exit_px   = cum_quote / exec_qty if exec_qty > 0 else None
+        exit_px = exit_px or current   # conservative fallback
+
+        entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+        pnl_usd    = (exit_px - entry_fill) * qty
+        pnl_pct    = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+        exit_ms    = int(
+            resp.get("transactTime") or resp.get("updateTime")
+            or datetime.now(timezone.utc).timestamp() * 1000
+        ) if resp else int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        trade.update({
+            "exit_status":      exit_status,
+            "exit_price":       round(exit_px, 6),
+            "exit_time":        exit_ms,
+            "exit_reason":      exit_reason,
+            "realized_pnl_usd": round(pnl_usd, 4),
+            "realized_pnl_pct": round(pnl_pct, 2),
+            "oco_placed":       False,
+            "oco_list_id":      None,
+            "oco_reconciliation_status": "EMERGENCY_CLOSED",
+        })
+        fill_ts = trade.get("entry_fill_time")
+        if fill_ts:
+            trade["time_to_resolution_sec"] = (exit_ms - int(fill_ts)) // 1000
+
+        resolved_this_run.append((sym, exit_status, pnl_usd))
+        print(
+            f"  🔴 [{sym}] EMERGENCY_CLOSED: market sold @ {ca._fmt_price(exit_px).strip()}  "
+            f"PnL: ${pnl_usd:+.4f}"
+        )
+        _send_telegram(
+            f"🛑 [SPOT] EMERGENCY_CLOSED: {sym}\n"
+            f"OCO was missing. Market sold @ {ca._fmt_price(exit_px).strip()}.\n"
+            f"SL was {ca._fmt_price(trade.get('sl')).strip()}  "
+            f"Exit: {ca._fmt_price(exit_px).strip()}\n"
+            f"PnL: ${pnl_usd:+.4f} USDT  |  exit_reason: {exit_reason}"
+        )
+        return True
 
     def _recover_missing_oco(self, trade: dict, current: float,
                              resolved_this_run: list) -> bool:
@@ -721,6 +893,7 @@ class SpotPositionMonitor:
                 "exit_status": "SL_HIT",
                 "exit_price": round(exit_px, 6),
                 "exit_time": int(exit_ts),
+                "exit_reason": "UNPROTECTED_SL_BREACH",
                 "realized_pnl_usd": round(pnl_usd, 4),
                 "realized_pnl_pct": round(pnl_pct, 2),
                 "oco_placed": False,

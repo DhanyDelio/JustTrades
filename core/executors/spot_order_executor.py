@@ -142,6 +142,33 @@ class SpotOrderExecutor:
         except BinanceAPIException as e:
             raise RuntimeError(f"Cancel order failed for {symbol}: {e}") from e
 
+    def close_position(self, trade: dict) -> dict:
+        """Market-sell a filled spot position through the shared executor."""
+        from binance.exceptions import BinanceAPIException
+        from binance.enums import SIDE_SELL, ORDER_TYPE_MARKET
+
+        sym = trade["symbol"]
+        qty = trade["entry_qty"]
+        try:
+            info = self.client.get_symbol_info(sym)
+            step = next(
+                float(f["stepSize"]) for f in info["filters"]
+                if f["filterType"] == "LOT_SIZE"
+            )
+        except Exception:
+            step = 0.001
+
+        qty_str = f"{round_step(qty, step):.8f}".rstrip("0").rstrip(".")
+        try:
+            return self.client.create_order(
+                symbol=sym,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty_str,
+            )
+        except BinanceAPIException as e:
+            raise RuntimeError(f"Market sell failed for {sym}: {e}") from e
+
     def place_oco_order(self, trade: dict) -> dict:
         """
         Place OCO SELL after LONG entry is filled.
@@ -213,13 +240,7 @@ class SpotOrderExecutor:
                 print(f"\n  ⚠  [{sym}] Price {current:.4f} ≤ SL {sl:.4f} at OCO placement.")
                 print(f"       Placing MARKET SELL immediately to cut loss.")
                 try:
-                    from binance.enums import SIDE_SELL, ORDER_TYPE_MARKET
-                    resp = self.client.create_order(
-                        symbol   = sym,
-                        side     = SIDE_SELL,
-                        type     = ORDER_TYPE_MARKET,
-                        quantity = qty_str,
-                    )
+                    resp = self.close_position(trade)
                     print(f"  ✅ Market SELL placed: {resp.get('orderId')}")
                     # Mark the trade dict so caller can update log
                     trade["_market_sold"] = True

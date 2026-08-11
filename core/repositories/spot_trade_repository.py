@@ -152,6 +152,7 @@ class SpotTradeRepository:
             "exit_status":       "OPEN",
             "exit_price":        None,
             "exit_time":         None,
+            "exit_reason":       None,
             "realized_pnl_usd":  None,
             "realized_pnl_pct":  None,
 
