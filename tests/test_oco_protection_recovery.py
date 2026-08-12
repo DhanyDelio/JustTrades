@@ -620,3 +620,159 @@ class TestEmergencyCloseDirect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Eager-commit & duplicate-invocation prevention tests
+# ---------------------------------------------------------------------------
+
+class TestEagerCommitPreventsDoubleTelegram(unittest.TestCase):
+    """
+    Verifies that _eager_commit() is called immediately when a trade is
+    resolved, so a concurrent --check-positions invocation sees exit_status
+    as already closed and does NOT send a second Telegram alert.
+
+    This tests the fix for the BABYUSDT / SOLUSDT double-alert incident.
+    """
+
+    def _oco_done_client(self, exit_type="STOP_LOSS_LIMIT", price="0.1640"):
+        """Client where OCO ALL_DONE with a filled SL leg."""
+        class _C:
+            def get_order(self, symbol, orderId):
+                if orderId == 700191:
+                    return {"status": "FILLED", "executedQty": "65",
+                            "cummulativeQuoteQty": str(65 * 0.1846),
+                            "price": "0.1846", "updateTime": 1000}
+                return {"status": "FILLED", "type": exit_type,
+                        "executedQty": "65",
+                        "cummulativeQuoteQty": str(65 * float(price)),
+                        "price": price, "updateTime": 2000}
+            def get_all_tickers(self):
+                return [{"symbol": "XLMUSDT", "price": price}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": price}
+            def v3_get_order_list(self, orderListId):
+                return {"listOrderStatus": "ALL_DONE",
+                        "orders": [{"orderId": 713017}, {"orderId": 713018}]}
+        return _C()
+
+    def test_eager_commit_called_before_end_of_cycle(self):
+        """
+        update_spot_by_order_id must be called BEFORE the cycle ends
+        (i.e. before the end-of-cycle save block), so that a second
+        invocation reading from Supabase sees exit_status = SL_HIT.
+        """
+        trade = _base_trade(entry_fill_time=1000)
+        call_order = []
+
+        def mock_update(eid, fields):
+            if fields.get("exit_status") in ("SL_HIT", "TP_HIT"):
+                call_order.append(("eager", fields["exit_status"]))
+
+        def mock_save(trades):
+            call_order.append(("save_stub",))
+
+        with ExitStack() as s:
+            s.enter_context(patch.object(pte.repo, "load_trade_log",
+                                         return_value=[trade]))
+            s.enter_context(patch.object(pte.repo, "save_trade_log",
+                                         side_effect=mock_save))
+            s.enter_context(patch(
+                "services.supabase_client.update_spot_by_order_id",
+                side_effect=mock_update))
+            s.enter_context(patch(
+                "core.executors.spot_position_monitor._send_telegram"))
+            s.enter_context(patch(
+                "core.paper_trade_executor._send_telegram"))
+            s.enter_context(patch(
+                "core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                return_value=_POOL))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                _make_monitor(self._oco_done_client()).check_positions()
+
+        # At least one eager commit with exit_status must have been called
+        eager_calls = [c for c in call_order if c[0] == "eager"]
+        self.assertGreater(len(eager_calls), 0,
+            "Expected eager commit with exit_status before end of cycle")
+        self.assertEqual(eager_calls[0][1], "SL_HIT")
+        print(f"✓ eager commit fired: {call_order}")
+
+    def test_second_invocation_skips_already_resolved_trade(self):
+        """
+        If Supabase already has exit_status=SL_HIT (because eager-commit ran),
+        the second load_trade_log() returns a closed trade which is excluded
+        from open_trades — no Telegram is sent on the second cycle.
+        """
+        trade_first = _base_trade(entry_fill_time=1000)
+        telegram_calls = []
+
+        # First invocation — resolves trade
+        _run_check(_make_monitor(self._oco_done_client()), trade_first)
+        self.assertEqual(trade_first["exit_status"], "SL_HIT")
+
+        # Simulate: second invocation loads from Supabase which now has SL_HIT
+        trade_second = dict(trade_first)  # already has exit_status=SL_HIT
+
+        with ExitStack() as s:
+            s.enter_context(patch.object(pte.repo, "load_trade_log",
+                                         return_value=[trade_second]))
+            s.enter_context(patch.object(pte.repo, "save_trade_log"))
+            s.enter_context(patch(
+                "services.supabase_client.update_spot_by_order_id"))
+            tg = s.enter_context(patch(
+                "core.executors.spot_position_monitor._send_telegram",
+                side_effect=telegram_calls.append))
+            s.enter_context(patch(
+                "core.paper_trade_executor._send_telegram"))
+            s.enter_context(patch(
+                "core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                return_value=_POOL))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                _make_monitor(self._oco_done_client()).check_positions()
+
+        self.assertEqual(len(telegram_calls), 0,
+            f"Second invocation sent {len(telegram_calls)} Telegram(s) — expected 0")
+        print("✓ second invocation: 0 Telegram alerts (no duplicate)")
+
+    def test_eager_commit_direct(self):
+        """_eager_commit() calls update_spot_by_order_id with correct fields."""
+        committed = {}
+
+        trade = _base_trade(
+            exit_status="SL_HIT", exit_price=0.1657, exit_time=2000,
+            exit_reason="OCO_TRIGGERED", realized_pnl_usd=-1.23,
+            realized_pnl_pct=-2.1, entry_fill_time=1000,
+        )
+        trade["time_to_resolution_sec"] = 1000
+
+        with patch("services.supabase_client.update_spot_by_order_id",
+                   side_effect=lambda eid, f: committed.update(f)):
+            SpotPositionMonitor._eager_commit(trade)
+
+        self.assertEqual(committed["exit_status"], "SL_HIT")
+        self.assertEqual(committed["exit_price"], 0.1657)
+        self.assertEqual(committed["realized_pnl_usd"], -1.23)
+        self.assertEqual(committed["time_to_resolution_sec"], 1000)
+        print(f"✓ _eager_commit fields: {list(committed.keys())}")
+
+    def test_eager_commit_no_entry_order_id_is_safe(self):
+        """_eager_commit() with no entry_order_id must not raise."""
+        trade = _base_trade()
+        trade.pop("entry_order_id", None)
+        with patch("services.supabase_client.update_spot_by_order_id") as mock:
+            SpotPositionMonitor._eager_commit(trade)
+        mock.assert_not_called()
+        print("✓ _eager_commit: no entry_order_id → safe no-op")
+
+    def test_eager_commit_supabase_error_is_silent(self):
+        """_eager_commit() swallows Supabase errors — does not propagate."""
+        trade = _base_trade(exit_status="SL_HIT")
+        with patch("services.supabase_client.update_spot_by_order_id",
+                   side_effect=RuntimeError("network down")):
+            try:
+                SpotPositionMonitor._eager_commit(trade)
+            except Exception as e:
+                self.fail(f"_eager_commit raised unexpectedly: {e}")
+        print("✓ _eager_commit: Supabase error swallowed silently")

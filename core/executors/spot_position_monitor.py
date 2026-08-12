@@ -279,6 +279,7 @@ class SpotPositionMonitor:
                         trade.pop("_market_sold", None)
                         log_dirty = True
                         resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+                        self._eager_commit(trade)
                         print(f"  {sym:<10} 🔴 Emergency market sell — SL_HIT logged  PnL: ${pnl_usd:+.4f}")
                         continue   # ← skip OCO placement and Step 3 entirely
     
@@ -363,6 +364,7 @@ class SpotPositionMonitor:
                                     log_dirty = True
                                     resolved_this_run.append((sym, exit_status, pnl_usd))
                                     oco_str = f"{'🟢' if exit_status=='TP_HIT' else '🔴'} {exit_status}"
+                                    self._eager_commit(trade)
                                     break
     
                             if trade.get("exit_status") != "OPEN":
@@ -535,6 +537,7 @@ class SpotPositionMonitor:
                             ) // 1000
                         log_dirty = True
                         resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+                        self._eager_commit(trade)
                         _send_telegram(
                             f"🛑 [SPOT] SL_HIT (price-guard, OCO confirmed): "
                             f"{sym} @ {ca._fmt_price(current).strip()}"
@@ -711,6 +714,38 @@ class SpotPositionMonitor:
         print("\n  Run --check-positions again to refresh.")
         print("  To manually close: testnet.binance.vision → spot trading → cancel OCO")
 
+    @staticmethod
+    def _eager_commit(trade: dict) -> None:
+        """
+        Write the resolved exit fields to Supabase immediately after a trade
+        is closed in-memory, before the end-of-cycle save block runs.
+
+        Purpose: prevent a concurrent --check-positions invocation from
+        seeing exit_status == "OPEN" for a trade that was just resolved,
+        which would cause a duplicate Telegram alert and a double-resolve.
+
+        The full field update in the save block at the end of check_positions()
+        is idempotent and will overwrite these same values — this is fine.
+        Non-fatal: if Supabase is unreachable, the end-of-cycle save will
+        still persist everything.
+        """
+        eid = trade.get("entry_order_id")
+        if not eid:
+            return
+        try:
+            from services.supabase_client import update_spot_by_order_id as _usb
+            _usb(eid, {
+                "exit_status":            trade.get("exit_status"),
+                "exit_price":             trade.get("exit_price"),
+                "exit_time":              trade.get("exit_time"),
+                "exit_reason":            trade.get("exit_reason"),
+                "realized_pnl_usd":       trade.get("realized_pnl_usd"),
+                "realized_pnl_pct":       trade.get("realized_pnl_pct"),
+                "time_to_resolution_sec": trade.get("time_to_resolution_sec"),
+            })
+        except Exception:
+            pass  # non-fatal — full save follows at end of check_positions()
+
     def _emergency_close(self, trade: dict, current: float,
                           resolved_this_run: list,
                           exit_reason: str = "UNPROTECTED_SL_BREACH") -> bool:
@@ -739,7 +774,13 @@ class SpotPositionMonitor:
             return True
 
         qty   = float(trade.get("entry_qty") or 0)
-        asset = sym[:-4] if sym.endswith("USDT") else sym
+        asset = sym.replace("USDT", "").replace("BUSD", "").replace("BTC", "")\
+                    .replace("ETH", "").replace("BNB", "")
+        # More robust: strip known quote assets from right side
+        for quote in ("USDT", "BUSD", "BTC", "ETH", "BNB"):
+            if sym.upper().endswith(quote):
+                asset = sym.upper()[:-len(quote)]
+                break
         exit_status = "TP_HIT" if exit_reason == "UNPROTECTED_TP_BREACH" else "SL_HIT"
 
         if qty <= 0:
@@ -782,6 +823,7 @@ class SpotPositionMonitor:
             if fill_ts:
                 trade["time_to_resolution_sec"] = (exit_ms - int(fill_ts)) // 1000
             resolved_this_run.append((sym, exit_status, pnl_usd))
+            self._eager_commit(trade)
             _send_telegram(
                 f"🛑 [SPOT] EMERGENCY_CLOSED (externally): {sym}\n"
                 f"Price {ca._fmt_price(current).strip()} crossed the stored "
@@ -833,6 +875,7 @@ class SpotPositionMonitor:
             trade["time_to_resolution_sec"] = (exit_ms - int(fill_ts)) // 1000
 
         resolved_this_run.append((sym, exit_status, pnl_usd))
+        self._eager_commit(trade)
         print(
             f"  🔴 [{sym}] EMERGENCY_CLOSED: market sold @ {ca._fmt_price(exit_px).strip()}  "
             f"PnL: ${pnl_usd:+.4f}"
@@ -907,6 +950,7 @@ class SpotPositionMonitor:
                     int(exit_ts) - int(fill_ts)
                 ) // 1000
             resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+            self._eager_commit(trade)
             print(f"  ✅ [{sym}] Reset recovery: market sold and logged SL_HIT.")
             return True
 

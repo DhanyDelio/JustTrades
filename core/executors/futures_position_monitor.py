@@ -151,6 +151,7 @@ class FuturesPositionMonitor:
                     trade["exit_orders_placed"] = False
                     log_dirty = True
                     resolved_this_run.append((sym, "SL_HIT", pnl_usd, side))
+                    self._eager_commit_futures(eid, trade)
                     continue
 
                 if not exit_result["success"]:
@@ -224,6 +225,7 @@ class FuturesPositionMonitor:
 
                     log_dirty = True
                     resolved_this_run.append((sym, exit_status_found, pnl_usd, side))
+                    self._eager_commit_futures(eid, trade)
                     exit_str = (f"{'🟢' if exit_status_found == 'TP_HIT' else '🔴'} "
                                 f"{exit_status_found}")
                     continue
@@ -294,6 +296,7 @@ class FuturesPositionMonitor:
                     self._cancel_algo_orders(client, sym, tp_algo_id, sl_algo_id)
                     log_dirty = True
                     resolved_this_run.append((sym, "SL_HIT", pnl_usd, side))
+                    self._eager_commit_futures(eid, trade)
                     _send_telegram(
                         f"🛑 [FUTURES] SL_HIT (price-guard): {sym} {side}"
                         f" @ {ca._fmt_price(fill_px).strip()}  |  PnL: ${pnl_usd:+.2f}"
@@ -357,6 +360,32 @@ class FuturesPositionMonitor:
     # ------------------------------------------------------------------ #
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _eager_commit_futures(entry_order_id, trade: dict) -> None:
+        """
+        Write resolved exit fields to Supabase immediately after a futures
+        trade is closed in-memory — mirrors SpotPositionMonitor._eager_commit().
+
+        Prevents a concurrent --check-positions invocation from double-resolving
+        and sending duplicate Telegram alerts (SOLUSDT double-alert incident).
+
+        Non-fatal: end-of-cycle persist block is idempotent and will overwrite.
+        """
+        if not entry_order_id:
+            return
+        try:
+            from services.supabase_client import update_futures_by_order_id
+            update_futures_by_order_id(entry_order_id, {
+                "exit_status":          trade.get("exit_status"),
+                "exit_price":           trade.get("exit_price"),
+                "exit_time":            trade.get("exit_time"),
+                "realized_pnl_usd":     trade.get("realized_pnl_usd"),
+                "realized_pnl_pct":     trade.get("realized_pnl_pct"),
+                "time_in_position_sec": trade.get("time_in_position_sec"),
+            })
+        except Exception:
+            pass  # non-fatal — full save follows at end of check_positions()
 
     @staticmethod
     def _query_exit_order(client, order_id, algo_id, label) -> tuple:
