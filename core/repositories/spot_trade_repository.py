@@ -164,7 +164,10 @@ class SpotTradeRepository:
             "symbol_rank":       cand.get("symbol_rank"),   # rank from get_top_symbols_by_volume
 
             # ── Raw ───────────────────────────────────────────────────────
-            "raw_entry_order":   order,
+            "raw_entry_order":   {
+                **order,
+                "ml_shadow": cand.get("ml_shadow"),
+            },
         }
         upsert_spot(record)
         print(f"  Trade inserted into Supabase trades_spot (order #{record['entry_order_id']})")

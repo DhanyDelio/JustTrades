@@ -5,9 +5,9 @@ Runs Spot and Futures trading pipelines on a 1-hour interval.
 
 Architecture:
   ┌─────────────────────────────────────────────────────┐
-  │  SPOT PIPELINE (with ML v2 Shadow Scoring)          │
+  │  SPOT PIPELINE (with ML v3 Shadow Scoring)          │
   │  - check-positions → propose-all --yes              │
-  │  - ML v2 scores every candidate (observation only)  │
+  │  - ML v3 scores every candidate (observation only)  │
   │  - Scores logged to Supabase, NO veto/reject logic  │
   ├─────────────────────────────────────────────────────┤
   │  FUTURES PIPELINE (independent, NO ML scoring)      │
@@ -69,7 +69,7 @@ def _run_step(cmd: list[str]) -> str:
 
 def run_spot_pipeline() -> str:
     """
-    Spot pipeline — includes ML v2 Shadow Scoring.
+    Spot pipeline — includes ML v3 Shadow Scoring.
     Returns pipeline status string for cycle summary.
     """
     print(f"\n{'=' * 50}", flush=True)

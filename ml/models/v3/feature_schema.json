@@ -1,0 +1,44 @@
+{
+  "schema_version": "v3_e2_1",
+  "numeric_features": [
+    "zone_touches",
+    "planned_rr",
+    "risk_pct",
+    "atr_pct_at_entry",
+    "btc_return_4h",
+    "btc_return_12h",
+    "btc_return_24h",
+    "btc_distance_from_ma",
+    "btc_volatility"
+  ],
+  "categorical_features": [
+    "zone_type",
+    "btc_trend_direction",
+    "btc_trend_state",
+    "volatility_regime",
+    "risk_state"
+  ],
+  "model_features": [
+    "zone_touches",
+    "planned_rr",
+    "risk_pct",
+    "atr_pct_at_entry",
+    "btc_return_4h",
+    "btc_return_12h",
+    "btc_return_24h",
+    "btc_distance_from_ma",
+    "btc_volatility",
+    "zone_type",
+    "btc_trend_direction",
+    "btc_trend_state",
+    "volatility_regime",
+    "risk_state"
+  ],
+  "required_candidate_fields": [
+    "symbol",
+    "rr",
+    "risk_pct",
+    "atr_pct"
+  ],
+  "observer_only": true
+}
