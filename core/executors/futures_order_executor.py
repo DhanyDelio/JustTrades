@@ -19,7 +19,9 @@ Tahap 1–3 refactored dependencies:
 from __future__ import annotations
 
 import sys
+import threading
 import time as _time
+from datetime import datetime, timezone
 
 from core.utils.telegram import send_telegram as _send_telegram
 
@@ -48,6 +50,13 @@ class FuturesOrderExecutor:
     """
     Object-Oriented Executor for Futures Trade Proposals and Exit Orders.
     """
+
+    PROTECTION_STATES = {
+        "PENDING", "FULLY_PROTECTED", "SL_ONLY", "TP_ONLY",
+        "UNPROTECTED", "UNKNOWN", "STALE_QTY", "POSITION_CLOSED",
+    }
+    _position_locks: dict[tuple[str, str], threading.RLock] = {}
+    _position_locks_guard = threading.Lock()
 
     def __init__(self, client, dry_run: bool = False, auto_confirm: bool = False):
         self.client = client
@@ -186,206 +195,398 @@ class FuturesOrderExecutor:
     # -------------------------------------------------------------------------
 
     def place_exit_orders(self, trade: dict) -> dict:
-        """
-        Place TP and SL exit orders after entry fills.
+        """Serialize reconciliation/mutation for one logical position."""
+        key = (trade["symbol"], trade.get("position_side", "BOTH"))
+        with self._position_locks_guard:
+            lock = self._position_locks.setdefault(key, threading.RLock())
+        with lock:
+            trade["_protection_state"] = "PENDING"
+            result = self._place_exit_orders_locked(trade)
+            trade["_protection_state"] = result["protection_state"]
+            return result
 
-        Design: Binance Futures Testnet returns ONLY algoId (no orderId) for
-        TAKE_PROFIT_MARKET and STOP_MARKET conditional orders.  Therefore:
-          - Uses futures_create_algo_order() with algoType=CONDITIONAL.
-          - Verification: futures_get_algo_order(algoId=...) WITHOUT symbol filter.
-            BUG: symbol filter on this endpoint is silently ignored on testnet —
-            returns empty response even when the order exists (confirmed Aug 2026).
-            Fix: query by algoId only, then match client-side if response is a list.
-          - Cancellation: futures_cancel_algo_order(algoId=...).
-          - tp_order_id / sl_order_id are set to the same value as tp_algo_id /
-            sl_algo_id so downstream code that reads those fields continues to work.
-
-        Returns dict: {tp_order_id, sl_order_id, tp_algo_id, sl_algo_id, success}
-        """
+    def _place_exit_orders_locked(self, trade: dict) -> dict:
+        """Reconcile then idempotently place only missing Futures exit legs."""
         from binance.exceptions import BinanceAPIException
 
         client = self.client
-        sym    = trade["symbol"]
-        qty    = trade["entry_qty"]
-        tp1    = trade["tp1"]
-        sl     = trade["sl"]
-        side   = "SELL" if trade["position_side"] == "LONG" else "BUY"
+        symbol = trade["symbol"]
+        side = "SELL" if trade["position_side"] == "LONG" else "BUY"
+        active_statuses = {"NEW", "WORKING", "EXECUTING", "PARTIALLY_FILLED"}
+        executed_statuses = {"FILLED", "EXECUTED", "COMPLETED", "FINISHED"}
+        missing_codes = {-2013, -2018}
 
-        # Fetch precision
         try:
-            info     = client.futures_exchange_info()
-            sym_info = next(s for s in info["symbols"] if s["symbol"] == sym)
-            tick = next(float(f["tickSize"]) for f in sym_info["filters"]
+            info = client.futures_exchange_info()
+            symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
+            tick = next(float(f["tickSize"]) for f in symbol_info["filters"]
                         if f["filterType"] == "PRICE_FILTER")
-            step = next(float(f["stepSize"]) for f in sym_info["filters"]
+            step = next(float(f["stepSize"]) for f in symbol_info["filters"]
                         if f["filterType"] == "LOT_SIZE")
         except Exception:
             tick, step = 0.01, 0.001
 
-        qty_str = f"{round_step(qty, step):.8f}".rstrip("0").rstrip(".")
-        tp_str  = f"{round_tick(tp1, tick):.8f}".rstrip("0").rstrip(".")
-        sl_str  = f"{round_tick(sl,  tick):.8f}".rstrip("0").rstrip(".")
+        qty_str = f"{round_step(trade['entry_qty'], step):.8f}".rstrip("0").rstrip(".")
+        exit_qty_str = qty_str
+        tp_str = f"{round_tick(trade['tp1'], tick):.8f}".rstrip("0").rstrip(".")
+        sl_str = f"{round_tick(trade['sl'], tick):.8f}".rstrip("0").rstrip(".")
 
-        # ── Emergency check: price already past SL? ───────────────────
+        entry_id = str(trade.get("entry_order_id") or "unknown")
+        exchange_position_side = trade.get("exchange_position_side") or "BOTH"
+
+        def client_id(leg: str) -> str:
+            # SDK/API contract: clientAlgoId accepts <=36 chars from this charset.
+            return f"jt-{entry_id}-{leg.lower()}"[-36:]
+
+        def status_of(order: dict) -> str:
+            return str(order.get("algoStatus") or order.get("status")
+                       or order.get("orderStatus") or "UNKNOWN").upper()
+
+        def match(response, algo_id=None, stable_id=None) -> dict:
+            rows = response if isinstance(response, list) else [response]
+            return next((row for row in (rows or []) if row and (
+                (algo_id is not None and str(row.get("algoId")) == str(algo_id))
+                or (stable_id and row.get("clientAlgoId") == stable_id)
+            )), {})
+
+        def error_record(leg: str, order_type: str, trigger: str,
+                         exc=None, message=None) -> dict:
+            return {
+                "leg": leg, "order_type": order_type, "trigger_price": trigger,
+                "algo_type": "CONDITIONAL",
+                "symbol": symbol, "side": side,
+                "position_side": exchange_position_side,
+                "quantity": exit_qty_str, "working_type": "MARK_PRICE",
+                "mark_price": position_mark_price,
+                "code": getattr(exc, "code", None),
+                "message": message or str(exc),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        position_error = None
+        position_qty = None
+        position_mark_price = None
         try:
-            current          = get_futures_price(client, sym)
-            is_long          = trade["position_side"] == "LONG"
-            emergency        = (current <= sl) if is_long else (current >= sl)
-            if emergency:
-                cmp_sym = "≤" if is_long else "≥"
-                print(f"  ⚠  [{sym}] Price {current:.4f} {cmp_sym} SL {sl:.4f} "
-                      f"— placing MARKET exit")
-                resp = client.futures_create_order(
-                    symbol=sym, side=side, type="MARKET",
-                    quantity=qty_str, positionSide="BOTH", reduceOnly=True,
+            positions = client.futures_position_information(symbol=symbol)
+            if isinstance(positions, dict):
+                positions = [positions]
+            position = next((p for p in (positions or [])
+                             if p.get("symbol") == symbol
+                             and p.get("positionSide", "BOTH") == exchange_position_side), None)
+            if position is None:
+                raise RuntimeError(
+                    f"No {symbol} position row for positionSide={exchange_position_side}")
+            signed_qty = float(position.get("positionAmt", 0) or 0)
+            position_mark_price = float(position.get("markPrice", 0) or 0) or None
+            logical_open = ((trade["position_side"] == "LONG" and signed_qty > 0)
+                            or (trade["position_side"] == "SHORT" and signed_qty < 0))
+            position_qty = abs(signed_qty) if logical_open else 0.0
+            if position_qty > 0:
+                exit_qty_str = (
+                    f"{round_step(position_qty, step):.8f}".rstrip("0").rstrip(".")
                 )
-                return {
-                    "sl_order_id": resp.get("orderId"), "sl_algo_id": None,
-                    "tp_order_id": None,                "tp_algo_id": None,
-                    "success": True, "emergency_exit": True,
-                }
-        except Exception as e:
-            print(f"  [WARN] Price check failed: {e} — proceeding anyway")
+        except Exception as exc:
+            position_error = exc
 
-        results = {
-            "tp_order_id": None, "sl_order_id": None,
-            "tp_algo_id":  None, "sl_algo_id":  None,
-            "success": False,
+        try:
+            response = client.futures_get_open_algo_orders()
+            open_orders = (response.get("orders", [])
+                           if isinstance(response, dict) else (response or []))
+        except Exception:
+            open_orders = None
+
+        def order_identity_matches(order: dict, leg: str) -> bool:
+            cfg = legs[leg]
+            order_type = order.get("orderType") or order.get("type")
+            order_trigger = float(order.get("triggerPrice") or order.get("stopPrice") or 0)
+            return (
+                order.get("symbol") == symbol
+                and order.get("positionSide", "BOTH") == exchange_position_side
+                and order.get("side") == side
+                and order_type == cfg["type"]
+                and abs(order_trigger - float(cfg["trigger"])) <= max(tick / 2, 1e-12)
+            )
+
+        def order_qty_matches(order: dict) -> bool:
+            order_qty = float(order.get("quantity") or order.get("origQty") or 0)
+            return abs(order_qty - float(exit_qty_str)) <= max(step / 2, 1e-12)
+
+        def reconcile(leg: str, persisted_id=None) -> dict:
+            stable_id = client_id(leg)
+            if open_orders is not None:
+                identified = [order for order in open_orders if (
+                    (persisted_id is not None
+                     and str(order.get("algoId")) == str(persisted_id))
+                    or order.get("clientAlgoId") == stable_id
+                    or order_identity_matches(order, leg)
+                ) and status_of(order) in active_statuses]
+                if len(identified) > 1:
+                    return {"state": "UNKNOWN", "id": persisted_id,
+                            "executed": False,
+                            "error": RuntimeError(
+                                f"Multiple active {leg} orders match {symbol} "
+                                f"positionSide={exchange_position_side}")}
+                if identified:
+                    order = identified[0]
+                    if not order_identity_matches(order, leg):
+                        return {"state": "UNKNOWN", "id": persisted_id,
+                                "executed": False,
+                                "error": RuntimeError(
+                                    f"Persisted {leg} ID belongs to unexpected order")}
+                    if not order_qty_matches(order):
+                        return {"state": "STALE", "id": order.get("algoId") or persisted_id,
+                                "executed": False,
+                                "order_qty": float(order.get("quantity")
+                                                   or order.get("origQty") or 0)}
+                    return {"state": "EXISTS", "id": order.get("algoId") or persisted_id,
+                            "executed": False,
+                            "order_qty": float(order.get("quantity")
+                                               or order.get("origQty") or 0)}
+
+            lookups = ([{"algoId": persisted_id}] if persisted_id else [])
+            lookups.append({"clientAlgoId": stable_id})
+            missing_seen = False
+            for params in lookups:
+                try:
+                    response = client.futures_get_algo_order(**params)
+                    order = match(response, persisted_id, stable_id)
+                    order_status = status_of(order)
+                    if order and order_status in active_statuses:
+                        if not order_identity_matches(order, leg):
+                            return {"state": "UNKNOWN", "id": persisted_id,
+                                    "executed": False,
+                                    "error": RuntimeError(
+                                        f"Queried {leg} order attributes do not match position")}
+                        if not order_qty_matches(order):
+                            return {"state": "STALE",
+                                    "id": order.get("algoId") or persisted_id,
+                                    "executed": False,
+                                    "order_qty": float(order.get("quantity")
+                                                       or order.get("origQty") or 0)}
+                        return {"state": "EXISTS",
+                                "id": order.get("algoId") or persisted_id,
+                                "executed": False,
+                                "order_qty": float(order.get("quantity")
+                                                   or order.get("origQty") or 0)}
+                    if order and order_status in executed_statuses:
+                        return {"state": "TERMINAL",
+                                "id": order.get("algoId") or persisted_id,
+                                "executed": True}
+                    if order and order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                        missing_seen = True
+                        continue
+                    # A successful but empty/malformed response is uncertain.
+                    return {"state": "UNKNOWN", "id": persisted_id,
+                            "executed": False}
+                except BinanceAPIException as exc:
+                    if getattr(exc, "code", None) in missing_codes:
+                        missing_seen = True
+                        continue
+                    return {"state": "UNKNOWN", "id": persisted_id,
+                            "executed": False, "error": exc}
+                except Exception as exc:
+                    return {"state": "UNKNOWN", "id": persisted_id,
+                            "executed": False, "error": exc}
+            if missing_seen or open_orders is not None:
+                return {"state": "MISSING", "id": persisted_id, "executed": False}
+            return {"state": "UNKNOWN", "id": persisted_id, "executed": False}
+
+        legs = {
+            "TP": {"type": "TAKE_PROFIT_MARKET", "trigger": tp_str,
+                   "id": trade.get("tp_algo_id") or trade.get("tp_order_id")},
+            "SL": {"type": "STOP_MARKET", "trigger": sl_str,
+                   "id": trade.get("sl_algo_id") or trade.get("sl_order_id")},
         }
+        state = {leg: reconcile(leg, cfg["id"]) for leg, cfg in legs.items()}
+        errors = []
+        creation_attempted = 0
+        previous_meta = ((trade.get("raw_entry_order") or {})
+                         .get("exit_protection") or {})
+        previous_unknown_cycles = int(
+            previous_meta.get("unknown_protection_cycles", 0) or 0)
 
-        def _place_algo_and_verify(label: str, order_type: str,
-                                   trigger_price: str) -> tuple[object, bool]:
-            """
-            Place a conditional exit order and verify registration.
-            Returns (algo_id, verified: bool).
+        def finish(protection_state: str, terminal_seen=False) -> dict:
+            unknown_cycles = (previous_unknown_cycles + 1
+                              if protection_state == "UNKNOWN" else 0)
+            result = {
+                "tp_order_id": state["TP"]["id"],
+                "sl_order_id": state["SL"]["id"],
+                "tp_algo_id": state["TP"]["id"],
+                "sl_algo_id": state["SL"]["id"],
+                "success": protection_state == "FULLY_PROTECTED",
+                "protection_state": protection_state,
+                "errors": errors,
+                "terminal_order_seen": terminal_seen,
+                "creation_attempted": creation_attempted,
+                "unknown_protection_cycles": unknown_cycles,
+                "position_qty": position_qty,
+                "mark_price": position_mark_price,
+                "tp_order_qty": state["TP"].get("order_qty"),
+                "sl_order_qty": state["SL"].get("order_qty"),
+            }
+            self._alert_protection_state(trade, result)
+            return result
 
-            Verify uses futures_get_algo_order(algoId=...) WITHOUT symbol filter.
-            Symbol filter is broken on Binance Futures Testnet (silently returns
-            empty even when order exists).  Fallback: scan open-orders list if
-            primary query returns UNKNOWN — handles transient testnet lag.
-            """
+        if position_error is not None:
+            errors.append(error_record(
+                "POSITION", "POSITION_QUERY", qty_str, exc=position_error))
+            return finish("UNKNOWN")
+
+        if any(value["state"] == "TERMINAL" for value in state.values()):
+            # Do not replace a just-executed leg. Let the monitor resolve its fill.
+            return finish("UNKNOWN", terminal_seen=True)
+
+        if position_qty == 0:
+            return finish("POSITION_CLOSED")
+
+        if any(value["state"] == "STALE" for value in state.values()):
+            return finish("STALE_QTY")
+
+        if any(value["state"] == "UNKNOWN" for value in state.values()):
+            for leg, value in state.items():
+                if value.get("error"):
+                    cfg = legs[leg]
+                    errors.append(error_record(
+                        leg, cfg["type"], cfg["trigger"], exc=value["error"]))
+            return finish("UNKNOWN")
+
+        # Preserve the existing emergency exit policy, but only after exchange
+        # reconciliation and only when no active SL already protects downside.
+        if state["SL"]["state"] == "MISSING":
             try:
-                resp = client.futures_create_algo_order(
-                    algoType     = "CONDITIONAL",
-                    symbol       = sym,
-                    side         = side,
-                    type         = order_type,
-                    quantity     = qty_str,
-                    triggerPrice = trigger_price,
-                    timeInForce  = "GTC",
-                    positionSide = "BOTH",
-                    reduceOnly   = "true",
-                    workingType  = "MARK_PRICE",
-                )
-            except BinanceAPIException as e:
-                print(f"  ❌ {label} algo order failed (API): {e}")
-                return None, False
-            except Exception as e:
-                print(f"  ❌ {label} algo order unexpected error: "
-                      f"{type(e).__name__}: {e}")
-                return None, False
+                current = get_futures_price(client, symbol)
+                is_long = trade["position_side"] == "LONG"
+                breached = ((current <= trade["sl"]) if is_long
+                            else (current >= trade["sl"]))
+                if breached:
+                    response = client.futures_create_order(
+                        symbol=symbol, side=side, type="MARKET",
+                        quantity=exit_qty_str, positionSide=exchange_position_side,
+                        reduceOnly=True,
+                    )
+                    return {
+                        "sl_order_id": response.get("orderId"), "sl_algo_id": None,
+                        "tp_order_id": state["TP"]["id"],
+                        "tp_algo_id": state["TP"]["id"],
+                        "success": True, "emergency_exit": True,
+                        "protection_state": "POSITION_CLOSED", "errors": [],
+                        "terminal_order_seen": True, "creation_attempted": 1,
+                        "unknown_protection_cycles": 0,
+                        "position_qty": position_qty,
+                    }
+            except Exception as exc:
+                print(f"  [WARN] Price check failed: {exc} — proceeding with exits")
 
-            algo_id = resp.get("algoId") or resp.get("orderId")
+        terminal_seen = any(value["executed"] for value in state.values())
+
+        def place(leg: str) -> None:
+            nonlocal creation_attempted
+            cfg = legs[leg]
+            creation_attempted += 1
+            try:
+                response = client.futures_create_algo_order(
+                    algoType="CONDITIONAL", symbol=symbol, side=side,
+                    type=cfg["type"], quantity=exit_qty_str,
+                    triggerPrice=cfg["trigger"], positionSide=exchange_position_side,
+                    reduceOnly="true", workingType="MARK_PRICE",
+                    clientAlgoId=client_id(leg),
+                )
+            except Exception as exc:
+                check = reconcile(leg)
+                state[leg] = check
+                if check["state"] != "EXISTS":
+                    errors.append(error_record(
+                        leg, cfg["type"], cfg["trigger"], exc=exc))
+                return
+
+            algo_id = response.get("algoId") or response.get("orderId")
             if not algo_id:
-                print(f"  ❌ {label} algo order — no algoId in response: {resp}")
-                return None, False
+                state[leg] = reconcile(leg)
+                if state[leg]["state"] != "EXISTS":
+                    errors.append(error_record(
+                        leg, cfg["type"], cfg["trigger"],
+                        message=f"No algoId/orderId in response "
+                                f"(code={response.get('code')}, msg={response.get('msg')})"))
+                return
 
-            print(f"  ✅ {label} algo order placed: algoId={algo_id} @ {trigger_price}")
+            _time.sleep(0.4)
+            state[leg] = reconcile(leg, algo_id)
+            if state[leg]["state"] != "EXISTS":
+                errors.append(error_record(
+                    leg, cfg["type"], cfg["trigger"],
+                    message=f"Created algoId={algo_id}; verification={state[leg]['state']}"))
 
-            # ── Post-placement verification ────────────────────────────
-            _time.sleep(0.4)  # brief settle — testnet can lag slightly
-            try:
-                verify_resp = client.futures_get_algo_order(algoId=algo_id)
-                # Response may be dict (single) or list
-                if isinstance(verify_resp, list):
-                    matches = [o for o in verify_resp
-                               if str(o.get("algoId")) == str(algo_id)]
-                    verify = matches[0] if matches else {}
-                else:
-                    verify = verify_resp or {}
+        # Never replace an order while a terminal leg awaits monitor resolution.
+        if not terminal_seen:
+            for leg in ("SL", "TP"):
+                if state[leg]["state"] == "MISSING":
+                    place(leg)
+                    if state[leg]["state"] == "UNKNOWN":
+                        break
 
-                v_status = (
-                    verify.get("algoStatus")
-                    or verify.get("status")
-                    or verify.get("orderStatus")
-                    or "UNKNOWN"
-                )
-                if v_status.upper() in ("NEW", "WORKING", "EXECUTING",
-                                        "PARTIALLY_FILLED"):
-                    print(f"  ✅ {label} algo order verified: algoStatus={v_status}")
-                    return algo_id, True
-                if v_status.upper() in ("FILLED", "EXECUTED", "COMPLETED"):
-                    print(f"  ⚠  {label} algo order immediately executed: "
-                          f"algoStatus={v_status}")
-                    return algo_id, True
+        if any(value["state"] == "UNKNOWN" for value in state.values()):
+            return finish("UNKNOWN", terminal_seen)
+        tp_exists = state["TP"]["state"] == "EXISTS"
+        sl_exists = state["SL"]["state"] == "EXISTS"
+        if tp_exists and sl_exists:
+            protection_state = "FULLY_PROTECTED"
+        elif sl_exists:
+            protection_state = "SL_ONLY"
+        elif tp_exists:
+            protection_state = "TP_ONLY"
+        else:
+            protection_state = "UNPROTECTED"
+        return finish(protection_state, terminal_seen)
 
-                # v_status UNKNOWN — transient lag fallback: scan open-orders list
-                all_open = client.futures_get_open_algo_orders()
-                if isinstance(all_open, dict):
-                    all_open = all_open.get("orders", [])
-                if any(str(o.get("algoId")) == str(algo_id)
-                       for o in (all_open or [])):
-                    print(f"  ✅ {label} algo order confirmed via open-orders list")
-                    return algo_id, True
-
-                print(f"  ⚠  {label} algo order verification: "
-                      f"algoStatus={v_status}, not found in open list. "
-                      f"Full response: {verify}")
-                return algo_id, False
-
-            except BinanceAPIException as ve:
-                print(f"  ⚠  {label} algo order verification error: {ve}. "
-                      f"Treating as unverified — price-guard will monitor.")
-                return algo_id, False
-            except Exception as ve:
-                print(f"  ⚠  {label} algo order verification error: "
-                      f"{type(ve).__name__}: {ve}. Assuming placed.")
-                return algo_id, True  # network hiccup — benefit of doubt
-
-        tp_algo_id, tp_verified = _place_algo_and_verify(
-            "TP", "TAKE_PROFIT_MARKET", tp_str)
-        sl_algo_id, sl_verified = _place_algo_and_verify(
-            "SL", "STOP_MARKET",        sl_str)
-
-        # algoId is the authoritative identifier for both fields
-        results["tp_order_id"] = tp_algo_id
-        results["sl_order_id"] = sl_algo_id
-        results["tp_algo_id"]  = tp_algo_id
-        results["sl_algo_id"]  = sl_algo_id
-
-        both_placed   = tp_algo_id is not None and sl_algo_id is not None
-        both_verified = tp_verified and sl_verified
-
-        if both_placed and not both_verified:
-            print(f"\n  {'!'*60}")
-            print(f"  !! WARNING: Exit algo order(s) placed but NOT verified "
-                  f"for {sym} !!")
-            print(f"  !!   TP verified={tp_verified}  SL verified={sl_verified}")
-            print(f"  !! Price-guard in --check-positions will catch any SL breach.")
-            print(f"  {'!'*60}\n")
-            _send_telegram(
-                f"⚠️ [FUTURES] Exit algo order UNVERIFIED for "
-                f"{sym} {trade.get('position_side')}.\n"
-                f"TP verified={tp_verified}  SL verified={sl_verified}\n"
-                f"Price-guard active — run --check-positions to monitor."
-            )
-        elif not both_placed:
-            print(f"\n  {'!'*60}")
-            print(f"  !! CRITICAL: Exit order placement FAILED for "
-                  f"{sym} {trade.get('position_side')} !!")
-            print(f"  !!   TP placed={tp_algo_id is not None}  "
-                  f"SL placed={sl_algo_id is not None}")
-            print(f"  !! Position UNPROTECTED — price-guard is active but fix ASAP.")
-            print(f"  {'!'*60}\n")
-            _send_telegram(
-                f"🚨 [FUTURES] EXIT ORDER FAILED for "
-                f"{sym} {trade.get('position_side')}!\n"
-                f"TP algoId={tp_algo_id}  SL algoId={sl_algo_id}\n"
-                f"Position UNPROTECTED — intervene immediately."
-            )
-
-        results["success"] = both_placed
-        return results
+    @staticmethod
+    def _alert_protection_state(trade: dict, result: dict) -> None:
+        """Alert using the verified protection state, including safe error detail."""
+        state = result["protection_state"]
+        if state in {"FULLY_PROTECTED", "PENDING"}:
+            return
+        symbol = trade["symbol"]
+        side = trade.get("position_side", "LONG")
+        messages = {
+            "SL_ONLY": (f"⚠️ [FUTURES] {symbol} {side} PARTIALLY PROTECTED\n"
+                        "Stop Loss: ACTIVE\nTake Profit: MISSING\n"
+                        "Position downside remains protected.\n"
+                        "TP retry/reconciliation required."),
+            "TP_ONLY": (f"🚨 [FUTURES] {symbol} {side} CRITICAL\n"
+                        "Take Profit: ACTIVE\nStop Loss: MISSING\n"
+                        "No downside protection."),
+            "UNPROTECTED": (f"🚨 [FUTURES] {symbol} {side} UNPROTECTED\n"
+                            "Take Profit: MISSING\nStop Loss: MISSING"),
+            "UNKNOWN": (("🚨" if result.get("unknown_protection_cycles", 0) >= 3
+                         else "⚠️")
+                        + f" [FUTURES] {symbol} {side} PROTECTION STATE UNKNOWN\n"
+                        "Exchange reconciliation failed.\n"
+                        + ("No new exit orders were created to avoid duplicates."
+                           if not result.get("creation_attempted") else
+                           "No further exit orders will be created until reconciliation succeeds.")
+                        + f"\nConsecutive unknown cycles: "
+                          f"{result.get('unknown_protection_cycles', 1)}"),
+            "STALE_QTY": (
+                f"⚠️ [FUTURES] {symbol} {side} EXIT ORDER QUANTITY MISMATCH\n"
+                f"Current position quantity: {result.get('position_qty')}\n"
+                f"TP protected quantity: {result.get('tp_order_qty')}\n"
+                f"SL protected quantity: {result.get('sl_order_qty')}"
+            ),
+            "POSITION_CLOSED": (
+                f"⚠️ [FUTURES] {symbol} {side} POSITION ABSENT ON EXCHANGE\n"
+                "No exit orders were created.\nDB reconciliation required."
+            ),
+        }
+        details = result.get("errors") or []
+        reason = ""
+        if details:
+            error = details[-1]
+            code = (f" code={error['code']}"
+                    if error.get("code") is not None else "")
+            reason = (f"\n{error['leg']} {error['order_type']} failed:{code} "
+                      f"{error['message']}\nTrigger: {error['trigger_price']}"
+                      + (f"\nMark price: {error['mark_price']}"
+                         if error.get("mark_price") is not None else ""))
+        _send_telegram(messages[state] + reason)
 
     # -------------------------------------------------------------------------
     # Backwards-compat shim (god file still imports log_trade directly)

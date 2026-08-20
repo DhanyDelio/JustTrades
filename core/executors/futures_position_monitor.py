@@ -132,11 +132,34 @@ class FuturesPositionMonitor:
             if entry_status == "FILLED" and not trade.get("exit_orders_placed"):
                 print(f"  {sym:<12} ✅ FILLED — placing TP + SL orders...")
                 exit_result = FuturesOrderExecutor(client).place_exit_orders(trade)
-                trade["tp_order_id"]        = exit_result.get("tp_order_id")
-                trade["sl_order_id"]        = exit_result.get("sl_order_id")
-                trade["tp_algo_id"]         = exit_result.get("tp_algo_id")
-                trade["sl_algo_id"]         = exit_result.get("sl_algo_id")
-                trade["exit_orders_placed"] = exit_result["success"]
+                # A failed leg must never erase the successfully reconciled leg.
+                for field in ("tp_order_id", "sl_order_id",
+                              "tp_algo_id", "sl_algo_id"):
+                    if exit_result.get(field) is not None:
+                        trade[field] = exit_result[field]
+                trade["exit_orders_placed"] = bool(
+                    exit_result["success"]
+                    or exit_result.get("terminal_order_seen")
+                )
+                raw_entry = dict(trade.get("raw_entry_order") or {})
+                raw_entry["exit_protection"] = {
+                    "state": exit_result.get("protection_state", "UNKNOWN"),
+                    "errors": exit_result.get("errors", []),
+                    "unknown_protection_cycles": exit_result.get(
+                        "unknown_protection_cycles", 0),
+                    "position_qty": exit_result.get("position_qty"),
+                    "tp_order_qty": exit_result.get("tp_order_qty"),
+                    "sl_order_qty": exit_result.get("sl_order_qty"),
+                    "mark_price": exit_result.get("mark_price"),
+                    "tp_client_algo_id": (
+                        f"jt-{trade.get('entry_order_id') or 'unknown'}-tp"[-36:]
+                    ),
+                    "sl_client_algo_id": (
+                        f"jt-{trade.get('entry_order_id') or 'unknown'}-sl"[-36:]
+                    ),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                trade["raw_entry_order"] = raw_entry
                 log_dirty = True
 
                 if exit_result.get("emergency_exit"):
@@ -154,11 +177,19 @@ class FuturesPositionMonitor:
                     self._eager_commit_futures(eid, trade)
                     continue
 
+                if (exit_result.get("protection_state") == "POSITION_CLOSED"
+                        and not exit_result.get("terminal_order_seen")):
+                    # Exchange confirms no live position and no executed TP/SL
+                    # was found. Close the stale DB lifecycle without inventing
+                    # an execution price, outcome, or realized PnL.
+                    trade["exit_status"] = "MANUALLY_CLOSED"
+                    trade["exit_orders_placed"] = False
+                    self._eager_commit_futures(eid, trade)
+                    continue
+
                 if not exit_result["success"]:
-                    print(f"\n  {'!'*60}")
-                    print(f"  !! CRITICAL: Exit orders FAILED for {sym} {side} !!")
-                    print(f"  !! Position UNPROTECTED !!")
-                    print(f"  {'!'*60}\n")
+                    print(f"  [{sym}] Exit protection state: "
+                          f"{exit_result.get('protection_state', 'UNKNOWN')}")
 
             # Step 2.5: accrue funding
             if entry_status == "FILLED" and trade.get("exit_status") == "OPEN":
@@ -347,7 +378,8 @@ class FuturesPositionMonitor:
                         "entry_status", "entry_fill_price", "entry_fill_time",
                         "entry_qty", "slippage_pct", "last_funding_check_time",
                         "tp_order_id", "sl_order_id", "tp_algo_id", "sl_algo_id",
-                        "exit_orders_placed", "funding_rate_paid", "funding_rate_history",
+                        "exit_orders_placed", "raw_entry_order",
+                        "funding_rate_paid", "funding_rate_history",
                         "exit_status", "exit_price", "exit_time",
                         "realized_pnl_usd", "realized_pnl_pct", "time_in_position_sec",
                         "max_adverse_excursion_pct", "max_favorable_excursion_pct",
