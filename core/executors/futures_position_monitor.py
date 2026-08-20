@@ -168,6 +168,8 @@ class FuturesPositionMonitor:
                         1 if side == "LONG" else -1)
                     pnl_pct = pnl_usd / trade.get("entry_notional", 1) * 100
                     trade["exit_status"]        = "SL_HIT"
+                    trade["exit_reason"]        = exit_result.get(
+                        "exit_reason", "EMERGENCY_UNPROTECTED")
                     trade["exit_price"]         = round(current, 6)
                     trade["realized_pnl_usd"]   = round(pnl_usd, 4)
                     trade["realized_pnl_pct"]   = round(pnl_pct, 2)
@@ -183,6 +185,7 @@ class FuturesPositionMonitor:
                     # was found. Close the stale DB lifecycle without inventing
                     # an execution price, outcome, or realized PnL.
                     trade["exit_status"] = "MANUALLY_CLOSED"
+                    trade["exit_reason"] = "RECONCILED_EXCHANGE_CLOSE"
                     trade["exit_orders_placed"] = False
                     self._eager_commit_futures(eid, trade)
                     continue
@@ -233,6 +236,10 @@ class FuturesPositionMonitor:
 
                     trade.update({
                         "exit_status":      exit_status_found,
+                        "exit_reason":      (
+                            "EXCHANGE_TP" if exit_status_found == "TP_HIT"
+                            else "EXCHANGE_SL"
+                        ),
                         "exit_price":       round(exit_price_found, 6),
                         "exit_time":        exit_ms,
                         "realized_pnl_usd": round(pnl_usd, 4),
@@ -316,6 +323,7 @@ class FuturesPositionMonitor:
                                   or datetime.now(timezone.utc).timestamp() * 1000)
                     trade.update({
                         "exit_status":      "SL_HIT",
+                        "exit_reason":      "EMERGENCY_PRICE_GUARD",
                         "exit_price":       round(fill_px, 6),
                         "exit_time":        exit_ms,
                         "realized_pnl_usd": round(pnl_usd, 4),
@@ -380,7 +388,7 @@ class FuturesPositionMonitor:
                         "tp_order_id", "sl_order_id", "tp_algo_id", "sl_algo_id",
                         "exit_orders_placed", "raw_entry_order",
                         "funding_rate_paid", "funding_rate_history",
-                        "exit_status", "exit_price", "exit_time",
+                        "exit_status", "exit_reason", "exit_price", "exit_time",
                         "realized_pnl_usd", "realized_pnl_pct", "time_in_position_sec",
                         "max_adverse_excursion_pct", "max_favorable_excursion_pct",
                         "distance_to_liquidation_pct_min",
@@ -410,6 +418,7 @@ class FuturesPositionMonitor:
             from services.supabase_client import update_futures_by_order_id
             update_futures_by_order_id(entry_order_id, {
                 "exit_status":          trade.get("exit_status"),
+                "exit_reason":          trade.get("exit_reason"),
                 "exit_price":           trade.get("exit_price"),
                 "exit_time":            trade.get("exit_time"),
                 "realized_pnl_usd":     trade.get("realized_pnl_usd"),

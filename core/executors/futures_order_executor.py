@@ -166,6 +166,13 @@ class FuturesOrderExecutor:
         """Executes the futures entry order and logs it."""
         from binance.exceptions import BinanceAPIException
 
+        research = cand.get("research_snapshot")
+        if isinstance(research, dict):
+            # Timestamp the immutable research contract immediately before the
+            # existing exchange-configuration/submission sequence.
+            research.setdefault(
+                "pre_submit_time", datetime.now(timezone.utc).isoformat())
+
         if self.dry_run:
             print(f"\n  [DRY RUN] FuturesOrderExecutor: "
                   f"skipping actual execution for {cand['symbol']}")
@@ -469,6 +476,7 @@ class FuturesOrderExecutor:
                         "tp_order_id": state["TP"]["id"],
                         "tp_algo_id": state["TP"]["id"],
                         "success": True, "emergency_exit": True,
+                        "exit_reason": "EMERGENCY_UNPROTECTED",
                         "protection_state": "POSITION_CLOSED", "errors": [],
                         "terminal_order_seen": True, "creation_attempted": 1,
                         "unknown_protection_cycles": 0,

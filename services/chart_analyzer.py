@@ -757,8 +757,16 @@ def analyze_symbol(symbol: str, save_chart: bool = True) -> dict | None:
         print(f"  ❌ Not enough candles for {symbol}: {len(df)}")
         return None
 
+    analysis_time = datetime.now(timezone.utc)
     current_price = float(df["close"].iloc[-1])
     atr           = compute_atr(df)
+
+    # Research provenance only. The current strategy intentionally remains
+    # unchanged and still analyzes the latest returned candle; these fields let
+    # downstream research determine whether that candle was closed at analysis.
+    last_candle_open_ms = int(df.index[-1].timestamp() * 1000)
+    interval_ms = 4 * 60 * 60 * 1000
+    last_candle_close_ms = last_candle_open_ms + interval_ms - 1
 
     # S/R zones
     resistance_zones, support_zones = get_sr_zones(df)
@@ -816,6 +824,12 @@ def analyze_symbol(symbol: str, save_chart: bool = True) -> dict | None:
     return {
         "symbol":            symbol,
         "current_price":     current_price,
+        "analysis_time":     analysis_time.isoformat(),
+        "last_candle_open_time":  last_candle_open_ms,
+        "last_candle_close_time": last_candle_close_ms,
+        "last_candle_was_closed": (
+            last_candle_close_ms < int(analysis_time.timestamp() * 1000)
+        ),
         "atr":               atr,
         "atr_pct":           atr / current_price * 100,
         "swing_desc":        swing_desc,

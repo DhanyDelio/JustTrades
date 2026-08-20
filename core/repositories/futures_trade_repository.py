@@ -11,6 +11,7 @@ Fallback: data/json/trade_futures.json (read-only backup).
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,6 +87,19 @@ class FuturesTradeRepository:
         sizing = cand["sizing"]
         liq    = cand["liquidation"]
         ez     = cand.get("entry_zone") or {}
+        research_snapshot = deepcopy(cand.get("research_snapshot") or {})
+        raw_entry_order = deepcopy(order)
+        raw_entry_order["research_snapshot"] = deepcopy(research_snapshot)
+
+        def epoch_ms_to_iso(value):
+            """Convert research candle epoch milliseconds to UTC ISO."""
+            if value is None:
+                return None
+            try:
+                return datetime.fromtimestamp(
+                    int(value) / 1000, tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError):
+                return None
 
         record = {
             # ── Identity ──────────────────────────────────────────────
@@ -109,6 +123,23 @@ class FuturesTradeRepository:
             "entry_notional":       sizing["notional_usd"],
             "margin_used":          sizing["margin_used"],
             "open_time":            datetime.now(timezone.utc).isoformat(),
+
+            # ── Immutable pre-submit research snapshot ────────────────
+            "research_snapshot_version": research_snapshot.get("schema_version"),
+            "decision_time":        research_snapshot.get("analysis_time"),
+            "pre_submit_time":      research_snapshot.get("pre_submit_time"),
+            "initial_entry_price":  research_snapshot.get("initial_entry"),
+            "initial_sl":           research_snapshot.get("initial_sl"),
+            "initial_risk_pct":     research_snapshot.get("initial_risk_pct"),
+            "final_rr":             research_snapshot.get("final_pre_submit_r"),
+            "delta_rr":             research_snapshot.get("delta_r"),
+            "atr_at_entry":         research_snapshot.get("atr"),
+            "analysis_candle_open_time": epoch_ms_to_iso(
+                research_snapshot.get("last_candle_open_time")),
+            "analysis_candle_close_time": epoch_ms_to_iso(
+                research_snapshot.get("last_candle_close_time")),
+            "analysis_candle_closed": research_snapshot.get(
+                "last_candle_was_closed"),
 
             # ── Exit orders ───────────────────────────────────────────
             "tp_order_id":          None,
@@ -148,6 +179,7 @@ class FuturesTradeRepository:
 
             # ── Exit ──────────────────────────────────────────────────
             "exit_status":          "OPEN",
+            "exit_reason":          None,
             "exit_price":           None,
             "exit_time":            None,
             "realized_pnl_usd":     None,
@@ -163,7 +195,7 @@ class FuturesTradeRepository:
             "last_funding_check_time":         None,
 
             # ── Raw ───────────────────────────────────────────────────
-            "raw_entry_order":      order,
+            "raw_entry_order":      raw_entry_order,
         }
         upsert_futures(record)
         print(

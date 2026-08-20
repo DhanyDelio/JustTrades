@@ -142,6 +142,27 @@ class FuturesCandidateScanner:
                         "tier_used":        setup.get("tier_used", "T1"),
                         "support_zones":    result.get("support_zones", []),
                         "resistance_zones": result.get("resistance_zones", []),
+                        "research_snapshot": {
+                            "schema_version": "futures_pre_submit_v1",
+                            "analysis_time": result.get("analysis_time"),
+                            "last_candle_open_time": result.get(
+                                "last_candle_open_time"),
+                            "last_candle_close_time": result.get(
+                                "last_candle_close_time"),
+                            "last_candle_was_closed": result.get(
+                                "last_candle_was_closed"),
+                            "symbol": sym,
+                            "side": "LONG" if direction == "long" else "SHORT",
+                            "initial_entry": current_price,
+                            "initial_sl": sl,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "initial_planned_r": rr,
+                            "initial_risk_pct": risk_pct,
+                            "atr": atr,
+                            "atr_pct": atr_pct,
+                            "zone_tier": setup.get("tier_used", "T1"),
+                        },
                     })
 
             all_candidates.extend(part_candidates)
@@ -247,6 +268,37 @@ class FuturesCandidateScanner:
                 cand["risk_pct"] = (recalc_sl - entry) / entry * 100 if entry > 0 else 0
 
             cand["entry_price"] = entry
+
+            # Capture the finalized contract before any order is submitted.
+            # This metadata is not read by ranking, sizing, or execution logic.
+            research = cand.setdefault("research_snapshot", {
+                "schema_version": "futures_pre_submit_v1",
+                "symbol": sym,
+                "side": cand["position_side"],
+                "initial_entry": cand.get("current_price"),
+                "initial_sl": cand.get("sl"),
+                "tp1": cand.get("tp1"),
+                "tp2": cand.get("tp2"),
+                "initial_planned_r": cand.get("rr"),
+                "initial_risk_pct": cand.get("risk_pct"),
+                "atr": cand.get("atr"),
+                "atr_pct": cand.get("atr_pct"),
+                "zone_tier": cand.get("tier_used"),
+            })
+            final_risk = abs(entry - cand["sl"])
+            final_r = (abs(cand["tp1"] - entry) / final_risk
+                       if final_risk > 0 else None)
+            research.update({
+                "final_pre_submit_entry": entry,
+                "final_pre_submit_sl": cand["sl"],
+                "final_pre_submit_r": final_r,
+                "delta_r": (final_r - cand["rr"]
+                            if final_r is not None and cand.get("rr") is not None
+                            else None),
+                "final_risk_pct": cand["risk_pct"],
+                "entry_zone_center": (cand.get("entry_zone") or {}).get("center"),
+                "entry_zone_touches": (cand.get("entry_zone") or {}).get("touches"),
+            })
 
             # Safety: SL/entry/TP direction check
             if direction == "long" and not (cand["sl"] < entry < cand["tp1"]):
