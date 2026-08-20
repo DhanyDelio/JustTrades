@@ -16,6 +16,7 @@ from pathlib import Path
 from services.supabase_client import fetch_all_spot, fetch_all_futures, fetch_heartbeat
 from services.timing_logger import log_timing
 from streamlit_autorefresh import st_autorefresh
+from dashboard_ml_metadata import load_ml_shadow_display_metadata
 
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
@@ -2170,7 +2171,12 @@ def main():
 
     # ── TAB 4: ML SHADOW METRICS ─────────────────────────────────────────
     with tab_ml:
-        st.caption("Model: `ml/models/v2.pkl` · Version: `v2.0.0` · Mode: **Observation Only** (no veto)")
+        ml_display = load_ml_shadow_display_metadata()
+        st.caption(
+            f"Model: `{ml_display['model']}` · "
+            f"Version: `{ml_display['version']}` · "
+            f"Mode: **{ml_display['mode']}**"
+        )
         
         df_spot_ml = load_trade_data()
         
@@ -2307,7 +2313,7 @@ def main():
                     st.error("🔴 **Negative score gap** — Model is inversely correlated. Needs retraining.")
 
                 st.caption(
-                    "ℹ️ ML v2 Shadow Scoring is **Spot-only**. "
+                    f"ℹ️ ML {ml_display['version']} Shadow Scoring is **Spot-only**. "
                     "Futures pipeline runs independently without ML scoring. "
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
