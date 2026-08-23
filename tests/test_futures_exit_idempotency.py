@@ -303,6 +303,21 @@ class FuturesExitIdempotencyTests(unittest.TestCase):
         self.assertTrue(result["terminal_order_seen"])
         exchange.client.futures_create_algo_order.assert_not_called()
 
+    def test_n_executed_order_wins_when_closed_position_row_is_absent(self):
+        exchange = FakeAlgoExchange()
+        exchange.client.futures_position_information.return_value = []
+        exchange.orders["jt-555-sl"] = {
+            "algoId": 900, "clientAlgoId": "jt-555-sl", "symbol": "SOLUSDT",
+            "side": "SELL", "positionSide": "BOTH", "orderType": "STOP_MARKET",
+            "triggerPrice": "140", "quantity": "1.2", "algoStatus": "EXECUTED",
+        }
+
+        result = self.run_executor(exchange, self.trade(sl_algo_id=900))
+
+        self.assertEqual(result["protection_state"], "UNKNOWN")
+        self.assertTrue(result["terminal_order_seen"])
+        exchange.client.futures_create_algo_order.assert_not_called()
+
     def test_n_canceled_and_expired_orders_are_replaced_not_counted_active(self):
         for terminal_status in ("CANCELED", "EXPIRED"):
             with self.subTest(status=terminal_status):

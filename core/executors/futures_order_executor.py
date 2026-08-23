@@ -434,14 +434,15 @@ class FuturesOrderExecutor:
             self._alert_protection_state(trade, result)
             return result
 
+        if any(value["state"] == "TERMINAL" for value in state.values()):
+            # A closed position row may disappear before reconciliation. Preserve
+            # the stronger terminal-order evidence so the monitor can resolve it.
+            return finish("UNKNOWN", terminal_seen=True)
+
         if position_error is not None:
             errors.append(error_record(
                 "POSITION", "POSITION_QUERY", qty_str, exc=position_error))
             return finish("UNKNOWN")
-
-        if any(value["state"] == "TERMINAL" for value in state.values()):
-            # Do not replace a just-executed leg. Let the monitor resolve its fill.
-            return finish("UNKNOWN", terminal_seen=True)
 
         if position_qty == 0:
             return finish("POSITION_CLOSED")
