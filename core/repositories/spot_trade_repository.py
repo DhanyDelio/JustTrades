@@ -167,6 +167,15 @@ class SpotTradeRepository:
             "raw_entry_order":   {
                 **order,
                 "ml_shadow": cand.get("ml_shadow"),
+                # Immutable-enough context for a later stale-entry review.
+                # It is intentionally audit-only: it does not alter entry,
+                # ranking, sizing, SL, or TP logic.
+                "pending_entry_guard": {
+                    "state": "NONE",
+                    "entry_zone": cand.get("entry_zone"),
+                    "atr_at_decision": cand.get("atr"),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
             },
         }
         upsert_spot(record)

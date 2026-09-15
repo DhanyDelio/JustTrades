@@ -99,7 +99,9 @@ Yang dilakukan:
 3. FILLED + belum ada OCO → place OCO (SL + TP)
 4. OCO `ALL_DONE` → detect TP_HIT / SL_HIT, hitung PnL, update Supabase
 5. Price-guard: kalau harga sudah breach SL meski OCO tidak trigger → resolve SL_HIT
-6. Auto-cancel: order pending > 3 hari dengan gap > 30% dari entry → cancel otomatis
+6. Stale pending-entry guard: harga ≥20% dari entry → review; ≥30% dan umur
+   ≥3 hari → revalidation support-zone; ≥40% + zone invalid → `WOULD_CANCEL`
+   dalam shadow mode. Cancel nyata hanya jika `STALE_ENTRY_AUTO_CANCEL_ENABLED=true`.
 
 ### `--stats` — Performance statistics
 

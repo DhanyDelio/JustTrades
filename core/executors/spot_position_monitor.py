@@ -2,6 +2,7 @@
 import sys
 import atexit
 import re
+import os
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 
@@ -14,6 +15,7 @@ from core.paper_trade_executor import (
     PER_TRADE_BUDGET
 )
 from core.managers.portfolio_manager import PortfolioManager
+from core.guards.stale_pending_entry_guard import evaluate as evaluate_stale_entry
 
 
 def _is_confirmed_missing_oco_error(exc: Exception) -> bool:
@@ -29,6 +31,118 @@ class SpotPositionMonitor:
         self.client = client
         self.repo = repo
         self.order_executor = order_executor
+
+    @staticmethod
+    def _auto_cancel_enabled() -> bool:
+        """Real cancellation is deliberately opt-in after shadow validation."""
+        return os.getenv("STALE_ENTRY_AUTO_CANCEL_ENABLED", "false").lower() in {
+            "1", "true", "yes", "on"
+        }
+
+    @staticmethod
+    def _set_pending_guard(trade: dict, **fields) -> None:
+        raw = dict(trade.get("raw_entry_order") or {})
+        guard = dict(raw.get("pending_entry_guard") or {})
+        guard.update(fields)
+        raw["pending_entry_guard"] = guard
+        trade["raw_entry_order"] = raw
+
+    def _persist_pending_guard(self, trade: dict) -> bool:
+        """Durably record an intent before an optional exchange cancellation."""
+        try:
+            from services.supabase_client import update_spot_by_order_id
+            update_spot_by_order_id(
+                trade["entry_order_id"], {"raw_entry_order": trade["raw_entry_order"]}
+            )
+            return True
+        except Exception as exc:
+            self._set_pending_guard(
+                trade, state="RECONCILIATION_REQUIRED",
+                reconciliation_reason="SUPABASE_PERSIST_FAILED",
+                reconciliation_error=str(type(exc).__name__),
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            return False
+
+    def _revalidate_pending_entry(self, trade: dict) -> dict:
+        """Fresh structural read; failures are UNKNOWN and can never cancel."""
+        try:
+            result = ca.analyze_symbol(trade["symbol"], save_chart=False)
+            if not result:
+                return {"zone_valid": "unknown", "reason": "ANALYSIS_UNAVAILABLE"}
+            entry = float(trade["entry_price"])
+            # The original entry is valid only if a current support zone still
+            # contains it (with a small entry-buffer tolerance).
+            for zone in result.get("support_zones", []):
+                low, high = float(zone["low"]), float(zone["high"])
+                if low <= entry <= high * 1.003:
+                    return {"zone_valid": True, "reason": "SUPPORT_ZONE_RETAINED",
+                            "zone": {k: zone.get(k) for k in ("low", "high", "center", "touches")}}
+            return {"zone_valid": False, "reason": "ENTRY_ZONE_NOT_RETAINED"}
+        except Exception:
+            return {"zone_valid": "unknown", "reason": "ANALYSIS_ERROR"}
+
+    def _handle_stale_pending_entry(self, trade: dict, current: float) -> bool:
+        """Review/revalidate an unfilled entry. Returns True when terminalized."""
+        decision = evaluate_stale_entry(trade, current)
+        if decision["action"] == "NONE":
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        self._set_pending_guard(trade, state=decision["action"], updated_at=now,
+                                last_price=current, last_distance_pct=decision.get("distance_pct"),
+                                order_age_days=decision.get("age_days"))
+        if decision["action"] == "REVALIDATE":
+            verdict = self._revalidate_pending_entry(trade)
+            self._set_pending_guard(trade, state="REVIEW_REQUIRED",
+                                    last_revalidation_at=now, last_revalidation=verdict)
+            decision = evaluate_stale_entry(trade, current)
+
+        if decision["action"] != "CANCEL_ELIGIBLE":
+            return False
+        self._set_pending_guard(trade, state="CANCEL_ELIGIBLE", updated_at=now,
+                                cancel_reason="STALE_SETUP_CANCELLED",
+                                cancel_subreason="PRICE_RUNAWAY_AND_ZONE_INVALID")
+        if not self._auto_cancel_enabled():
+            self._set_pending_guard(trade, state="WOULD_CANCEL", updated_at=now)
+            print(f"  {trade['symbol']:<10} ℹ Stale-entry shadow: would cancel "
+                  f"({decision['distance_pct']:+.2f}% above entry; zone invalid).")
+            return False
+
+        # Two durable checks bracket the exchange mutation. A DB outage or
+        # exchange state change always fails closed rather than cancelling.
+        self._set_pending_guard(trade, state="CANCEL_IN_FLIGHT", cancel_requested_at=now)
+        if not self._persist_pending_guard(trade):
+            print(f"  {trade['symbol']:<10} ⚠ Stale-entry cancel skipped: audit persistence unavailable.")
+            return False
+        try:
+            latest = self.client.get_order(symbol=trade["symbol"], orderId=trade["entry_order_id"])
+            if (str(latest.get("status", "")).upper() != "NEW"
+                    or float(latest.get("executedQty", 0) or 0) != 0):
+                trade["entry_status"] = latest.get("status", trade.get("entry_status"))
+                self._set_pending_guard(trade, state="RECONCILIATION_REQUIRED",
+                                        reconciliation_reason="EXCHANGE_STATE_CHANGED")
+                return False
+            self.order_executor.cancel_order(trade["symbol"], trade["entry_order_id"])
+            confirmed = self.client.get_order(
+                symbol=trade["symbol"], orderId=trade["entry_order_id"]
+            )
+            if str(confirmed.get("status", "")).upper() != "CANCELED":
+                trade["entry_status"] = confirmed.get("status", trade.get("entry_status"))
+                self._set_pending_guard(trade, state="RECONCILIATION_REQUIRED",
+                                        reconciliation_reason="CANCEL_NOT_CONFIRMED")
+                return False
+        except Exception:
+            self._set_pending_guard(trade, state="RECONCILIATION_REQUIRED",
+                                    reconciliation_reason="CANCEL_UNCONFIRMED")
+            return False
+
+        trade["entry_status"] = "CANCELED"
+        trade["exit_status"] = "CANCELED"
+        trade["exit_reason"] = "STALE_SETUP_CANCELLED"
+        self._set_pending_guard(trade, state="STALE_SETUP_CANCELLED",
+                                cancel_confirmed_at=datetime.now(timezone.utc).isoformat())
+        print(f"  {trade['symbol']:<10} ✅ Stale pending entry canceled after exchange re-check.")
+        return True
 
     def check_positions(self, verbose: bool = False, mode: str = "all",
                         recover_unprotected: bool = False) -> None:
@@ -225,7 +339,21 @@ class SpotPositionMonitor:
                             f" | SL: {ca._fmt_price(trade.get('sl')).strip()}"
                             f" | TP: {ca._fmt_price(trade.get('tp1')).strip()}"
                         )
-    
+
+                # ── Step 1.5: stale unfilled-entry guard ────────────────
+                # This never re-prices/chases a limit buy.  In its default
+                # shadow mode it only records what would be canceled.
+                if entry_status == "NEW" and price_map.get(sym) is not None:
+                    before_guard = dict(trade.get("raw_entry_order") or {})
+                    terminalized = self._handle_stale_pending_entry(
+                        trade, price_map[sym]
+                    )
+                    if trade.get("raw_entry_order") != before_guard:
+                        log_dirty = True
+                    if terminalized:
+                        log_dirty = True
+                        continue
+
                 # ── Step 2: Place OCO if filled and no OCO yet ─────────────
                 if entry_status == "FILLED" and not trade.get("oco_placed"):
                     print(f"  {sym:<10} ✅ FILLED — placing OCO...")
@@ -697,6 +825,7 @@ class SpotPositionMonitor:
                     "realized_pnl_usd":           ot.get("realized_pnl_usd"),
                     "realized_pnl_pct":           ot.get("realized_pnl_pct"),
                     "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
+                    "raw_entry_order":            ot.get("raw_entry_order"),
                 })
                 # Persist oco_reconciliation_status separately — requires
                 # the column to exist in trades_spot (see docs/migrations/).

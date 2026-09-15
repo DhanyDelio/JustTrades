@@ -405,7 +405,11 @@ def load_trade_data() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT", "CANCELED"])
+    status = df["exit_status"].fillna("").astype(str).str.upper()
+    # A never-filled entry cancellation is operationally resolved, but it is
+    # not a trade outcome and must never enter PnL/win-rate research.
+    df["is_resolved"] = status.isin(["TP_HIT", "SL_HIT", "CANCELED"])
+    df["is_outcome"] = status.isin(["TP_HIT", "SL_HIT"])
     df["is_win"]      = df["realized_pnl_usd"].gt(0)
 
     def parse_epoch_ms(series):
@@ -438,14 +442,14 @@ def load_trade_data() -> pd.DataFrame:
 
 
 def build_metrics(df: pd.DataFrame):
-    resolved        = df[df["is_resolved"]].copy()
+    resolved        = df[df["is_outcome"]].copy()
     total_trades    = int(len(df))
     resolved_trades = int(len(resolved))
     win_rate        = round((resolved["is_win"].mean() * 100) if resolved_trades else 0.0, 2)
     total_realized_pnl = round(float(resolved["realized_pnl_usd"].sum()) if resolved_trades else 0.0, 2)
 
     cluster_mask = df["correlation_cluster_id"].notna()
-    cluster_pnl  = float(df.loc[cluster_mask & df["is_resolved"], "realized_pnl_usd"].sum()) if cluster_mask.any() else 0.0
+    cluster_pnl  = float(df.loc[cluster_mask & df["is_outcome"], "realized_pnl_usd"].sum()) if cluster_mask.any() else 0.0
     lab_capital  = STARTING_LAB_CAPITAL + cluster_pnl
 
     cluster_ids  = resolved["correlation_cluster_id"].dropna().unique()
@@ -463,7 +467,7 @@ def build_metrics(df: pd.DataFrame):
 
 
 def build_equity_curve(df: pd.DataFrame):
-    resolved = df[df["is_resolved"]].copy()
+    resolved = df[df["is_outcome"]].copy()
     if resolved.empty:
         return None
 
@@ -490,7 +494,7 @@ def build_equity_curve(df: pd.DataFrame):
 
 
 def build_symbol_pnl(df: pd.DataFrame):
-    resolved = df[df["is_resolved"]].copy()
+    resolved = df[df["is_outcome"]].copy()
     if resolved.empty:
         return None
 
@@ -509,7 +513,7 @@ def build_symbol_pnl(df: pd.DataFrame):
 
 
 def build_hourly_charts(df: pd.DataFrame):
-    resolved = df[df["is_resolved"]].copy()
+    resolved = df[df["is_outcome"]].copy()
     if resolved.empty:
         return None, None
 
