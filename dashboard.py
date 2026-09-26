@@ -16,7 +16,10 @@ from pathlib import Path
 from services.supabase_client import fetch_all_spot, fetch_all_futures, fetch_heartbeat
 from services.timing_logger import log_timing
 from streamlit_autorefresh import st_autorefresh
-from dashboard_ml_metadata import load_ml_shadow_display_metadata
+from dashboard_ml_metadata import (
+    load_ml_shadow_display_metadata,
+    split_ml_shadow_rows,
+)
 
 
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
@@ -2187,31 +2190,46 @@ def main():
         if df_spot_ml.empty:
             st.info("No spot trades found.")
         else:
-            has_ml = df_spot_ml["ml_score"].notna()
-            scored = df_spot_ml[has_ml].copy()
-            unscored = df_spot_ml[~has_ml].copy()
+            scored, legacy_scored, unscored = split_ml_shadow_rows(
+                df_spot_ml,
+                ml_display["version"],
+            )
+            historical_resolved = df_spot_ml[
+                df_spot_ml["exit_status"].fillna("").astype(str).str.upper()
+                .isin(["TP_HIT", "SL_HIT"])
+            ]
 
             st.divider()
 
             # ── KPIs ─────────────────────────────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Scored Trades", len(scored))
-            m2.metric("Unscored (Legacy)", len(unscored))
+            m1.metric("V3 Scored Trades", len(scored))
 
             scored_resolved = scored[scored["is_resolved"]].copy()
+            m2.metric("V3 Resolved", len(scored_resolved))
             if not scored_resolved.empty:
                 scored_wr = scored_resolved["is_win"].mean() * 100
                 avg_score = scored["ml_score"].mean()
-                m3.metric("Scored Win Rate", f"{scored_wr:.1f}%")
-                m4.metric("Avg ML Score", f"{avg_score:.3f}")
+                m3.metric("V3 Win Rate", f"{scored_wr:.1f}%")
+                m4.metric("Avg V3 Score", f"{avg_score:.3f}")
             else:
-                m3.metric("Scored Win Rate", "—")
-                m4.metric("Avg ML Score", f"{scored['ml_score'].mean():.3f}" if not scored.empty else "—")
+                m3.metric("V3 Win Rate", "—")
+                m4.metric("Avg V3 Score", f"{scored['ml_score'].mean():.3f}" if not scored.empty else "—")
+
+            st.caption(
+                f"Forward V3 only · Pending outcomes: {len(scored) - len(scored_resolved)} · "
+                f"Legacy model scores excluded: {len(legacy_scored)} · "
+                f"Unscored trades: {len(unscored)} · "
+                f"Historical TP/SL outcomes available to research/training: {len(historical_resolved)}"
+            )
 
             st.divider()
 
             if scored_resolved.empty:
-                st.warning("No resolved trades with ML scores yet. Waiting for more data...")
+                st.warning(
+                    "No resolved forward trades scored by ML V3 yet. "
+                    "Legacy V1/V2 scores are intentionally excluded."
+                )
             else:
                 col_left, col_right = st.columns(2)
 
