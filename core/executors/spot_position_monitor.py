@@ -270,12 +270,46 @@ class SpotPositionMonitor:
                         )
                     elif _purged and local_status in ("NEW", "PARTIALLY_FILLED", ""):
                         # Pending entry order purged — cannot confirm fill.
-                        entry_status = local_status or "UNKNOWN"
-                        trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
-                        log_dirty = True
+                        # IMPORTANT: persist this state to Supabase immediately so:
+                        #   (a) the next cycle does not re-detect and loop silently forever
+                        #   (b) the portfolio slot is released (entry_status=RECONCILIATION_REQUIRED
+                        #       is excluded from deployed_count by portfolio_manager)
+                        # Idempotent: skip the write if already RECONCILIATION_REQUIRED.
+                        _already_recon = (local_status == "RECONCILIATION_REQUIRED")
+                        if not _already_recon:
+                            trade["entry_status"] = "RECONCILIATION_REQUIRED"
+                            # Also set oco_reconciliation_status for backward-compat
+                            # with any code that reads this field for display/audit.
+                            trade["oco_reconciliation_status"] = "RECONCILIATION_REQUIRED"
+                            # Record audit trail in raw_entry_order
+                            _raw_recon = dict(trade.get("raw_entry_order") or {})
+                            _raw_recon["reconciliation_required_at"] = (
+                                datetime.now(timezone.utc).isoformat()
+                            )
+                            _raw_recon["reconciliation_reason"] = (
+                                "ENTRY_ORDER_NOT_FOUND_ON_EXCHANGE"
+                            )
+                            _raw_recon["reconciliation_exchange_error"] = err_str[:120]
+                            trade["raw_entry_order"] = _raw_recon
+                            log_dirty = True
+                            # Persist immediately — do not wait for end-of-cycle save.
+                            try:
+                                from services.supabase_client import update_spot_by_order_id
+                                update_spot_by_order_id(eid, {
+                                    "entry_status":    "RECONCILIATION_REQUIRED",
+                                    "raw_entry_order": _raw_recon,
+                                })
+                            except Exception as _persist_exc:
+                                # Non-fatal: in-memory state is updated; end-of-cycle
+                                # save will retry. Never block the monitoring loop.
+                                print(
+                                    f"  {sym:<10} ⚠ RECONCILIATION_REQUIRED persist failed "
+                                    f"(will retry): {_persist_exc}"
+                                )
                         print(
-                            f"  {sym:<10} ⚠ Entry order {eid} not found, "
-                            f"local_status={local_status!r}. RECONCILIATION_REQUIRED."
+                            f"  {sym:<10} ⚠ Entry order {eid} not found "
+                            f"({'already ' if _already_recon else ''}RECONCILIATION_REQUIRED), "
+                            f"local_status={local_status!r}. Portfolio slot released."
                         )
                         continue
                     else:

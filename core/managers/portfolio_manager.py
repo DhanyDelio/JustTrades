@@ -57,10 +57,17 @@ class PortfolioManager:
     
         lab_capital = self.lab_starting_capital + closed_cluster_pnl
     
-        # Deployed capital: open clustered trades
+        # Deployed capital: open clustered trades whose entry is not cancelled or
+        # reconciliation-required. entry_status=CANCELED means the limit order never
+        # filled; entry_status=RECONCILIATION_REQUIRED means the exchange confirmed
+        # the order is gone but we cannot determine what happened. In both cases
+        # capital was never committed, so these rows must not block new proposals.
+        _INACTIVE_ENTRY_STATUSES = {"CANCELED", "RECONCILIATION_REQUIRED"}
         deployed_count = sum(
             1 for t in trades
-            if t.get("correlation_cluster_id") and t.get("exit_status") == "OPEN"
+            if t.get("correlation_cluster_id")
+            and t.get("exit_status") == "OPEN"
+            and t.get("entry_status") not in _INACTIVE_ENTRY_STATUSES
         )
         deployed_capital = deployed_count * self.per_trade_budget
     
