@@ -389,96 +389,239 @@ class SpotPositionMonitor:
                         continue
 
                 # ── Step 2: Place OCO if filled and no OCO yet ─────────────
-                if entry_status == "FILLED" and not trade.get("oco_placed"):
-                    print(f"  {sym:<10} ✅ FILLED — placing OCO...")
-                    oco_resp, last_err = None, None
+                #
+                # place_oco_order now returns a structured dict:
+                #   {"protection_state": FULLY_PROTECTED|TP_ONLY|SL_ONLY|UNPROTECTED,
+                #    "oco_resp": dict|None, "tp_order_id": int|None,
+                #    "sl_order_id": int|None, "filter_reason": str|None,
+                #    "_market_sold": bool}
+                #
+                # oco_placed=True is ONLY set for FULLY_PROTECTED (real OCO list).
+                # TP_ONLY / SL_ONLY set their own fields and oco_reconciliation_status.
+                # UNPROTECTED stores the state so next cycle can retry.
+                # No-spam idempotency: skip this whole Step 2 block if the trade
+                # already has a partial-protection state from a prior cycle AND the
+                # prices have not changed — the next-cycle recovery in Step 3.5 handles
+                # the upgrade attempt.
+                _partial_states = {"TP_ONLY", "SL_ONLY", "UNPROTECTED"}
+                _already_partial = trade.get("oco_reconciliation_status") in _partial_states
+                if entry_status == "FILLED" and not trade.get("oco_placed") and not _already_partial:
+                    print(f"  {sym:<10} ✅ FILLED — placing protection orders...")
+                    prot_result, last_err = None, None
                     for attempt in range(1, 3):
                         try:
-                            oco_resp = self.order_executor.place_oco_order(trade)
+                            prot_result = self.order_executor.place_oco_order(trade)
                             break
                         except RuntimeError as e:
                             last_err = e
                             if attempt < 2:
                                 import time; time.sleep(3)
-    
-                    # ── Market-sell path: place_oco_order already sold the position ──
-                    # trade["_market_sold"] is set by the emergency market-sell branch.
-                    # Update the log as SL_HIT and skip ALL further OCO logic for this trade.
-                    if trade.get("_market_sold"):
-                        entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
-                        exit_px    = float(oco_resp.get("fills", [{}])[0].get("price", 0) or 0) \
-                                     if oco_resp and oco_resp.get("fills") else None
-                        # Fallback: use cummulativeQuoteQty / executedQty
-                        if not exit_px and oco_resp:
-                            exec_qty  = float(oco_resp.get("executedQty", 0) or 0)
-                            cum_quote = float(oco_resp.get("cummulativeQuoteQty", 0) or 0)
-                            exit_px   = cum_quote / exec_qty if exec_qty > 0 else None
-                        if not exit_px:
-                            exit_px = trade["sl"]   # conservative fallback
-                        pnl_usd = (exit_px - entry_fill) * trade["entry_qty"]
-                        pnl_pct = pnl_usd / trade.get("entry_notional", 1) * 100
-                        # exit_time: use transactTime from market sell response (accurate)
-                        # fallback to updateTime, then entry_fill_time + small offset
-                        exit_ts = (
-                            oco_resp.get("transactTime")
-                            or oco_resp.get("updateTime")
-                            if oco_resp else None
-                        )
-                        if not exit_ts:
-                            exit_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-                        trade["exit_status"]      = "SL_HIT"
-                        trade["exit_price"]       = round(exit_px, 6)
-                        trade["exit_time"]        = int(exit_ts)
-                        trade["exit_reason"]      = "SL_HIT"
-                        trade["realized_pnl_usd"] = round(pnl_usd, 4)
-                        trade["realized_pnl_pct"] = round(pnl_pct, 2)
-                        # time_to_resolution_sec from fill to market sell
-                        fill_t = trade.get("entry_fill_time")
-                        if fill_t:
-                            trade["time_to_resolution_sec"] = (int(exit_ts) - int(fill_t)) // 1000
-                        trade["oco_placed"]       = False
-                        trade["oco_list_id"]      = None
-                        trade.pop("_market_sold", None)
-                        log_dirty = True
-                        resolved_this_run.append((sym, "SL_HIT", pnl_usd))
-                        self._eager_commit(trade)
-                        print(f"  {sym:<10} 🔴 Emergency market sell — SL_HIT logged  PnL: ${pnl_usd:+.4f}")
-                        continue   # ← skip OCO placement and Step 3 entirely
-    
-                    if oco_resp:
-                        oco_orders = oco_resp.get("orderReports", [])
-                        trade["oco_placed"]    = True
-                        trade["oco_order_ids"] = [o["orderId"] for o in oco_orders]
-                        trade["oco_list_id"]   = oco_resp.get("orderListId")
-                        log_dirty = True
-                        
-                        from services.supabase_client import update_spot_by_order_id
-                        eid = trade.get("entry_order_id")
-                        if eid:
-                            update_spot_by_order_id(eid, {
-                                "entry_status":          trade.get("entry_status"),
-                                "entry_fill_price":      trade.get("entry_fill_price"),
-                                "entry_fill_time":       trade.get("entry_fill_time"),
-                                "entry_qty":             trade.get("entry_qty"),
-                                "slippage_pct":          trade.get("slippage_pct"),
-                                "oco_placed":            True,
-                                "oco_order_ids":         trade.get("oco_order_ids"),
-                                "oco_list_id":           trade.get("oco_list_id"),
-                            })
-                            
-                        print(f"  {sym:<10} ✅ OCO placed  List#{trade['oco_list_id']}")
-                    else:
+
+                    if prot_result is None:
+                        # Both attempts raised RuntimeError — show critical banner
                         print(
                             f"\n  {'!'*60}\n"
-                            f"  !! CRITICAL: OCO FAILED for {sym} — POSITION UNPROTECTED !!\n"
+                            f"  !! CRITICAL: Protection FAILED for {sym} — UNPROTECTED !!\n"
                             f"  !! Error: {str(last_err)[:48]:<50}!!\n"
                             f"  !! SL: {ca._fmt_price(trade['sl']).strip():<30} "
                             f"TP: {ca._fmt_price(trade['tp1']).strip():<20}!!\n"
                             f"  !! Fix manually at testnet.binance.vision              !!\n"
                             f"  {'!'*60}\n"
                         )
+                        trade["oco_reconciliation_status"] = "UNPROTECTED"
+                        log_dirty = True
+                        from services.supabase_client import update_spot_by_order_id
+                        try:
+                            update_spot_by_order_id(eid, {"oco_reconciliation_status": "UNPROTECTED"})
+                        except Exception:
+                            pass
                         import atexit
                         atexit.register(lambda: sys.exit(2))
+
+                    else:
+                        # ── Backward-compat: normalize raw exchange dict (from mocks /
+                        # legacy code) to the new structured format ────────────────
+                        if isinstance(prot_result, dict) and "protection_state" not in prot_result:
+                            # Raw OCO response (orderListId present) → FULLY_PROTECTED
+                            prot_result = {
+                                "protection_state": "FULLY_PROTECTED",
+                                "oco_resp": prot_result,
+                                "tp_order_id": None,
+                                "sl_order_id": None,
+                                "filter_reason": None,
+                            }
+                        protection_state = prot_result.get("protection_state", "UNPROTECTED")
+                        _market_sold     = prot_result.get("_market_sold") or trade.get("_market_sold")
+
+                        # ── Market-sell path (price dropped to/below SL) ──────────
+                        if _market_sold:
+                            raw_resp   = prot_result.get("oco_resp") or {}
+                            entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+                            exit_px    = float(raw_resp.get("fills", [{}])[0].get("price", 0) or 0) \
+                                         if raw_resp.get("fills") else None
+                            if not exit_px and raw_resp:
+                                exec_qty  = float(raw_resp.get("executedQty", 0) or 0)
+                                cum_quote = float(raw_resp.get("cummulativeQuoteQty", 0) or 0)
+                                exit_px   = cum_quote / exec_qty if exec_qty > 0 else None
+                            if not exit_px:
+                                exit_px = trade["sl"]
+                            pnl_usd = (exit_px - entry_fill) * trade["entry_qty"]
+                            pnl_pct = pnl_usd / trade.get("entry_notional", 1) * 100
+                            exit_ts = (
+                                raw_resp.get("transactTime") or raw_resp.get("updateTime")
+                                or int(datetime.now(timezone.utc).timestamp() * 1000)
+                            )
+                            trade["exit_status"]      = "SL_HIT"
+                            trade["exit_price"]       = round(exit_px, 6)
+                            trade["exit_time"]        = int(exit_ts)
+                            trade["exit_reason"]      = "SL_HIT"
+                            trade["realized_pnl_usd"] = round(pnl_usd, 4)
+                            trade["realized_pnl_pct"] = round(pnl_pct, 2)
+                            fill_t = trade.get("entry_fill_time")
+                            if fill_t:
+                                trade["time_to_resolution_sec"] = (int(exit_ts) - int(fill_t)) // 1000
+                            trade["oco_placed"]       = False
+                            trade["oco_list_id"]      = None
+                            trade.pop("_market_sold", None)
+                            log_dirty = True
+                            resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+                            self._eager_commit(trade)
+                            print(f"  {sym:<10} 🔴 Emergency market sell — SL_HIT logged  PnL: ${pnl_usd:+.4f}")
+                            continue   # ← skip Step 3 entirely
+
+                        # ── FULLY_PROTECTED: standard OCO placed ──────────────────
+                        elif protection_state == "FULLY_PROTECTED":
+                            oco_resp   = prot_result.get("oco_resp") or {}
+                            oco_orders = oco_resp.get("orderReports", [])
+                            trade["oco_placed"]                = True
+                            trade["oco_order_ids"]             = [o["orderId"] for o in oco_orders]
+                            trade["oco_list_id"]               = oco_resp.get("orderListId")
+                            trade["oco_reconciliation_status"] = "FULLY_PROTECTED"
+                            log_dirty = True
+                            from services.supabase_client import update_spot_by_order_id
+                            update_spot_by_order_id(eid, {
+                                "entry_status":              trade.get("entry_status"),
+                                "entry_fill_price":          trade.get("entry_fill_price"),
+                                "entry_fill_time":           trade.get("entry_fill_time"),
+                                "entry_qty":                 trade.get("entry_qty"),
+                                "slippage_pct":              trade.get("slippage_pct"),
+                                "oco_placed":                True,
+                                "oco_order_ids":             trade.get("oco_order_ids"),
+                                "oco_list_id":               trade.get("oco_list_id"),
+                                "oco_reconciliation_status": "FULLY_PROTECTED",
+                            })
+                            print(f"  {sym:<10} ✅ OCO placed (FULLY_PROTECTED)  List#{trade['oco_list_id']}")
+
+                        # ── TP_ONLY: standalone TP LIMIT_MAKER placed; SL filter-invalid ─
+                        elif protection_state == "TP_ONLY":
+                            tp_order_id = prot_result.get("tp_order_id")
+                            trade["oco_placed"]                = False   # no OCO list
+                            trade["oco_list_id"]               = None
+                            trade["tp_order_id"]               = tp_order_id
+                            trade["oco_reconciliation_status"] = "TP_ONLY"
+                            log_dirty = True
+                            from services.supabase_client import update_spot_by_order_id
+                            update_spot_by_order_id(eid, {
+                                "entry_status":              trade.get("entry_status"),
+                                "entry_fill_price":          trade.get("entry_fill_price"),
+                                "entry_fill_time":           trade.get("entry_fill_time"),
+                                "entry_qty":                 trade.get("entry_qty"),
+                                "slippage_pct":              trade.get("slippage_pct"),
+                                "oco_placed":                False,
+                                "oco_reconciliation_status": "TP_ONLY",
+                                "tp_order_id":               tp_order_id,
+                            })
+                            _send_telegram(
+                                f"🟡 [SPOT] PARTIAL PROTECTION (TP_ONLY): {sym}\n"
+                                f"TP order placed (orderId={tp_order_id}). "
+                                f"SL {ca._fmt_price(trade.get('sl')).strip()} is filter-invalid "
+                                f"(PERCENT_PRICE_BY_SIDE).\n"
+                                f"SL value preserved — NOT shifted. "
+                                f"Recovery attempted next cycle if filter clears."
+                            )
+                            print(
+                                f"  {sym:<10} 🟡 TP_ONLY: standalone TP placed "
+                                f"(orderId={tp_order_id}), SL filter-invalid"
+                            )
+
+                        # ── SL_ONLY: standalone SL STOP_LOSS_LIMIT placed; TP filter-invalid ─
+                        elif protection_state == "SL_ONLY":
+                            sl_order_id = prot_result.get("sl_order_id")
+                            trade["oco_placed"]                = False
+                            trade["oco_list_id"]               = None
+                            trade["sl_order_id"]               = sl_order_id
+                            trade["oco_reconciliation_status"] = "SL_ONLY"
+                            log_dirty = True
+                            from services.supabase_client import update_spot_by_order_id
+                            update_spot_by_order_id(eid, {
+                                "entry_status":              trade.get("entry_status"),
+                                "entry_fill_price":          trade.get("entry_fill_price"),
+                                "entry_fill_time":           trade.get("entry_fill_time"),
+                                "entry_qty":                 trade.get("entry_qty"),
+                                "slippage_pct":              trade.get("slippage_pct"),
+                                "oco_placed":                False,
+                                "oco_reconciliation_status": "SL_ONLY",
+                                "sl_order_id":               sl_order_id,
+                            })
+                            _send_telegram(
+                                f"🟠 [SPOT] PARTIAL PROTECTION (SL_ONLY): {sym}\n"
+                                f"SL order placed (orderId={sl_order_id}). "
+                                f"TP {ca._fmt_price(trade.get('tp1')).strip()} is filter-invalid.\n"
+                                f"Recovery attempted next cycle if filter clears."
+                            )
+                            print(
+                                f"  {sym:<10} 🟠 SL_ONLY: standalone SL placed "
+                                f"(orderId={sl_order_id}), TP filter-invalid"
+                            )
+
+                        # ── UNPROTECTED: both legs invalid, no exchange call ───────
+                        else:  # UNPROTECTED
+                            filter_reason = prot_result.get("filter_reason", "UNKNOWN")
+                            trade["oco_placed"]                = False
+                            trade["oco_list_id"]               = None
+                            trade["oco_reconciliation_status"] = "UNPROTECTED"
+                            log_dirty = True
+                            from services.supabase_client import update_spot_by_order_id
+                            update_spot_by_order_id(eid, {
+                                "entry_status":              trade.get("entry_status"),
+                                "entry_fill_price":          trade.get("entry_fill_price"),
+                                "entry_fill_time":           trade.get("entry_fill_time"),
+                                "entry_qty":                 trade.get("entry_qty"),
+                                "slippage_pct":              trade.get("slippage_pct"),
+                                "oco_placed":                False,
+                                "oco_reconciliation_status": "UNPROTECTED",
+                            })
+                            _send_telegram(
+                                f"🚨 [SPOT] UNPROTECTED: {sym}\n"
+                                f"Both TP and SL fail PERCENT_PRICE_BY_SIDE filter ({filter_reason}).\n"
+                                f"No protection orders placed. Recovery attempted next cycle."
+                            )
+                            print(
+                                f"\n  {'!'*60}\n"
+                                f"  !! UNPROTECTED: {sym} — both legs filter-invalid ({filter_reason}) !!\n"
+                                f"  !! SL: {ca._fmt_price(trade['sl']).strip():<30} "
+                                f"TP: {ca._fmt_price(trade['tp1']).strip():<20}!!\n"
+                                f"  !! Recovery will be attempted next cycle               !!\n"
+                                f"  {'!'*60}\n"
+                            )
+
+                # ── Step 2b: Next-cycle recovery for partial protection states ──
+                # If the trade already has TP_ONLY / SL_ONLY / UNPROTECTED from a
+                # prior cycle, attempt to add the missing leg on this cycle.
+                # Idempotency: only attempts when the filter conditions may have changed
+                # (i.e. we don't spam every cycle when the symbol is genuinely stale).
+                # No-spam guard: use oco_reconciliation_status as the primary gate;
+                # a successful upgrade changes the status and stops future retries.
+                elif (entry_status == "FILLED"
+                      and not trade.get("oco_placed")
+                      and _already_partial):
+                    self._recover_partial_protection(
+                        trade, eid, log_dirty, resolved_this_run
+                    )
+                    # Re-read log_dirty in case recovery set it — use a reference trick
+                    # by checking if trade state changed (eager_commit already persisted).
+                    if trade.get("oco_reconciliation_status") == "FULLY_PROTECTED":
+                        log_dirty = True
     
                 # ── Step 3: Check OCO status ────────────────────────────────
                 prev_recon = trade.get("oco_reconciliation_status", "")
@@ -706,6 +849,48 @@ class SpotPositionMonitor:
                             f"  |  PnL: ${pnl_usd:+.2f}"
                         )
                         continue
+
+                    elif (sl_breached
+                          and not trade.get("oco_placed")
+                          and prev_recon in ("TP_ONLY", "SL_ONLY", "UNPROTECTED")):
+                        # ── Partial-protection SL breach: price guard for states
+                        # without a full OCO list.
+                        #
+                        # TP_ONLY: standalone LIMIT_MAKER at TP is live, but SL had
+                        #   no protection.  Price has now dropped to/below SL.
+                        # SL_ONLY: standalone STOP_LOSS_LIMIT exists but may not have
+                        #   triggered yet (e.g. exchange lag or testnet quirk).
+                        # UNPROTECTED: no protection at all.
+                        #
+                        # In all three cases, SL being breached means the risk
+                        # contract is violated and we must close immediately.
+                        # Use _emergency_close() which also checks balance first.
+                        if prev_recon != "UNPROTECTED_SL_BREACH":
+                            trade["oco_reconciliation_status"] = "UNPROTECTED_SL_BREACH"
+                            log_dirty = True
+                        print(
+                            f"  🚨 [{sym}] SL BREACH on {prev_recon}: "
+                            f"price {current:.6f} ≤ SL {sl_level:.6f}. "
+                            f"Executing emergency close."
+                        )
+                        if self._emergency_close(
+                                trade, current, resolved_this_run,
+                                exit_reason="UNPROTECTED_SL_BREACH"):
+                            log_dirty = True
+                            oco_str = "🔴 EMERGENCY_CLOSED"
+                            continue
+                        # _emergency_close() failed — alert and fall through
+                        entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+                        est_pnl    = trade.get("entry_qty", 0) * (current - entry_fill)
+                        if prev_recon != "UNPROTECTED_SL_BREACH":
+                            _send_telegram(
+                                f"🚨 [SPOT] SL BREACH ({prev_recon}): {sym}\n"
+                                f"Price {ca._fmt_price(current).strip()} below SL "
+                                f"{ca._fmt_price(trade.get('sl')).strip()}.\n"
+                                f"Emergency close FAILED — manual intervention required.\n"
+                                f"Est. loss: ${est_pnl:+.4f} USDT"
+                            )
+                        oco_str = "🚨 UNPROTECTED_SL_BREACH"
     
                 # Compact view: show PnL only for filled positions;
                 # for pending orders show distance to entry instead (more useful than "n/a")
@@ -1074,12 +1259,32 @@ class SpotPositionMonitor:
             return False
 
         try:
-            response = self.order_executor.place_oco_order(trade)
+            prot_result = self.order_executor.place_oco_order(trade)
         except RuntimeError as exc:
             print(f"  ⚠  [{sym}] Recovery failed: {exc}")
             return False
 
-        if trade.pop("_market_sold", False):
+        if prot_result is None:
+            # place_oco_order returned None — treat as failed recovery
+            trade["oco_reconciliation_status"] = "UNPROTECTED"
+            print(f"  ⚠  [{sym}] Recovery failed: place_oco_order returned None")
+            return False
+
+        # place_oco_order now returns a structured dict; unwrap it.
+        # Guard against legacy raw-dict returns (e.g. from mocks) and None.
+        if isinstance(prot_result, dict) and "protection_state" not in prot_result:
+            prot_result = {
+                "protection_state": "FULLY_PROTECTED",
+                "oco_resp": prot_result,
+                "tp_order_id": None,
+                "sl_order_id": None,
+                "filter_reason": None,
+            }
+        response       = prot_result.get("oco_resp") if isinstance(prot_result, dict) else prot_result
+        protection_state = prot_result.get("protection_state", "UNPROTECTED") if isinstance(prot_result, dict) else "FULLY_PROTECTED"
+        _market_sold   = (prot_result.get("_market_sold") if isinstance(prot_result, dict) else False) or trade.pop("_market_sold", False)
+
+        if _market_sold:
             exit_px = None
             fills = response.get("fills", []) if response else []
             if fills:
@@ -1119,6 +1324,50 @@ class SpotPositionMonitor:
 
         reports = response.get("orderReports", []) if response else []
         list_id = response.get("orderListId") if response else None
+
+        # If recovery returned a partial-protection state, record it and return True
+        # so the caller marks this cycle as "handled" (no more UNPROTECTED alerts).
+        if protection_state == "TP_ONLY":
+            tp_order_id = prot_result.get("tp_order_id") if isinstance(prot_result, dict) else None
+            trade.update({
+                "oco_placed": False,
+                "oco_list_id": None,
+                "tp_order_id": tp_order_id,
+                "oco_reconciliation_status": "TP_ONLY",
+            })
+            _send_telegram(
+                f"🟡 [SPOT] PARTIAL RECOVERY (TP_ONLY): {sym}\n"
+                f"TP order placed (orderId={tp_order_id}). "
+                f"SL {ca._fmt_price(trade.get('sl')).strip()} still filter-invalid.\n"
+                f"Will attempt full OCO next cycle."
+            )
+            print(f"  🟡 [{sym}] Recovery: TP_ONLY (orderId={tp_order_id})")
+            return True
+
+        if protection_state == "SL_ONLY":
+            sl_order_id = prot_result.get("sl_order_id") if isinstance(prot_result, dict) else None
+            trade.update({
+                "oco_placed": False,
+                "oco_list_id": None,
+                "sl_order_id": sl_order_id,
+                "oco_reconciliation_status": "SL_ONLY",
+            })
+            _send_telegram(
+                f"🟠 [SPOT] PARTIAL RECOVERY (SL_ONLY): {sym}\n"
+                f"SL order placed (orderId={sl_order_id}). "
+                f"TP {ca._fmt_price(trade.get('tp1')).strip()} still filter-invalid.\n"
+                f"Will attempt full OCO next cycle."
+            )
+            print(f"  🟠 [{sym}] Recovery: SL_ONLY (orderId={sl_order_id})")
+            return True
+
+        if protection_state == "UNPROTECTED" and not _market_sold:
+            # Recovery attempted but both legs still filter-invalid
+            trade["oco_reconciliation_status"] = "UNPROTECTED"
+            print(f"  ⚠  [{sym}] Recovery: still UNPROTECTED (both legs filter-invalid)")
+            return False
+
+        # FULLY_PROTECTED path: OCO list placed
         if not list_id:
             print(f"  ⚠  [{sym}] Recovery failed: exchange returned no OCO list id.")
             return False
@@ -1127,10 +1376,10 @@ class SpotPositionMonitor:
             "oco_placed": True,
             "oco_order_ids": [row["orderId"] for row in reports],
             "oco_list_id": list_id,
-            "oco_reconciliation_status": "PROTECTED",
+            "oco_reconciliation_status": "FULLY_PROTECTED",
         })
         _send_telegram(
-            f"🛡️ [SPOT] OCO RECOVERED: {sym}\n"
+            f"🛡️ [SPOT] OCO RECOVERED (FULLY_PROTECTED): {sym}\n"
             f"New OCO: {list_id}\n"
             f"SL: {ca._fmt_price(trade.get('sl')).strip()}  "
             f"TP: {ca._fmt_price(trade.get('tp1')).strip()}"
@@ -1139,5 +1388,274 @@ class SpotPositionMonitor:
         return True
     
     
+    def _recover_partial_protection(
+        self,
+        trade: dict,
+        eid: int,
+        log_dirty: bool,
+        resolved_this_run: list,
+    ) -> None:
+        """
+        Attempt to upgrade a TP_ONLY / SL_ONLY / UNPROTECTED position to
+        FULLY_PROTECTED on the next monitoring cycle.
+
+        Design:
+        - Called from Step 2b when the trade already has a partial-protection state
+          from a previous cycle and oco_placed is still False.
+        - Calls place_oco_order again; if conditions have improved (filter cleared,
+          price moved back inside the band) it will succeed.
+        - On success: updates trade in-place and persists to Supabase immediately.
+        - On failure (still partial or still unprotected): updates the state so the
+          dashboard shows the current reality but does NOT re-send Telegram alerts
+          if the state is unchanged (idempotent alert guard).
+        - Never shifts SL or TP values.
+
+        Cancel-before-replace protocol (Bug 1+2 fix):
+        - For TP_ONLY: before calling place_oco_order(), query the exchange for
+          trade["tp_order_id"].
+            * If FILLED → position exited at TP; resolve as TP_HIT immediately.
+            * If OPEN/NEW/PARTIALLY_FILLED → cancel it first, then proceed with
+              place_oco_order() so we don't create a duplicate SELL.
+            * If NOT_FOUND or already CANCELED → proceed directly (safe).
+        - Same logic for SL_ONLY using trade["sl_order_id"].
+        - This guarantees at most one open SELL order for the position at any time.
+        """
+        sym  = trade["symbol"]
+        prev = trade.get("oco_reconciliation_status")
+
+        # ── Cancel-before-replace: ensure no duplicate SELL order ─────────────
+        # For TP_ONLY and SL_ONLY states, a standalone order from a prior cycle
+        # may still be open on the exchange.  We MUST cancel it before placing any
+        # new order (OCO or standalone), otherwise we end up with two simultaneous
+        # SELL orders for the same position.
+        _standalone_order_id = None
+        if prev == "TP_ONLY":
+            _standalone_order_id = trade.get("tp_order_id")
+        elif prev == "SL_ONLY":
+            _standalone_order_id = trade.get("sl_order_id")
+
+        if _standalone_order_id:
+            try:
+                existing = self.client.get_order(
+                    symbol=sym, orderId=_standalone_order_id
+                )
+                existing_status = str(existing.get("status", "")).upper()
+
+                if existing_status == "FILLED":
+                    # Standalone order already filled — this is a TP_HIT (or SL_HIT
+                    # for SL_ONLY).  Resolve the trade now; no further order needed.
+                    exec_qty  = float(existing.get("executedQty", 0) or 1)
+                    cum_quote = float(existing.get("cummulativeQuoteQty", 0) or 0)
+                    exit_px   = cum_quote / exec_qty if (exec_qty > 0 and cum_quote > 0) \
+                                else float(existing.get("price", trade.get("tp1", 0)))
+                    exit_status = "SL_HIT" if prev == "SL_ONLY" else "TP_HIT"
+                    entry_fill  = trade.get("entry_fill_price") or trade["entry_price"]
+                    pnl_usd     = (exit_px - entry_fill) * float(trade.get("entry_qty", 0))
+                    pnl_pct     = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+                    exit_ts     = int(
+                        existing.get("updateTime")
+                        or datetime.now(timezone.utc).timestamp() * 1000
+                    )
+                    trade.update({
+                        "exit_status":      exit_status,
+                        "exit_price":       round(exit_px, 6),
+                        "exit_time":        exit_ts,
+                        "exit_reason":      exit_status,
+                        "realized_pnl_usd": round(pnl_usd, 4),
+                        "realized_pnl_pct": round(pnl_pct, 2),
+                        "oco_placed":       False,
+                        "oco_list_id":      None,
+                        "oco_reconciliation_status": "EMERGENCY_CLOSED",
+                    })
+                    fill_t = trade.get("entry_fill_time")
+                    if fill_t:
+                        trade["time_to_resolution_sec"] = (exit_ts - int(fill_t)) // 1000
+                    resolved_this_run.append((sym, exit_status, pnl_usd))
+                    self._eager_commit(trade)
+                    icon = "🟢" if exit_status == "TP_HIT" else "🔴"
+                    print(
+                        f"  {sym:<10} {icon} Standalone {prev} filled @ "
+                        f"{ca._fmt_price(exit_px).strip()} — resolved as {exit_status}  "
+                        f"PnL: ${pnl_usd:+.4f}"
+                    )
+                    _send_telegram(
+                        f"{icon} [SPOT] {exit_status} (standalone {prev}): {sym}\n"
+                        f"Exit @ {ca._fmt_price(exit_px).strip()}  "
+                        f"PnL: ${pnl_usd:+.4f} USDT"
+                    )
+                    return
+
+                elif existing_status in ("NEW", "PARTIALLY_FILLED"):
+                    # Cancel the open standalone order before placing a new one.
+                    print(
+                        f"  {sym:<10} ℹ Cancelling existing {prev} order "
+                        f"(orderId={_standalone_order_id}) before recovery attempt."
+                    )
+                    try:
+                        self.order_executor.cancel_order(sym, _standalone_order_id)
+                        print(f"  {sym:<10} ✅ Cancelled orderId={_standalone_order_id}")
+                    except RuntimeError as cancel_exc:
+                        # Cancel failed — abort recovery to avoid duplicate SELL risk.
+                        print(
+                            f"  ⚠  [{sym}] Recovery aborted: cancel of existing "
+                            f"{prev} order failed: {cancel_exc}"
+                        )
+                        return
+                # CANCELED, EXPIRED, NOT_FOUND → safe to proceed with new order
+
+            except Exception as query_exc:
+                err_str = str(query_exc)
+                # -2013 / Order does not exist → standalone order is gone; safe to proceed
+                if "-2013" in err_str or "Order does not exist" in err_str:
+                    print(
+                        f"  {sym:<10} ℹ {prev} order {_standalone_order_id} "
+                        f"not found on exchange — proceeding with fresh placement."
+                    )
+                else:
+                    # Unknown query error — abort to stay safe
+                    print(
+                        f"  ⚠  [{sym}] Recovery aborted: could not query {prev} "
+                        f"order {_standalone_order_id}: {query_exc}"
+                    )
+                    return
+
+        try:
+            prot_result = self.order_executor.place_oco_order(trade)
+        except RuntimeError as exc:
+            print(f"  ⚠  [{sym}] Partial-protection recovery failed: {exc}")
+            return
+
+        if prot_result is None:
+            return
+
+        # Backward-compat: normalize raw exchange dict to structured format
+        if isinstance(prot_result, dict) and "protection_state" not in prot_result:
+            prot_result = {
+                "protection_state": "FULLY_PROTECTED",
+                "oco_resp": prot_result,
+                "tp_order_id": None,
+                "sl_order_id": None,
+                "filter_reason": None,
+            }
+        protection_state = prot_result.get("protection_state", "UNPROTECTED")
+        _market_sold     = prot_result.get("_market_sold") or trade.pop("_market_sold", False)
+
+        if _market_sold:
+            # Emergency market sell — price dropped to/past SL during recovery attempt
+            raw_resp   = prot_result.get("oco_resp") or {}
+            entry_fill = trade.get("entry_fill_price") or trade["entry_price"]
+            exit_px    = None
+            fills = raw_resp.get("fills", [])
+            if fills:
+                exit_px = float(fills[0].get("price", 0) or 0)
+            if not exit_px and raw_resp:
+                exec_qty  = float(raw_resp.get("executedQty", 0) or 0)
+                cum_quote = float(raw_resp.get("cummulativeQuoteQty", 0) or 0)
+                exit_px   = cum_quote / exec_qty if exec_qty > 0 else None
+            exit_px = exit_px or trade["sl"]
+            pnl_usd = (exit_px - entry_fill) * float(trade.get("entry_qty", 0))
+            pnl_pct = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
+            exit_ts = int(
+                raw_resp.get("transactTime")
+                or raw_resp.get("updateTime")
+                or datetime.now(timezone.utc).timestamp() * 1000
+            )
+            trade.update({
+                "exit_status": "SL_HIT", "exit_price": round(exit_px, 6),
+                "exit_time": exit_ts, "exit_reason": "SL_HIT",
+                "realized_pnl_usd": round(pnl_usd, 4),
+                "realized_pnl_pct": round(pnl_pct, 2),
+                "oco_placed": False, "oco_list_id": None,
+            })
+            fill_t = trade.get("entry_fill_time")
+            if fill_t:
+                trade["time_to_resolution_sec"] = (exit_ts - int(fill_t)) // 1000
+            resolved_this_run.append((sym, "SL_HIT", pnl_usd))
+            self._eager_commit(trade)
+            print(f"  {sym:<10} 🔴 Emergency market sell (partial-protection recovery) PnL: ${pnl_usd:+.4f}")
+            return
+
+        from services.supabase_client import update_spot_by_order_id
+
+        if protection_state == "FULLY_PROTECTED":
+            oco_resp   = prot_result.get("oco_resp") or {}
+            oco_orders = oco_resp.get("orderReports", [])
+            list_id    = oco_resp.get("orderListId")
+            trade.update({
+                "oco_placed":                True,
+                "oco_order_ids":             [o["orderId"] for o in oco_orders],
+                "oco_list_id":               list_id,
+                "oco_reconciliation_status": "FULLY_PROTECTED",
+            })
+            update_spot_by_order_id(eid, {
+                "oco_placed":                True,
+                "oco_order_ids":             trade["oco_order_ids"],
+                "oco_list_id":               list_id,
+                "oco_reconciliation_status": "FULLY_PROTECTED",
+            })
+            _send_telegram(
+                f"🛡️ [SPOT] UPGRADED TO FULLY_PROTECTED: {sym}\n"
+                f"Previous state: {prev}. New OCO List#{list_id}.\n"
+                f"SL: {ca._fmt_price(trade.get('sl')).strip()}  "
+                f"TP: {ca._fmt_price(trade.get('tp1')).strip()}"
+            )
+            print(
+                f"  {sym:<10} ✅ FULLY_PROTECTED (upgraded from {prev})  List#{list_id}"
+            )
+
+        elif protection_state == "TP_ONLY":
+            tp_order_id = prot_result.get("tp_order_id")
+            new_state   = "TP_ONLY"
+            trade.update({
+                "oco_placed": False, "oco_list_id": None,
+                "tp_order_id": tp_order_id,
+                "oco_reconciliation_status": new_state,
+            })
+            update_spot_by_order_id(eid, {
+                "oco_placed": False,
+                "oco_reconciliation_status": new_state,
+                "tp_order_id": tp_order_id,
+            })
+            if prev != new_state:
+                _send_telegram(
+                    f"🟡 [SPOT] PARTIAL PROTECTION (TP_ONLY): {sym}\n"
+                    f"Previous state: {prev}. TP orderId={tp_order_id}. "
+                    f"SL still filter-invalid."
+                )
+            print(f"  {sym:<10} 🟡 TP_ONLY (orderId={tp_order_id})")
+
+        elif protection_state == "SL_ONLY":
+            sl_order_id = prot_result.get("sl_order_id")
+            new_state   = "SL_ONLY"
+            trade.update({
+                "oco_placed": False, "oco_list_id": None,
+                "sl_order_id": sl_order_id,
+                "oco_reconciliation_status": new_state,
+            })
+            update_spot_by_order_id(eid, {
+                "oco_placed": False,
+                "oco_reconciliation_status": new_state,
+                "sl_order_id": sl_order_id,
+            })
+            if prev != new_state:
+                _send_telegram(
+                    f"🟠 [SPOT] PARTIAL PROTECTION (SL_ONLY): {sym}\n"
+                    f"Previous state: {prev}. SL orderId={sl_order_id}. "
+                    f"TP still filter-invalid."
+                )
+            print(f"  {sym:<10} 🟠 SL_ONLY (orderId={sl_order_id})")
+
+        else:  # still UNPROTECTED
+            new_state = "UNPROTECTED"
+            trade["oco_reconciliation_status"] = new_state
+            update_spot_by_order_id(eid, {"oco_reconciliation_status": new_state})
+            if prev != new_state:
+                _send_telegram(
+                    f"🚨 [SPOT] STILL UNPROTECTED: {sym}\n"
+                    f"Both legs remain filter-invalid. Will retry next cycle."
+                )
+            print(f"  {sym:<10} ⚠ Still UNPROTECTED (both legs filter-invalid)")
+
+
     # ---------------------------------------------------------------------------
     # 9. MAIN — --propose and --check-positions

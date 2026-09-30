@@ -170,7 +170,7 @@ class TestScenario2_OcoMissingPriceAboveSl(unittest.TestCase):
         executor.place_oco_order.assert_called_once()
         self.assertTrue(trade["oco_placed"])
         self.assertEqual(trade["oco_list_id"], 9999)
-        self.assertEqual(trade["oco_reconciliation_status"], "PROTECTED")
+        self.assertEqual(trade["oco_reconciliation_status"], "FULLY_PROTECTED")
         self.assertEqual(trade["exit_status"], "OPEN")
 
     def test_failed_recovery_sets_unprotected_state(self):
@@ -776,3 +776,365 @@ class TestEagerCommitPreventsDoubleTelegram(unittest.TestCase):
             except Exception as e:
                 self.fail(f"_eager_commit raised unexpectedly: {e}")
         print("✓ _eager_commit: Supabase error swallowed silently")
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7 — TP_ONLY / SL_ONLY / UNPROTECTED lifecycle bug regressions
+#
+# Covers three bugs found during pre-commit audit:
+#   Bug 1: TP_ONLY idempotency — second cycle must NOT create a second
+#           standalone LIMIT_MAKER order when the first is still OPEN.
+#   Bug 2: TP_ONLY → FULLY_PROTECTED upgrade — existing standalone TP order
+#           must be CANCELLED before OCO is placed (no duplicate SELL).
+#   Bug 3: Price guard — SL breach on TP_ONLY / SL_ONLY / UNPROTECTED must
+#           trigger emergency close, not silently pass.
+# ---------------------------------------------------------------------------
+
+class TestScenario7_PartialProtectionLifecycleBugs(unittest.TestCase):
+    """
+    Tests:
+      7a. TP_ONLY idempotency — second cycle, SL still invalid:
+          existing OPEN tp_order is cancelled, then ONE new TP order placed.
+      7b. TP_ONLY → FULLY_PROTECTED upgrade:
+          existing OPEN tp_order cancelled BEFORE OCO placed (no duplicate SELL).
+      7c. TP_ONLY standalone order already FILLED → resolved as TP_HIT immediately,
+          place_oco_order must NOT be called.
+      7d. SL breach on TP_ONLY state → _emergency_close() triggered.
+      7e. SL breach on SL_ONLY state → _emergency_close() triggered.
+      7f. SL breach on UNPROTECTED state → _emergency_close() triggered.
+    """
+
+    # ── shared trade factory ────────────────────────────────────────────────
+
+    def _tp_only_trade(self, **overrides):
+        """A FILLED trade with TP_ONLY partial protection."""
+        t = {
+            "symbol": "AVAXUSDT", "direction": "long",
+            "entry_order_id": 1001, "entry_status": "FILLED",
+            "entry_price": 7.836, "entry_fill_price": 7.836,
+            "entry_fill_time": 1000000, "entry_qty": 1.53,
+            "entry_notional": 11.99, "exit_status": "OPEN",
+            "oco_placed": False, "oco_list_id": None,
+            "oco_reconciliation_status": "TP_ONLY",
+            "tp_order_id": 55001,   # existing standalone TP from prior cycle
+            "sl_order_id": None,
+            "sl": 7.58, "tp1": 11.799,
+            "realized_pnl_usd": None, "exit_reason": None,
+        }
+        t.update(overrides)
+        return t
+
+    def _sl_only_trade(self, **overrides):
+        t = self._tp_only_trade(
+            oco_reconciliation_status="SL_ONLY",
+            tp_order_id=None,
+            sl_order_id=55002,
+        )
+        t.update(overrides)
+        return t
+
+    def _unprotected_trade(self, **overrides):
+        t = self._tp_only_trade(
+            oco_reconciliation_status="UNPROTECTED",
+            tp_order_id=None,
+            sl_order_id=None,
+        )
+        t.update(overrides)
+        return t
+
+    def _run(self, trade, client, executor):
+        monitor = _make_monitor(client, executor)
+        with ExitStack() as s:
+            s.enter_context(patch.object(pte.repo, "load_trade_log",
+                                         return_value=[trade]))
+            s.enter_context(patch.object(pte.repo, "save_trade_log"))
+            s.enter_context(patch("services.supabase_client.update_spot_by_order_id"))
+            s.enter_context(patch("core.executors.spot_position_monitor._send_telegram"))
+            s.enter_context(patch("core.paper_trade_executor._send_telegram"))
+            s.enter_context(patch(
+                "core.managers.portfolio_manager.PortfolioManager.compute_lab_pool",
+                return_value=_POOL))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                monitor.check_positions()
+        return buf.getvalue()
+
+    # ── Test 7a: TP_ONLY idempotency — second cycle with SL still invalid ───
+
+    def test_7a_tp_only_second_cycle_cancels_existing_before_new(self):
+        """
+        Bug 1: When TP_ONLY recovery runs and SL is still filter-invalid,
+        the existing OPEN standalone TP order must be CANCELLED first,
+        then ONE new TP order is placed.  Total create_order calls = 1.
+        """
+        trade = self._tp_only_trade()   # tp_order_id=55001
+        executor = MagicMock()
+
+        # place_oco_order returns TP_ONLY again (SL still filter-invalid)
+        executor.place_oco_order.return_value = {
+            "protection_state": "TP_ONLY",
+            "oco_resp": None,
+            "tp_order_id": 55099,   # new order id from fresh placement
+            "sl_order_id": None,
+            "filter_reason": "SL_FILTER_INVALID",
+        }
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                if orderId == 1001:   # entry order
+                    return {"status": "FILLED", "executedQty": "1.53",
+                            "cummulativeQuoteQty": str(1.53 * 7.836),
+                            "price": "7.836", "updateTime": 1}
+                if orderId == 55001:  # existing standalone TP — still OPEN
+                    return {"status": "NEW", "executedQty": "0",
+                            "cummulativeQuoteQty": "0", "price": "11.80",
+                            "updateTime": 1}
+                return {"status": "UNKNOWN"}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "11.13"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "11.13"}
+            def v3_get_order_list(self, orderListId):
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        # cancel_order must have been called for the existing tp_order_id
+        executor.cancel_order.assert_called_once_with("AVAXUSDT", 55001)
+        # place_oco_order called once (after cancel)
+        executor.place_oco_order.assert_called_once()
+        # trade updated to new tp_order_id
+        self.assertEqual(trade["tp_order_id"], 55099)
+        self.assertEqual(trade["oco_reconciliation_status"], "TP_ONLY")
+        print("✓ Test 7a: OPEN tp_order cancelled before new TP placed (no duplicate)")
+
+    # ── Test 7b: TP_ONLY → FULLY_PROTECTED: existing TP cancelled before OCO
+
+    def test_7b_tp_only_upgrade_cancels_before_oco(self):
+        """
+        Bug 2: When SL becomes filter-valid and recovery returns FULLY_PROTECTED,
+        the existing standalone TP order must be CANCELLED before create_oco_order
+        is called.  Without cancel, two SELL orders would exist simultaneously.
+        """
+        trade = self._tp_only_trade()   # tp_order_id=55001
+
+        executor = MagicMock()
+        # place_oco_order succeeds with FULLY_PROTECTED (SL now filter-valid)
+        executor.place_oco_order.return_value = {
+            "protection_state": "FULLY_PROTECTED",
+            "oco_resp": {
+                "orderListId": 9001,
+                "orderReports": [{"orderId": 901}, {"orderId": 902}],
+            },
+            "tp_order_id": None,
+            "sl_order_id": None,
+            "filter_reason": None,
+        }
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                if orderId == 1001:
+                    return {"status": "FILLED", "executedQty": "1.53",
+                            "cummulativeQuoteQty": str(1.53 * 7.836),
+                            "price": "7.836", "updateTime": 1}
+                if orderId == 55001:  # existing standalone TP — still OPEN
+                    return {"status": "NEW", "executedQty": "0",
+                            "cummulativeQuoteQty": "0", "price": "11.80",
+                            "updateTime": 1}
+                return {"status": "UNKNOWN"}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "11.13"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "11.13"}
+            def v3_get_order_list(self, orderListId):
+                # After upgrade to FULLY_PROTECTED, Step 3 will poll oco_list_id=9001
+                if orderListId == 9001:
+                    return {"listOrderStatus": "EXECUTING", "orders": []}
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        # cancel_order must be called BEFORE place_oco_order
+        cancel_call_idx = None
+        place_call_idx  = None
+        for i, call in enumerate(executor.method_calls):
+            if call[0] == "cancel_order":
+                cancel_call_idx = i
+            if call[0] == "place_oco_order":
+                place_call_idx  = i
+        self.assertIsNotNone(cancel_call_idx, "cancel_order must be called")
+        self.assertIsNotNone(place_call_idx,  "place_oco_order must be called")
+        self.assertLess(cancel_call_idx, place_call_idx,
+                        "cancel_order must precede place_oco_order")
+        # trade upgraded to FULLY_PROTECTED
+        self.assertEqual(trade["oco_reconciliation_status"], "FULLY_PROTECTED")
+        self.assertTrue(trade["oco_placed"])
+        self.assertEqual(trade["oco_list_id"], 9001)
+        print("✓ Test 7b: existing TP cancelled before OCO placed (no duplicate SELL)")
+
+    # ── Test 7c: standalone TP already FILLED → resolve as TP_HIT
+
+    def test_7c_standalone_tp_filled_resolves_tp_hit(self):
+        """
+        Bug 2 (edge): if the standalone TP order already FILLED by the time
+        recovery runs, we should resolve the trade as TP_HIT immediately
+        WITHOUT calling place_oco_order at all.
+        """
+        trade = self._tp_only_trade()   # tp_order_id=55001
+
+        executor = MagicMock()
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                if orderId == 1001:
+                    return {"status": "FILLED", "executedQty": "1.53",
+                            "cummulativeQuoteQty": str(1.53 * 7.836),
+                            "price": "7.836", "updateTime": 1}
+                if orderId == 55001:  # standalone TP FILLED
+                    return {"status": "FILLED",
+                            "executedQty": "1.53",
+                            "cummulativeQuoteQty": str(1.53 * 11.80),
+                            "price": "11.80", "updateTime": 5000000}
+                return {"status": "UNKNOWN"}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "11.80"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "11.80"}
+            def v3_get_order_list(self, orderListId):
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        # place_oco_order must NOT be called — already resolved
+        executor.place_oco_order.assert_not_called()
+        # trade resolved as TP_HIT
+        self.assertEqual(trade["exit_status"], "TP_HIT")
+        self.assertIsNotNone(trade["realized_pnl_usd"])
+        self.assertGreater(trade["realized_pnl_usd"], 0,
+                           "Exit above entry should produce positive PnL")
+        print(f"✓ Test 7c: standalone TP FILLED → TP_HIT, PnL={trade['realized_pnl_usd']:+.4f}")
+
+    # ── Test 7d: SL breach on TP_ONLY → Step 2b market-sell path ─────────
+
+    def test_7d_sl_breach_on_tp_only_triggers_emergency_close(self):
+        """
+        Bug 3: when price drops below SL and state is TP_ONLY (no existing
+        standalone order, tp_order_id=None), _recover_partial_protection calls
+        place_oco_order which returns _market_sold=True (price ≤ SL path).
+        Verifies the trade is resolved as SL_HIT.
+        """
+        trade = self._tp_only_trade(tp_order_id=None)
+        executor = MagicMock()
+        executor.place_oco_order.return_value = {
+            "protection_state": "UNPROTECTED",
+            "oco_resp": {
+                "orderId": 66001, "status": "FILLED",
+                "executedQty": "1.53",
+                "cummulativeQuoteQty": str(1.53 * 7.50),
+                "transactTime": 9000000,
+            },
+            "tp_order_id": None, "sl_order_id": None,
+            "filter_reason": "PRICE_BELOW_SL",
+            "_market_sold": True,
+        }
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                return {"status": "FILLED", "executedQty": "1.53",
+                        "cummulativeQuoteQty": str(1.53 * 7.836),
+                        "price": "7.836", "updateTime": 1}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "7.50"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "7.50"}
+            def v3_get_order_list(self, orderListId):
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        executor.place_oco_order.assert_called_once()
+        self.assertEqual(trade["exit_status"], "SL_HIT")
+        self.assertIsNotNone(trade["realized_pnl_usd"])
+        print("✓ Test 7d: SL breach on TP_ONLY → market-sell path, resolved SL_HIT")
+
+    # ── Test 7e: SL breach on SL_ONLY → Step 2b market-sell path ──────────
+
+    def test_7e_sl_breach_on_sl_only_triggers_emergency_close(self):
+        """
+        Bug 3: SL breach on SL_ONLY (no existing order, sl_order_id=None).
+        place_oco_order returns _market_sold=True. Verifies SL_HIT resolution.
+        """
+        trade = self._sl_only_trade(sl_order_id=None)
+        executor = MagicMock()
+        executor.place_oco_order.return_value = {
+            "protection_state": "UNPROTECTED",
+            "oco_resp": {
+                "orderId": 66002, "status": "FILLED",
+                "executedQty": "1.53",
+                "cummulativeQuoteQty": str(1.53 * 7.50),
+                "transactTime": 9000001,
+            },
+            "tp_order_id": None, "sl_order_id": None,
+            "filter_reason": "PRICE_BELOW_SL",
+            "_market_sold": True,
+        }
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                return {"status": "FILLED", "executedQty": "1.53",
+                        "cummulativeQuoteQty": str(1.53 * 7.836),
+                        "price": "7.836", "updateTime": 1}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "7.50"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "7.50"}
+            def v3_get_order_list(self, orderListId):
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        executor.place_oco_order.assert_called_once()
+        self.assertEqual(trade["exit_status"], "SL_HIT")
+        self.assertIsNotNone(trade["realized_pnl_usd"])
+        print("✓ Test 7e: SL breach on SL_ONLY → market-sell path, resolved SL_HIT")
+
+    # ── Test 7f: SL breach on UNPROTECTED → Step 2b market-sell path ───────
+
+    def test_7f_sl_breach_on_unprotected_triggers_emergency_close(self):
+        """
+        Bug 3: UNPROTECTED state (both legs filter-invalid), price below SL.
+        place_oco_order returns _market_sold=True. Verifies SL_HIT resolution.
+        """
+        trade = self._unprotected_trade()
+        executor = MagicMock()
+        executor.place_oco_order.return_value = {
+            "protection_state": "UNPROTECTED",
+            "oco_resp": {
+                "orderId": 66003, "status": "FILLED",
+                "executedQty": "1.53",
+                "cummulativeQuoteQty": str(1.53 * 7.50),
+                "transactTime": 9000002,
+            },
+            "tp_order_id": None, "sl_order_id": None,
+            "filter_reason": "PRICE_BELOW_SL",
+            "_market_sold": True,
+        }
+
+        class _Client:
+            def get_order(self, symbol, orderId):
+                return {"status": "FILLED", "executedQty": "1.53",
+                        "cummulativeQuoteQty": str(1.53 * 7.836),
+                        "price": "7.836", "updateTime": 1}
+            def get_all_tickers(self):
+                return [{"symbol": "AVAXUSDT", "price": "7.50"}]
+            def get_symbol_ticker(self, symbol):
+                return {"price": "7.50"}
+            def v3_get_order_list(self, orderListId):
+                raise Exception("no OCO")
+
+        self._run(trade, _Client(), executor)
+
+        executor.place_oco_order.assert_called_once()
+        self.assertEqual(trade["exit_status"], "SL_HIT")
+        self.assertIsNotNone(trade["realized_pnl_usd"])
+        print("✓ Test 7f: SL breach on UNPROTECTED → market-sell path, resolved SL_HIT")

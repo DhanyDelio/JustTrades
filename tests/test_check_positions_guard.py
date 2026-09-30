@@ -780,7 +780,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
 
         executor.place_oco_order.assert_called_once_with(trade)
         self.assertEqual(trade["oco_list_id"], 9001)
-        self.assertEqual(trade["oco_reconciliation_status"], "PROTECTED")
+        self.assertEqual(trade["oco_reconciliation_status"], "FULLY_PROTECTED")
 
     def test_transient_oco_failures_never_enter_missing_or_recovery(self):
         from unittest.mock import MagicMock
@@ -826,7 +826,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
                     "entry_notional": 11.837, "exit_status": "OPEN",
                     "oco_placed": True, "oco_list_id": 645378,
                     "oco_order_ids": [951495, 951496],
-                    "oco_reconciliation_status": "PROTECTED",
+                    "oco_reconciliation_status": "FULLY_PROTECTED",
                     "sl": 0.1657, "tp1": 0.1810,
                     "realized_pnl_usd": None,
                 }
@@ -886,7 +886,7 @@ class CheckPositionsGuardTests(unittest.TestCase):
         executor.place_oco_order.assert_called_once_with(trade)
         self.assertTrue(trade["oco_placed"])
         self.assertEqual(trade["oco_list_id"], 9001)
-        self.assertEqual(trade["oco_reconciliation_status"], "PROTECTED")
+        self.assertEqual(trade["oco_reconciliation_status"], "FULLY_PROTECTED")
         notify.assert_called_once()
 
     def test_reset_recovery_market_sells_position_past_sl(self):

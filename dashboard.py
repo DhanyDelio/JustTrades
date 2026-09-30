@@ -1081,21 +1081,44 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
     oco_ok       = oco_placed and oco_list_id
     recon_status = trade.get("oco_reconciliation_status", "")
-    _oco_unprotected = recon_status in ("UNPROTECTED", "UNPROTECTED_SL_BREACH", "RECONCILIATION_REQUIRED")
-    if _oco_unprotected and recon_status == "UNPROTECTED_SL_BREACH":
+
+    # ── OCO badge: exchange-authoritative protection state ─────────────────────
+    # Priority (highest to lowest):
+    #   🚨 SL BREACH UNPROTECTED — price crossed SL with no protection
+    #   🚨 TP BREACH UNPROTECTED — price crossed TP with no protection
+    #   ⚠ OCO MISSING           — old unprotected / reconciliation states
+    #   🟡 TP ONLY               — standalone TP placed; SL filter-invalid
+    #   🟠 SL ONLY               — standalone SL placed; TP filter-invalid
+    #   ✅ OCO ✓ (FULLY_PROTECTED) — full OCO list active on exchange
+    #   ✅ OCO ✓ (legacy oco_ok)   — oco_placed=True + oco_list_id present
+    #   ⚠ NO OCO                 — filled but no protection at all
+    if recon_status == "UNPROTECTED_SL_BREACH":
         oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
                      f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
                      f"🚨 SL BREACH UNPROTECTED</span>")
-    elif _oco_unprotected:
+    elif recon_status == "UNPROTECTED_TP_BREACH":
+        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"🚨 TP BREACH UNPROTECTED</span>")
+    elif recon_status in ("UNPROTECTED", "RECONCILIATION_REQUIRED"):
         oco_badge = (f"<span style='background:#cc4400;color:#fff;border-radius:4px;"
                      f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"⚠ OCO MISSING</span>")
-    elif oco_ok:
+                     f"🚨 OCO MISSING</span>")
+    elif recon_status == "TP_ONLY":
+        oco_badge = (f"<span style='background:#8a6800;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"🟡 TP ONLY</span>")
+    elif recon_status == "SL_ONLY":
+        oco_badge = (f"<span style='background:#a04000;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"🟠 SL ONLY</span>")
+    elif recon_status == "FULLY_PROTECTED" or oco_ok:
         oco_badge = (f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
                      f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
     elif is_filled:
+        # Filled but no recon_status and no oco_placed — genuinely no protection
         oco_badge = (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em'>⚠ NO OCO</span>")
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
     else:
         oco_badge = ""
 
