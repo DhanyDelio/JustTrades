@@ -170,12 +170,14 @@ class TestSpotExitOrders(unittest.TestCase):
 
         # Harga saat ini berada di antara SL dan TP (kondisi ideal)
         mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
-        expected_resp = {"orderListId": 12345, "listStatusType": "EXEC_STARTED"}
-        mock_client.create_oco_order.return_value = expected_resp
+        exchange_resp = {"orderListId": 12345, "listStatusType": "EXEC_STARTED"}
+        mock_client.create_oco_order.return_value = exchange_resp
 
         result = executor.place_exit_orders(trade)
 
-        self.assertEqual(result, expected_resp)
+        # Result is now a structured dict — check protection_state and nested oco_resp
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertEqual(result["oco_resp"]["orderListId"], 12345)
         mock_client.create_oco_order.assert_called_once()
 
         # Verifikasi parameter OCO
@@ -245,7 +247,9 @@ class TestSpotExitOrders(unittest.TestCase):
 
         result = executor.place_exit_orders(trade)
 
-        self.assertEqual(result, expected_resp)
+        # Result is a structured dict — check protection_state + nested oco_resp
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertEqual(result["oco_resp"]["orderListId"], 99999)
         self.assertEqual(mock_client.create_oco_order.call_count, 2)
         print("✓ Percobaan 1 gagal (error -1013), retry otomatis.")
         print("✓ Percobaan 2 berhasil — OCO ditempatkan.")
@@ -279,6 +283,249 @@ class TestSpotExitOrders(unittest.TestCase):
         print("✓ Setelah 3x retry gagal, RuntimeError dilempar (TIDAK silent fail).")
         print(f"✓ Error message: {context.exception}")
 
+
+
+# =============================================================================
+# TEST: OCO API -1102 / -1013 REGRESSION (new format + error handling)
+# =============================================================================
+
+class TestOcoApiRegressions(unittest.TestCase):
+    """
+    Regression tests for the Binance Spot OCO API format fix.
+
+    Background:
+      - Binance Spot OCO API now requires aboveType/belowType (new format).
+      - Old format used price= / stopPrice= / stopLimitPrice= parameters.
+      - Error -1102 fires if mandatory aboveType/belowType are missing.
+      - Error -1013 PERCENT_PRICE_BY_SIDE fires when SL is structurally too far
+        from current price (outside the exchange price-band filter, e.g. < 80%
+        of avgPrice). Retrying this is futile — must fail-fast.
+      - Error -1013 PRICE_FILTER (different sub-type) is transient — retry allowed.
+
+    Tests:
+      1.  aboveType=LIMIT_MAKER and belowType=STOP_LOSS_LIMIT are always sent
+      2.  abovePrice maps to TP, belowStopPrice maps to SL trigger
+      3.  -1102 raises RuntimeError immediately (no retry)
+      4.  -1013 PERCENT_PRICE_BY_SIDE raises RuntimeError immediately (no retry)
+      5.  -1013 PRICE_FILTER retries (transient constraint — different sub-type)
+      6.  Normal SELL OCO succeeds and returns exchange response
+      7.  Partial fill quantity: qty from trade dict used, not hardcoded
+      8.  Duplicate/retry: if OCO already placed, no duplicate is created
+      9.  Exchange rejection on non-price error raises RuntimeError (no retry)
+    """
+
+    def _make_executor(self):
+        mock_client = MagicMock()
+        mock_client.get_symbol_info.return_value = {
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE",     "stepSize": "0.001"},
+            ]
+        }
+        return SpotOrderExecutor(mock_client), mock_client
+
+    def _make_trade(self, sl=59000.0, tp1=63000.0, qty=0.012567):
+        return {
+            "symbol":    "BTCUSDT",
+            "entry_qty": qty,
+            "sl":        sl,
+            "tp1":       tp1,
+        }
+
+    def _make_api_error(self, code: int, msg: str) -> "BinanceAPIException":
+        from binance.exceptions import BinanceAPIException
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 400
+        body = f'{{"code":{code},"msg":"{msg}"}}'
+        resp.text = body
+        resp.json.return_value = {"code": code, "msg": msg}
+        return BinanceAPIException(resp, 400, body)
+
+    # ── Test 1: New format — aboveType and belowType always sent ──────────────
+    def test_new_format_above_below_type_always_sent(self):
+        """aboveType=LIMIT_MAKER and belowType=STOP_LOSS_LIMIT must always be in payload."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=59000.0, tp1=63000.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        mock_client.create_oco_order.return_value = {"orderListId": 1}
+
+        executor.place_exit_orders(trade)
+
+        call_kwargs = mock_client.create_oco_order.call_args.kwargs
+        self.assertEqual(call_kwargs["aboveType"], "LIMIT_MAKER",
+                         "aboveType must be LIMIT_MAKER (TP leg)")
+        self.assertEqual(call_kwargs["belowType"], "STOP_LOSS_LIMIT",
+                         "belowType must be STOP_LOSS_LIMIT (SL leg)")
+        # Old format params must NOT be present
+        self.assertNotIn("price",          call_kwargs, "old 'price' param must not be sent")
+        self.assertNotIn("stopPrice",      call_kwargs, "old 'stopPrice' param must not be sent")
+        self.assertNotIn("stopLimitPrice", call_kwargs, "old 'stopLimitPrice' param must not be sent")
+        print("✓ Test 1: aboveType=LIMIT_MAKER, belowType=STOP_LOSS_LIMIT always sent; old params absent")
+
+    # ── Test 2: Price mapping — TP → abovePrice, SL trigger → belowStopPrice ──
+    def test_tp_maps_to_above_price_sl_maps_to_below_stop_price(self):
+        """TP price must go to abovePrice; SL trigger must go to belowStopPrice."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=59000.0, tp1=63000.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        mock_client.create_oco_order.return_value = {"orderListId": 2}
+
+        executor.place_exit_orders(trade)
+
+        kw = mock_client.create_oco_order.call_args.kwargs
+        # abovePrice = TP1 (rounded)
+        self.assertAlmostEqual(float(kw["abovePrice"]), 63000.0, places=1,
+                               msg="abovePrice must match TP1")
+        # belowStopPrice = SL trigger
+        self.assertAlmostEqual(float(kw["belowStopPrice"]), 59000.0, places=1,
+                               msg="belowStopPrice must match SL")
+        # belowPrice = SL limit (below trigger)
+        self.assertLess(float(kw["belowPrice"]), float(kw["belowStopPrice"]),
+                        "belowPrice (limit) must be below belowStopPrice (trigger)")
+        print(f"✓ Test 2: abovePrice={kw['abovePrice']} (TP), "
+              f"belowStopPrice={kw['belowStopPrice']} (SL trigger), "
+              f"belowPrice={kw['belowPrice']} (SL limit)")
+
+    # ── Test 3: -1102 raises immediately, no retry ────────────────────────────
+    @unittest.mock.patch("time.sleep", return_value=None)
+    def test_1102_raises_immediately_no_retry(self, _sleep):
+        """-1102 (missing mandatory param) must raise RuntimeError on first attempt, no retry."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade()
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        err_1102 = self._make_api_error(-1102,
+                       "Mandatory parameter 'aboveType' was not sent")
+        mock_client.create_oco_order.side_effect = err_1102
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_exit_orders(trade)
+
+        # Must have raised after exactly 1 call — no retry on -1102
+        self.assertEqual(mock_client.create_oco_order.call_count, 1,
+                         "-1102 must not be retried")
+        self.assertIn("-1102", str(ctx.exception))
+        _sleep.assert_not_called()
+        print(f"✓ Test 3: -1102 raises immediately after 1 attempt, no sleep/retry")
+
+    # ── Test 4: -1013 PERCENT_PRICE_BY_SIDE raises immediately, no retry ──────
+    @unittest.mock.patch("time.sleep", return_value=None)
+    def test_1013_percent_price_by_side_raises_immediately(self, _sleep):
+        """-1013 PERCENT_PRICE_BY_SIDE must raise immediately, not retry 3x."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=7580.0, tp1=12000.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "11000.00"}
+        err_percent = self._make_api_error(
+            -1013, "Filter failure: PERCENT_PRICE_BY_SIDE"
+        )
+        mock_client.create_oco_order.side_effect = err_percent
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_exit_orders(trade)
+
+        # Must NOT have retried — PERCENT_PRICE_BY_SIDE is structural, not transient
+        self.assertEqual(mock_client.create_oco_order.call_count, 1,
+                         "PERCENT_PRICE_BY_SIDE must not be retried")
+        _sleep.assert_not_called()
+        exc_msg = str(ctx.exception)
+        self.assertIn("PERCENT_PRICE_BY_SIDE", exc_msg)
+        print(f"✓ Test 4: -1013 PERCENT_PRICE_BY_SIDE → immediate RuntimeError, no retry")
+
+    # ── Test 5: -1013 PRICE_FILTER (transient) → retry allowed ───────────────
+    @unittest.mock.patch("time.sleep", return_value=None)
+    def test_1013_price_filter_transient_retries(self, _sleep):
+        """-1013 PRICE_FILTER (not PERCENT_PRICE_BY_SIDE) is transient — retry allowed."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=59000.0, tp1=63000.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        err_price = self._make_api_error(-1013, "Filter failure: PRICE_FILTER")
+        success   = {"orderListId": 5}
+        # First attempt fails with transient price filter, second succeeds
+        mock_client.create_oco_order.side_effect = [err_price, success]
+
+        result = executor.place_exit_orders(trade)
+
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertEqual(result["oco_resp"]["orderListId"], 5)
+        self.assertEqual(mock_client.create_oco_order.call_count, 2,
+                         "Transient -1013 PRICE_FILTER should be retried")
+        print("✓ Test 5: -1013 PRICE_FILTER retried; succeeded on attempt 2")
+
+    # ── Test 6: Normal SELL OCO success ───────────────────────────────────────
+    def test_normal_sell_oco_success(self):
+        """Happy path: normal OCO SELL with price between SL and TP."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=59000.0, tp1=63000.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        expected = {"orderListId": 99, "listStatusType": "EXEC_STARTED",
+                    "orderReports": [{"orderId": 1001}, {"orderId": 1002}]}
+        mock_client.create_oco_order.return_value = expected
+
+        result = executor.place_exit_orders(trade)
+
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertEqual(result["oco_resp"]["orderListId"], 99)
+        self.assertEqual(result["oco_resp"]["listStatusType"], "EXEC_STARTED")
+        kw = mock_client.create_oco_order.call_args.kwargs
+        self.assertEqual(kw["symbol"], "BTCUSDT")
+        self.assertEqual(kw["side"],   "SELL")
+        self.assertIn("belowTimeInForce", kw)
+        self.assertEqual(kw["belowTimeInForce"], "GTC")
+        print("✓ Test 6: Normal SELL OCO success; response parsed correctly")
+
+    # ── Test 7: Partial fill quantity — qty from trade dict ───────────────────
+    def test_partial_fill_quantity_used_from_trade(self):
+        """Quantity passed to exchange must come from trade['entry_qty']."""
+        executor, mock_client = self._make_executor()
+        # Non-standard partial quantity
+        trade = self._make_trade(sl=59000.0, tp1=63000.0, qty=0.007)
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        mock_client.create_oco_order.return_value = {"orderListId": 7}
+
+        executor.place_exit_orders(trade)
+
+        kw = mock_client.create_oco_order.call_args.kwargs
+        # qty_str is rounded to stepSize (0.001) so 0.007 stays 0.007
+        self.assertAlmostEqual(float(kw["quantity"]), 0.007, places=3,
+                               msg="Quantity must match trade['entry_qty']")
+        print(f"✓ Test 7: Partial fill qty {kw['quantity']} correctly taken from trade dict")
+
+    # ── Test 8: Duplicate/retry — no double OCO if first call succeeds ────────
+    def test_no_duplicate_oco_on_retry(self):
+        """
+        If place_exit_orders is called twice (e.g. after monitor restart),
+        it should not create a second OCO if the caller checks oco_placed first.
+        The executor itself does not guard against double-call — that guard lives
+        in the monitor. Verify that calling it twice makes two API calls (no
+        internal dedup at executor level), so the monitor's guard is relied upon.
+        """
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade()
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        mock_client.create_oco_order.return_value = {"orderListId": 8}
+
+        executor.place_exit_orders(trade)
+        executor.place_exit_orders(trade)
+
+        # Two calls → two OCO requests (dedup is monitor's responsibility)
+        self.assertEqual(mock_client.create_oco_order.call_count, 2)
+        print("✓ Test 8: Executor makes API call each time; dedup is monitor's responsibility")
+
+    # ── Test 9: Non-price exchange rejection → immediate RuntimeError ─────────
+    def test_non_price_rejection_raises_immediately(self):
+        """Non-price API errors (e.g. -2010 insufficient balance) raise immediately."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade()
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        err_balance = self._make_api_error(-2010, "Account has insufficient balance")
+        mock_client.create_oco_order.side_effect = err_balance
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_exit_orders(trade)
+
+        # Must raise on first attempt — no retry for non-price errors
+        self.assertEqual(mock_client.create_oco_order.call_count, 1)
+        self.assertIn("OCO placement failed", str(ctx.exception))
+        print("✓ Test 9: -2010 insufficient balance → immediate RuntimeError, no retry")
 
 
 # =============================================================================
@@ -793,6 +1040,379 @@ class TestLogTrade(unittest.TestCase):
         record = mock_upsert.call_args.args[0]
         self.assertEqual(record["budget_usd"], 24.0)
         print(f"✓ budget_usd={record['budget_usd']} (dari budget_for_slot override)")
+
+
+
+
+
+class TestPartialProtectionLifecycle(unittest.TestCase):
+    """
+    15 regression tests for the partial-protection lifecycle.
+
+    Scenarios:
+      1.  AVAXUSDT: SL filter-invalid, TP valid → TP_ONLY returned
+      2.  TP_ONLY: standalone LIMIT_MAKER order params verified
+      3.  SL_ONLY: TP filter-invalid, SL valid → SL_ONLY returned
+      4.  SL_ONLY: standalone STOP_LOSS_LIMIT order params verified
+      5.  UNPROTECTED: both legs filter-invalid → no exchange call
+      6.  FULLY_PROTECTED: both legs valid → standard OCO path unchanged
+      7.  Preflight no filter found → fallback to OCO path (FULLY_PROTECTED)
+      8.  get_avg_price failure → falls back to get_symbol_ticker for avgPrice
+      9.  Emergency market sell still takes priority over preflight (price ≤ SL)
+      10. TP already exceeded → adjust TP then re-check preflight (FULLY_PROTECTED)
+      11. TP_ONLY standalone order API failure → raises RuntimeError
+      12. SL_ONLY standalone order API failure → raises RuntimeError
+      13. UNPROTECTED state: trade["sl"] / trade["tp1"] not mutated
+      14. _check_percent_price_filter returns correct validity flags
+      15. PERCENT_PRICE_BY_SIDE post-preflight exchange rejection still fail-fast
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Import the real SpotOrderExecutor (not the base-class stub)
+        import importlib, types
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        module = importlib.import_module("core.executors.spot_order_executor")
+        cls.RealSpotOrderExecutor = module.SpotOrderExecutor
+
+    def _make_executor(self):
+        mock_client = MagicMock()
+        mock_client.get_symbol_info.return_value = {
+            "filters": [
+                {"filterType": "PRICE_FILTER",         "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE",             "stepSize": "0.001"},
+                {"filterType": "PERCENT_PRICE_BY_SIDE",
+                 "askMultiplierDown": "0.8",
+                 "askMultiplierUp":   "2.0",
+                 "avgPriceMins":      "5"},
+            ]
+        }
+        return self.RealSpotOrderExecutor(mock_client), mock_client
+
+    def _make_trade(self, sl=7.58, tp1=11.799, qty=1.53, symbol="AVAXUSDT"):
+        return {"symbol": symbol, "entry_qty": qty, "sl": sl, "tp1": tp1}
+
+    def _avax_state(self, mock_client, current=11.13, avg_price=None):
+        """Configure mock to reflect AVAXUSDT scenario (SL filter-invalid)."""
+        mock_client.get_symbol_ticker.return_value = {"price": str(current)}
+        mock_client.get_avg_price.return_value = {"price": str(avg_price or current)}
+
+    # ── Test 1: AVAXUSDT scenario → TP_ONLY ────────────────────────────────
+    def test_avax_sl_filter_invalid_returns_tp_only(self):
+        """
+        AVAXUSDT: entry 7.836, current 11.13, SL 7.58, TP1 11.799.
+        SL/avgPrice = 7.58/11.13 = 0.681 < askMultiplierDown=0.80 → SL invalid.
+        TP/avgPrice = 11.799/11.13 = 1.060 < askMultiplierUp=2.0  → TP valid.
+        Expected: TP_ONLY state, standalone LIMIT_MAKER order placed.
+        """
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=7.58, tp1=11.799, qty=1.53)
+        self._avax_state(mock_client, current=11.13)
+        mock_client.create_order.return_value = {"orderId": 55001, "status": "NEW"}
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "TP_ONLY")
+        self.assertEqual(result["tp_order_id"], 55001)
+        self.assertIsNone(result["sl_order_id"])
+        self.assertIsNone(result["oco_resp"])
+        self.assertEqual(result["filter_reason"], "SL_FILTER_INVALID")
+        mock_client.create_oco_order.assert_not_called()
+        print("✓ Test 1: AVAXUSDT SL filter-invalid → TP_ONLY, TP order placed")
+
+    # ── Test 2: TP_ONLY standalone order params ─────────────────────────────
+    def test_tp_only_order_uses_limit_maker(self):
+        """Standalone TP order must be LIMIT_MAKER SELL with correct price."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=7.58, tp1=11.799)
+        self._avax_state(mock_client, current=11.13)
+        mock_client.create_order.return_value = {"orderId": 55002}
+
+        executor.place_oco_order(trade)
+
+        kw = mock_client.create_order.call_args.kwargs
+        self.assertEqual(kw["side"],   "SELL")
+        self.assertEqual(kw["type"],   "LIMIT_MAKER")
+        self.assertAlmostEqual(float(kw["price"]), 11.8, places=0)
+        self.assertNotIn("stopPrice", kw, "LIMIT_MAKER must not have stopPrice")
+        print(f"✓ Test 2: TP_ONLY order type=LIMIT_MAKER price={kw['price']}")
+
+    # ── Test 3: SL_ONLY state when TP fails filter ──────────────────────────
+    def test_sl_only_returned_when_tp_fails_filter(self):
+        """TP far above current (askMultiplierUp exceeded) → SL_ONLY."""
+        executor, mock_client = self._make_executor()
+        # TP at 30.0 / avgPrice 11.13 = 2.69 > askMultiplierUp=2.0 → TP invalid
+        # SL at 10.5 / avgPrice 11.13 = 0.94 > askMultiplierDown=0.8 → SL valid
+        trade = self._make_trade(sl=10.5, tp1=30.0, qty=1.0)
+        self._avax_state(mock_client, current=11.13)
+        mock_client.create_order.return_value = {"orderId": 55003}
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "SL_ONLY")
+        self.assertEqual(result["sl_order_id"], 55003)
+        self.assertIsNone(result["tp_order_id"])
+        self.assertEqual(result["filter_reason"], "TP_FILTER_INVALID")
+        mock_client.create_oco_order.assert_not_called()
+        print("✓ Test 3: TP filter-invalid → SL_ONLY, SL order placed")
+
+    # ── Test 4: SL_ONLY order params ────────────────────────────────────────
+    def test_sl_only_order_uses_stop_loss_limit(self):
+        """Standalone SL order must be STOP_LOSS_LIMIT with stopPrice and price."""
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=10.5, tp1=30.0, qty=1.0)
+        self._avax_state(mock_client, current=11.13)
+        mock_client.create_order.return_value = {"orderId": 55004}
+
+        executor.place_oco_order(trade)
+
+        kw = mock_client.create_order.call_args.kwargs
+        self.assertEqual(kw["side"],        "SELL")
+        self.assertEqual(kw["type"],        "STOP_LOSS_LIMIT")
+        self.assertEqual(kw["timeInForce"], "GTC")
+        self.assertIn("stopPrice", kw, "STOP_LOSS_LIMIT must have stopPrice")
+        self.assertIn("price",     kw, "STOP_LOSS_LIMIT must have limit price")
+        self.assertLess(float(kw["price"]), float(kw["stopPrice"]),
+                        "limit price must be below stop trigger")
+        print(f"✓ Test 4: SL_ONLY order type=STOP_LOSS_LIMIT "
+              f"stopPrice={kw['stopPrice']} price={kw['price']}")
+
+    # ── Test 5: UNPROTECTED when both legs fail filter ───────────────────────
+    def test_unprotected_when_both_legs_fail_filter(self):
+        """Both TP and SL outside filter → UNPROTECTED, no exchange order placed."""
+        executor, mock_client = self._make_executor()
+        # SL too low (0.681), TP too high (3.0) — both outside band
+        trade = self._make_trade(sl=7.58, tp1=35.0, qty=1.53)
+        self._avax_state(mock_client, current=11.13)
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "UNPROTECTED")
+        self.assertIsNone(result["oco_resp"])
+        self.assertIsNone(result["tp_order_id"])
+        self.assertIsNone(result["sl_order_id"])
+        self.assertEqual(result["filter_reason"], "BOTH_LEGS_FILTER_INVALID")
+        mock_client.create_order.assert_not_called()
+        mock_client.create_oco_order.assert_not_called()
+        print("✓ Test 5: Both legs filter-invalid → UNPROTECTED, no exchange call")
+
+    # ── Test 6: FULLY_PROTECTED when both legs valid ─────────────────────────
+    def test_fully_protected_when_both_legs_valid(self):
+        """Both legs within filter → FULLY_PROTECTED, standard OCO placed."""
+        executor, mock_client = self._make_executor()
+        # current=10.0, avgPrice=10.0, SL=9.0 (0.9>0.8 ✓), TP=11.5 (1.15<2.0 ✓)
+        trade = self._make_trade(sl=9.0, tp1=11.5, qty=1.0)
+        mock_client.get_symbol_ticker.return_value = {"price": "10.0"}
+        mock_client.get_avg_price.return_value = {"price": "10.0"}
+        mock_client.create_oco_order.return_value = {
+            "orderListId": 7001,
+            "orderReports": [{"orderId": 700}, {"orderId": 701}],
+        }
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertEqual(result["oco_resp"]["orderListId"], 7001)
+        self.assertIsNone(result["tp_order_id"])
+        self.assertIsNone(result["sl_order_id"])
+        mock_client.create_oco_order.assert_called_once()
+        mock_client.create_order.assert_not_called()
+        print("✓ Test 6: Both legs valid → FULLY_PROTECTED, standard OCO placed")
+
+    # ── Test 7: No PERCENT_PRICE_BY_SIDE filter → fallback to OCO ────────────
+    def test_no_percent_price_filter_falls_back_to_oco(self):
+        """Symbol without PERCENT_PRICE_BY_SIDE filter → treat both as valid."""
+        mock_client = MagicMock()
+        # No PERCENT_PRICE_BY_SIDE in filters
+        mock_client.get_symbol_info.return_value = {
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "LOT_SIZE",     "stepSize": "0.001"},
+            ]
+        }
+        mock_client.get_symbol_ticker.return_value = {"price": "61000.00"}
+        mock_client.get_avg_price.return_value = {"price": "61000.00"}
+        mock_client.create_oco_order.return_value = {
+            "orderListId": 8001,
+            "orderReports": [{"orderId": 800}],
+        }
+        executor = self.RealSpotOrderExecutor(mock_client)
+        trade = {"symbol": "BTCUSDT", "entry_qty": 0.01, "sl": 59000.0, "tp1": 63000.0}
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        mock_client.create_oco_order.assert_called_once()
+        print("✓ Test 7: No PERCENT_PRICE_BY_SIDE filter → OCO placed (FULLY_PROTECTED)")
+
+    # ── Test 8: get_avg_price failure → fallback to get_symbol_ticker ─────────
+    def test_avg_price_failure_falls_back_to_ticker(self):
+        """If get_avg_price() raises, _check_percent_price_filter uses ticker price."""
+        executor, mock_client = self._make_executor()
+        mock_client.get_avg_price.side_effect = Exception("network error")
+        # With ticker price = 11.13:  SL 7.58/11.13=0.681 < 0.8 → invalid
+        mock_client.get_symbol_ticker.return_value = {"price": "11.13"}
+        trade = self._make_trade(sl=7.58, tp1=11.5)
+        mock_client.create_order.return_value = {"orderId": 55008}
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "TP_ONLY",
+                         "Fallback to ticker should still detect SL as filter-invalid")
+        print("✓ Test 8: get_avg_price failure → ticker fallback, SL still detected as invalid")
+
+    # ── Test 9: Emergency market sell takes priority over preflight ───────────
+    def test_price_below_sl_emergency_sell_before_preflight(self):
+        """Price ≤ SL → emergency market sell regardless of filter state."""
+        executor, mock_client = self._make_executor()
+        # Price already below SL
+        mock_client.get_symbol_ticker.return_value = {"price": "7.0"}
+        mock_client.get_avg_price.return_value = {"price": "7.0"}
+        mock_client.create_order.return_value = {
+            "orderId": 9001, "status": "FILLED",
+            "executedQty": "1.53", "cummulativeQuoteQty": "10.71",
+        }
+        trade = self._make_trade(sl=7.58, tp1=11.799, qty=1.53)
+
+        result = executor.place_oco_order(trade)
+
+        self.assertTrue(result.get("_market_sold") or trade.get("_market_sold"))
+        # create_order called for MARKET SELL, create_oco_order NOT called
+        mock_client.create_oco_order.assert_not_called()
+        kw = mock_client.create_order.call_args.kwargs
+        self.assertEqual(kw["type"], "MARKET")
+        print("✓ Test 9: Price ≤ SL → emergency market sell (preflight not reached)")
+
+    # ── Test 10: TP exceeded → adjust TP then check preflight ─────────────────
+    @unittest.mock.patch("time.sleep", return_value=None)
+    def test_tp_exceeded_adjust_then_preflight_passes(self, _sleep):
+        """Price ≥ TP → TP adjusted upward, preflight re-checks new TP value."""
+        executor, mock_client = self._make_executor()
+        # current=12.0, TP=11.5 → TP exceeded; adjusted TP = 12.0 * 1.003 = 12.036
+        # With adjusted TP: 12.036/12.0 = 1.003 < 2.0 ✓; SL 10.8/12.0 = 0.9 > 0.8 ✓
+        mock_client.get_symbol_ticker.return_value = {"price": "12.0"}
+        mock_client.get_avg_price.return_value = {"price": "12.0"}
+        trade = self._make_trade(sl=10.8, tp1=11.5, qty=1.0)
+        mock_client.create_oco_order.return_value = {
+            "orderListId": 9010, "orderReports": [{"orderId": 901}],
+        }
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "FULLY_PROTECTED")
+        self.assertGreater(trade["tp1"], 12.0, "TP must have been adjusted above current")
+        print(f"✓ Test 10: TP exceeded → adjusted to {trade['tp1']:.4f}, FULLY_PROTECTED")
+
+    # ── Test 11: TP_ONLY standalone order API failure → RuntimeError ──────────
+    def test_tp_only_standalone_order_failure_raises(self):
+        """If standalone TP order placement fails → RuntimeError propagated."""
+        from binance.exceptions import BinanceAPIException
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=7.58, tp1=11.799)
+        self._avax_state(mock_client, current=11.13)
+        mock_resp = MagicMock(spec=requests.Response)
+        mock_resp.status_code = 400
+        mock_resp.text = '{"code":-2010,"msg":"Account has insufficient balance"}'
+        mock_resp.json.return_value = {"code": -2010, "msg": "Account has insufficient balance"}
+        mock_client.create_order.side_effect = BinanceAPIException(
+            mock_resp, 400, mock_resp.text
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_oco_order(trade)
+
+        self.assertIn("Standalone TP order failed", str(ctx.exception))
+        print("✓ Test 11: TP_ONLY standalone order API failure → RuntimeError")
+
+    # ── Test 12: SL_ONLY standalone order API failure → RuntimeError ──────────
+    def test_sl_only_standalone_order_failure_raises(self):
+        """If standalone SL order placement fails → RuntimeError propagated."""
+        from binance.exceptions import BinanceAPIException
+        executor, mock_client = self._make_executor()
+        trade = self._make_trade(sl=10.5, tp1=30.0, qty=1.0)  # TP invalid, SL valid
+        self._avax_state(mock_client, current=11.13)
+        mock_resp = MagicMock(spec=requests.Response)
+        mock_resp.status_code = 400
+        mock_resp.text = '{"code":-2010,"msg":"Account has insufficient balance"}'
+        mock_resp.json.return_value = {"code": -2010, "msg": "Account has insufficient balance"}
+        mock_client.create_order.side_effect = BinanceAPIException(
+            mock_resp, 400, mock_resp.text
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_oco_order(trade)
+
+        self.assertIn("Standalone SL order failed", str(ctx.exception))
+        print("✓ Test 12: SL_ONLY standalone order API failure → RuntimeError")
+
+    # ── Test 13: UNPROTECTED never mutates trade["sl"] or trade["tp1"] ────────
+    def test_unprotected_does_not_mutate_sl_or_tp(self):
+        """No protection path should ever shift SL or TP values on the trade."""
+        executor, mock_client = self._make_executor()
+        original_sl  = 7.58
+        original_tp1 = 35.0
+        trade = self._make_trade(sl=original_sl, tp1=original_tp1)
+        self._avax_state(mock_client, current=11.13)
+
+        result = executor.place_oco_order(trade)
+
+        self.assertEqual(result["protection_state"], "UNPROTECTED")
+        self.assertEqual(trade["sl"],  original_sl,  "SL must never be mutated")
+        self.assertEqual(trade["tp1"], original_tp1, "TP must never be mutated")
+        print("✓ Test 13: UNPROTECTED — sl and tp1 unchanged on trade dict")
+
+    # ── Test 14: _check_percent_price_filter correctness ─────────────────────
+    def test_check_percent_price_filter_returns_correct_validity(self):
+        """_check_percent_price_filter returns valid=True/False based on ratio."""
+        executor, mock_client = self._make_executor()
+        mock_client.get_avg_price.return_value = {"price": "11.13"}
+        mock_client.get_symbol_ticker.return_value = {"price": "11.13"}
+
+        # SL 7.58: ratio=0.681, askMultiplierDown=0.8 → INVALID
+        sl_result = executor._check_percent_price_filter("AVAXUSDT", 7.58)
+        self.assertFalse(sl_result["valid"])
+        self.assertTrue(sl_result["filter_found"])
+        self.assertAlmostEqual(sl_result["ratio"], 7.58 / 11.13, places=3)
+
+        # TP 11.799: ratio=1.060, within [0.8, 2.0] → VALID
+        tp_result = executor._check_percent_price_filter("AVAXUSDT", 11.799)
+        self.assertTrue(tp_result["valid"])
+        self.assertTrue(tp_result["filter_found"])
+        self.assertAlmostEqual(tp_result["ratio"], 11.799 / 11.13, places=3)
+        print(f"✓ Test 14: SL ratio={sl_result['ratio']:.3f} → invalid; "
+              f"TP ratio={tp_result['ratio']:.3f} → valid")
+
+    # ── Test 15: Post-preflight PERCENT_PRICE_BY_SIDE rejection still fail-fast
+    @unittest.mock.patch("time.sleep", return_value=None)
+    def test_post_preflight_percent_price_rejection_still_fail_fast(self, _sleep):
+        """
+        If avgPrice shifts between preflight and OCO call so that the exchange
+        rejects with PERCENT_PRICE_BY_SIDE, the error must still be fail-fast
+        (no retry).  FULLY_PROTECTED path, but exchange fires -1013 anyway.
+        """
+        from binance.exceptions import BinanceAPIException
+        executor, mock_client = self._make_executor()
+        # Preflight passes: both legs valid with avg=10.0
+        mock_client.get_symbol_ticker.return_value = {"price": "10.0"}
+        mock_client.get_avg_price.return_value = {"price": "10.0"}
+        trade = self._make_trade(sl=9.0, tp1=11.5, qty=1.0)
+        mock_resp = MagicMock(spec=requests.Response)
+        mock_resp.status_code = 400
+        mock_resp.text = '{"code":-1013,"msg":"Filter failure: PERCENT_PRICE_BY_SIDE"}'
+        mock_resp.json.return_value = {"code": -1013,
+                                       "msg": "Filter failure: PERCENT_PRICE_BY_SIDE"}
+        mock_client.create_oco_order.side_effect = BinanceAPIException(
+            mock_resp, 400, mock_resp.text
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            executor.place_oco_order(trade)
+
+        self.assertEqual(mock_client.create_oco_order.call_count, 1,
+                         "Post-preflight PERCENT_PRICE_BY_SIDE must not be retried")
+        self.assertIn("PERCENT_PRICE_BY_SIDE", str(ctx.exception))
+        _sleep.assert_not_called()
+        print("✓ Test 15: Post-preflight PERCENT_PRICE_BY_SIDE → fail-fast, no retry")
 
 
 if __name__ == "__main__":
