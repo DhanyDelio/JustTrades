@@ -299,18 +299,13 @@ def _fmt_order_status(status: str) -> str:
 def _send_telegram(message: str) -> None:
     """Send a Telegram message using TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from .env.
 
-    Set TELEGRAM_TEST_MODE=true di lokal + isi TELEGRAM_TEST_BOT_TOKEN /
-    TELEGRAM_TEST_CHAT_ID untuk redirect semua notifikasi ke bot test terpisah,
-    supaya tidak nyampah ke production Telegram.
-    VM tidak perlu set ini — default false = pakai production bot.
+    Set TELEGRAM_ENABLED=false in local .env to suppress all notifications
+    during development/testing. VM deployments leave this unset (default true).
     """
-    test_mode = os.getenv("TELEGRAM_TEST_MODE", "false").lower().strip() in ("true", "1", "yes", "on")
-    if test_mode:
-        token   = os.getenv("TELEGRAM_TEST_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_TEST_CHAT_ID", "").strip()
-    else:
-        token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if os.getenv("TELEGRAM_ENABLED", "true").lower().strip() in ("false", "0", "no", "off"):
+        return
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         return
     placeholders = ("your_telegram", "your", "replace_me", "placeholder", "changeme")
