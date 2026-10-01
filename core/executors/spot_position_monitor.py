@@ -1493,12 +1493,33 @@ class SpotPositionMonitor:
                     )
                     try:
                         self.order_executor.cancel_order(sym, _standalone_order_id)
-                        print(f"  {sym:<10} ✅ Cancelled orderId={_standalone_order_id}")
                     except RuntimeError as cancel_exc:
                         # Cancel failed — abort recovery to avoid duplicate SELL risk.
                         print(
                             f"  ⚠  [{sym}] Recovery aborted: cancel of existing "
                             f"{prev} order failed: {cancel_exc}"
+                        )
+                        return
+                    # Confirm CANCELED on exchange before proceeding — never assume.
+                    # A cancel API call can succeed but the order may still be
+                    # "pending cancel" briefly.  If not confirmed CANCELED, abort
+                    # so we never have two open SELL orders simultaneously.
+                    try:
+                        confirmed = self.client.get_order(
+                            symbol=sym, orderId=_standalone_order_id
+                        )
+                        confirmed_status = str(confirmed.get("status", "")).upper()
+                        if confirmed_status not in ("CANCELED", "EXPIRED"):
+                            print(
+                                f"  ⚠  [{sym}] Recovery aborted: cancel not confirmed "
+                                f"(status={confirmed_status}). Will retry next cycle."
+                            )
+                            return
+                        print(f"  {sym:<10} ✅ Cancel confirmed (orderId={_standalone_order_id})")
+                    except Exception as confirm_exc:
+                        print(
+                            f"  ⚠  [{sym}] Recovery aborted: could not confirm cancel "
+                            f"of orderId={_standalone_order_id}: {confirm_exc}"
                         )
                         return
                 # CANCELED, EXPIRED, NOT_FOUND → safe to proceed with new order
