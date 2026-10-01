@@ -297,7 +297,14 @@ def _fmt_order_status(status: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _send_telegram(message: str) -> None:
-    """Send a Telegram message using TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from .env."""
+    """Send a Telegram message using TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from .env.
+
+    Set TELEGRAM_ENABLED=false in .env to suppress all notifications locally
+    without needing a separate bot or modifying tests.  VM deployments leave
+    this unset (defaults to true).
+    """
+    if os.getenv("TELEGRAM_ENABLED", "true").lower().strip() in ("false", "0", "no", "off"):
+        return
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
