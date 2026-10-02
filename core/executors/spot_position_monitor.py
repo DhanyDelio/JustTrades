@@ -367,6 +367,22 @@ class SpotPositionMonitor:
                             (fill_price - planned) / planned * 100, 4
                         ) if planned else None
                         log_dirty = True
+                        # ── Eager-persist fill details immediately ────────────
+                        # Prevents the "spam fill notification" bug where
+                        # entry_fill_price stays None in Supabase across cycles
+                        # because a later exception or continue interrupts the
+                        # end-of-cycle save block before it writes this trade.
+                        try:
+                            from services.supabase_client import update_spot_by_order_id as _usb_fill
+                            _usb_fill(eid, {
+                                "entry_status":     "FILLED",
+                                "entry_fill_price": trade["entry_fill_price"],
+                                "entry_fill_time":  trade["entry_fill_time"],
+                                "entry_qty":        trade["entry_qty"],
+                                "slippage_pct":     trade["slippage_pct"],
+                            })
+                        except Exception:
+                            pass  # non-fatal — end-of-cycle save will retry
                         # Notify on NEW → FILLED transition
                         _send_telegram(
                             f"✅ Filled: {sym} {trade.get('direction','').lower()} @ {ca._fmt_price(fill_price).strip()}"
@@ -1027,25 +1043,28 @@ class SpotPositionMonitor:
                 eid = ot.get("entry_order_id")
                 if not eid:
                     continue
-                update_spot_by_order_id(eid, {
-                    "entry_status":               ot.get("entry_status"),
-                    "entry_fill_price":           ot.get("entry_fill_price"),
-                    "entry_fill_time":            ot.get("entry_fill_time"),
-                    "entry_qty":                  ot.get("entry_qty"),
-                    "slippage_pct":               ot.get("slippage_pct"),
-                    "oco_placed":                 ot.get("oco_placed"),
-                    "oco_order_ids":              ot.get("oco_order_ids"),
-                    "oco_list_id":                ot.get("oco_list_id"),
-                    "tp1":                        ot.get("tp1"),
-                    "exit_status":                ot.get("exit_status"),
-                    "exit_price":                 ot.get("exit_price"),
-                    "exit_time":                  ot.get("exit_time"),
-                    "exit_reason":                ot.get("exit_reason"),
-                    "realized_pnl_usd":           ot.get("realized_pnl_usd"),
-                    "realized_pnl_pct":           ot.get("realized_pnl_pct"),
-                    "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
-                    "raw_entry_order":            ot.get("raw_entry_order"),
-                })
+                try:
+                    update_spot_by_order_id(eid, {
+                        "entry_status":               ot.get("entry_status"),
+                        "entry_fill_price":           ot.get("entry_fill_price"),
+                        "entry_fill_time":            ot.get("entry_fill_time"),
+                        "entry_qty":                  ot.get("entry_qty"),
+                        "slippage_pct":               ot.get("slippage_pct"),
+                        "oco_placed":                 ot.get("oco_placed"),
+                        "oco_order_ids":              ot.get("oco_order_ids"),
+                        "oco_list_id":                ot.get("oco_list_id"),
+                        "tp1":                        ot.get("tp1"),
+                        "exit_status":                ot.get("exit_status"),
+                        "exit_price":                 ot.get("exit_price"),
+                        "exit_time":                  ot.get("exit_time"),
+                        "exit_reason":                ot.get("exit_reason"),
+                        "realized_pnl_usd":           ot.get("realized_pnl_usd"),
+                        "realized_pnl_pct":           ot.get("realized_pnl_pct"),
+                        "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
+                        "raw_entry_order":            ot.get("raw_entry_order"),
+                    })
+                except Exception as _save_exc:
+                    print(f"  ⚠ [{ot.get('symbol','?')}] End-of-cycle save failed: {_save_exc}")
                 # Persist oco_reconciliation_status separately — requires
                 # the column to exist in trades_spot (see docs/migrations/).
                 # Safe to skip if column not yet present; in-memory state is
