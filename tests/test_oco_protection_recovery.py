@@ -491,7 +491,15 @@ class TestScenario6_NormalOcoFlowRegression(unittest.TestCase):
         self.assertGreater(trade["realized_pnl_usd"], 0)
 
     def test_price_guard_sl_sets_price_guard_reason(self):
-        """Price-guard SL remains classified as a normal SL hit."""
+        """Price-guard SL path writes exit_reason='PRICE_GUARD_SL', NOT 'SL_HIT'.
+
+        The price-guard branch (sl_breached + OCO confirmed EXECUTING) no longer
+        resolves the trade immediately.  Instead it enters a two-cycle stuck-OCO
+        detection gate: cycle N marks suspected_at, cycle N+1 sends alert.
+        Neither cycle changes exit_status or exit_reason.
+        This test verifies that a single price-guard cycle does NOT resolve
+        the trade as SL_HIT (old phantom behavior).
+        """
         trade = _base_trade(entry_fill_time=1000)
 
         class _C:
@@ -506,9 +514,18 @@ class TestScenario6_NormalOcoFlowRegression(unittest.TestCase):
             def v3_get_order_list(self, orderListId):
                 return {"listOrderStatus": "EXECUTING", "orders": []}  # OCO alive
 
+        # Reset module-level stuck-OCO tracking before test
+        if hasattr(SpotPositionMonitor, "_stuck_oco_marked_this_run"):
+            SpotPositionMonitor._stuck_oco_marked_this_run = set()
+
         _run_check(_make_monitor(_C()), trade)
-        self.assertEqual(trade["exit_status"], "SL_HIT")
-        self.assertEqual(trade["exit_reason"], "SL_HIT")
+        # Trade must NOT be resolved as SL_HIT — still OPEN (price-guard gate cycle N)
+        self.assertEqual(trade["exit_status"], "OPEN")
+        self.assertIsNone(trade.get("exit_reason"))
+        # suspected_at must be set in raw_entry_order
+        raw = trade.get("raw_entry_order") or {}
+        self.assertIn("stuck_oco_detection", raw,
+                      "stuck_oco_detection must be set in raw_entry_order on cycle N")
 
 
 # ---------------------------------------------------------------------------

@@ -62,9 +62,43 @@ def load_data() -> pd.DataFrame:
     rows = fetch_all_spot()
     df   = pd.DataFrame(rows)
 
+    # ── Provenance-aware eligibility filter ───────────────────────────────
+    # Only genuine exchange fills are clean labels for ML training.
+    # Price-guard estimates, manual resolutions, and emergency closes are
+    # mechanistically different and must be excluded.
+    CLEAN_EXIT_REASONS = {"TP_HIT", "SL_HIT"}
+    EXCLUDED_EXIT_REASONS = {
+        "PRICE_GUARD_SL",
+        "UNPROTECTED_SL_BREACH",
+        "UNPROTECTED_TP_BREACH",
+        "OCO_STUCK_MANUAL_RESOLUTION",
+        "EMERGENCY_CLOSED",
+        "RECOVERED_SL_HIT",
+        "STALE_SETUP_CANCELLED",
+    }
+
     closed_mask = df[TARGET].isin(["TP_HIT", "SL_HIT"])
     rule_mask   = df["rule_version"].isin(["v1.0.0"]) | df["rule_version"].isna()
-    df          = df[closed_mask & rule_mask].copy().reset_index(drop=True)
+
+    # NULL exit_reason rows with TP_HIT/SL_HIT status are INCLUDED (legacy,
+    # predate exit_reason field) — they get a warning but are not dropped to
+    # avoid discarding all historical data.
+    null_reason_mask = (
+        df[TARGET].isin(["TP_HIT", "SL_HIT"]) &
+        df["exit_reason"].isna()
+    )
+    if null_reason_mask.sum() > 0:
+        print(
+            f"  [WARNING] {null_reason_mask.sum()} rows have NULL exit_reason "
+            f"with TP_HIT/SL_HIT status — included with provenance uncertainty"
+        )
+
+    clean_mask = (
+        df[TARGET].isin(["TP_HIT", "SL_HIT"]) &
+        ~df["exit_reason"].isin(EXCLUDED_EXIT_REASONS)
+    )
+
+    df = df[closed_mask & rule_mask & clean_mask].copy().reset_index(drop=True)
 
     print(f"  Total closed v1.0.0 trades : {len(df)}")
     print(f"    rule_version=v1.0.0      : {(df['rule_version']=='v1.0.0').sum()}")

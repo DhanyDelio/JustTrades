@@ -37,10 +37,41 @@ def load_data() -> pd.DataFrame:
     rows = fetch_all_spot()
     df = pd.DataFrame(rows)
 
+    # ── Provenance-aware eligibility filter ───────────────────────────────
+    # Only genuine exchange fills are clean labels for ML training.
+    CLEAN_EXIT_REASONS = {"TP_HIT", "SL_HIT"}
+    EXCLUDED_EXIT_REASONS = {
+        "PRICE_GUARD_SL",
+        "UNPROTECTED_SL_BREACH",
+        "UNPROTECTED_TP_BREACH",
+        "OCO_STUCK_MANUAL_RESOLUTION",
+        "EMERGENCY_CLOSED",
+        "RECOVERED_SL_HIT",
+        "STALE_SETUP_CANCELLED",
+    }
+
     closed_mask = df["exit_status"].isin(["TP_HIT", "SL_HIT"])
+
+    # NULL exit_reason rows with TP_HIT/SL_HIT status are INCLUDED (legacy,
+    # predate exit_reason field) — included with provenance uncertainty warning.
+    null_reason_mask = (
+        df["exit_status"].isin(["TP_HIT", "SL_HIT"]) &
+        df["exit_reason"].isna()
+    )
+    if null_reason_mask.sum() > 0:
+        print(
+            f"  [WARNING] {null_reason_mask.sum()} rows have NULL exit_reason "
+            f"with TP_HIT/SL_HIT status — included with provenance uncertainty"
+        )
+
+    clean_mask = (
+        df["exit_status"].isin(["TP_HIT", "SL_HIT"]) &
+        ~df["exit_reason"].isin(EXCLUDED_EXIT_REASONS)
+    )
+
     # We want to train on recent data too, so we allow v1.0.0, v2.0.0, etc or NaN
-    # We'll just take all closed spot trades.
-    df = df[closed_mask].copy().reset_index(drop=True)
+    # We'll just take all closed spot trades that pass the provenance filter.
+    df = df[closed_mask & clean_mask].copy().reset_index(drop=True)
 
     print(f"  Total closed spot trades (Raw N) : {len(df)}")
     
@@ -110,6 +141,98 @@ def make_pipe() -> Pipeline:
         )),
     ])
 
+def _attach_time_order(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    entry_fill_dt = pd.to_datetime(df.get("entry_fill_time"), unit="ms", utc=True, errors="coerce")
+    open_time_dt = pd.to_datetime(df.get("open_time"), utc=True, errors="coerce")
+    created_at_dt = pd.to_datetime(df.get("created_at"), utc=True, errors="coerce")
+
+    df["_entry_sort_dt"] = entry_fill_dt
+    df.loc[df["_entry_sort_dt"].isna(), "_entry_sort_dt"] = open_time_dt[df["_entry_sort_dt"].isna()]
+    df.loc[df["_entry_sort_dt"].isna(), "_entry_sort_dt"] = created_at_dt[df["_entry_sort_dt"].isna()]
+
+    missing_time = int(df["_entry_sort_dt"].isna().sum())
+    if missing_time:
+        print(f"  [WARN] {missing_time} row(s) missing entry timestamp for time-based eval — dropping them.")
+
+    return df.dropna(subset=["_entry_sort_dt"]).sort_values("_entry_sort_dt").reset_index(drop=True)
+
+
+def evaluate_time_based(df: pd.DataFrame, use_sample_weight: bool = True) -> float:
+    df_time = _attach_time_order(df)
+    n = len(df_time)
+    mode_label = "Weighted" if use_sample_weight else "Uniform"
+
+    print(f"\n{SEP}")
+    print(f"  TIME-BASED EVALUATION (Walk-Forward, {mode_label})")
+    print(SEP)
+
+    if n < 20:
+        print(f"  Not enough timestamped samples for time-based evaluation (n={n}).")
+        return float("nan")
+
+    min_train = max(int(np.ceil(n * 0.70)), 10)
+    test_window = max(int(np.ceil(n * 0.10)), 1)
+
+    if min_train >= n:
+        print(f"  Not enough holdout samples after 70/30 split rule (n={n}).")
+        return float("nan")
+
+    oof_indices: list[int] = []
+    oof_probs: list[float] = []
+    fold_count = 0
+
+    print(f"  Samples with valid timestamps      : {n}")
+    print(f"  Initial train window (70%)        : {min_train}")
+    print(f"  Walk-forward test window          : {test_window}")
+    print(f"  Sample weighting mode             : {mode_label}")
+
+    for test_start in range(min_train, n, test_window):
+        test_end = min(test_start + test_window, n)
+        train_df = df_time.iloc[:test_start].copy()
+        test_df = df_time.iloc[test_start:test_end].copy()
+
+        if len(test_df) == 0 or train_df["win"].nunique() < 2:
+            continue
+
+        X_train, y_train, _ = build_feature_matrix(train_df.copy())
+        X_test, y_test, _ = build_feature_matrix(test_df.copy())
+        X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+        train_weights = train_df["sample_weight"].values if use_sample_weight else np.ones(len(train_df), dtype=float)
+
+        model = make_pipe()
+        model.fit(X_train, y_train, lr__sample_weight=train_weights)
+        fold_probs = model.predict_proba(X_test)[:, 1]
+
+        oof_indices.extend(test_df.index.tolist())
+        oof_probs.extend(fold_probs.tolist())
+        fold_count += 1
+
+    if not oof_probs:
+        print("  Could not produce walk-forward predictions.")
+        return float("nan")
+
+    eval_df = df_time.loc[oof_indices].copy()
+    eval_df["time_prob"] = oof_probs
+
+    if eval_df["win"].nunique() < 2:
+        print("  Walk-forward holdout contains only one class — ROC-AUC undefined.")
+        return float("nan")
+
+    auc_time = roc_auc_score(eval_df["win"], eval_df["time_prob"])
+    print(f"  Walk-forward folds evaluated      : {fold_count}")
+    print(f"  Time-based ROC-AUC Score          : {auc_time:.3f}")
+    print(f"  Holdout predictions used          : {len(eval_df)}")
+    if not eval_df.empty:
+        print(
+            f"  Holdout span                      : "
+            f"{eval_df['_entry_sort_dt'].min()}  →  {eval_df['_entry_sort_dt'].max()}"
+        )
+
+    return auc_time
+
+
 def analyze_thresholds(df, y_proba_loco):
     df["loco_prob"] = y_proba_loco
     baseline_wr = df["win"].mean()
@@ -149,32 +272,57 @@ def analyze_thresholds(df, y_proba_loco):
     
     print(f"\n  => OPTIMAL THRESHOLD (Max EV, n>10): > {best_thresh:.2f}")
     
-def main():
-    df = load_data()
-    X, y, groups = build_feature_matrix(df)
-    sample_weights = df["sample_weight"].values
-    
-    print(f"\n  Running LOCO (Leave-One-Cluster-Out)...")
+def _run_loco_eval(X, y, groups, sample_weights, use_sample_weight: bool = True):
+    mode_label = "Weighted" if use_sample_weight else "Uniform"
+    print(f"\n  Running LOCO (Leave-One-Cluster-Out, {mode_label})...")
     logo = LeaveOneGroupOut()
-    fit_params = {"lr__sample_weight": sample_weights}
-    
+    eval_weights = sample_weights if use_sample_weight else np.ones(len(y), dtype=float)
+    fit_params = {"lr__sample_weight": eval_weights}
+
     y_proba_loco = cross_val_predict(
-        make_pipe(), X, y, cv=logo, groups=groups, 
+        make_pipe(), X, y, cv=logo, groups=groups,
         method="predict_proba", params=fit_params
     )[:, 1]  # type: ignore
-    
+
     try:
         auc_loco = roc_auc_score(y, y_proba_loco)
     except Exception:
         auc_loco = float("nan")
-        
-    print(f"  LOCO ROC-AUC Score: {auc_loco:.3f}")
-    
-    analyze_thresholds(df, y_proba_loco)
-    
+
+    print(f"  LOCO ROC-AUC Score ({mode_label}): {auc_loco:.3f}")
+    return auc_loco, y_proba_loco
+
+
+def main():
+    df = load_data()
+    X, y, groups = build_feature_matrix(df)
+    sample_weights = df["sample_weight"].values
+
+    auc_loco_weighted, y_proba_loco_weighted = _run_loco_eval(
+        X, y, groups, sample_weights, use_sample_weight=True
+    )
+    auc_loco_uniform, _ = _run_loco_eval(
+        X, y, groups, sample_weights, use_sample_weight=False
+    )
+
+    auc_time_weighted = evaluate_time_based(df, use_sample_weight=True)
+    auc_time_uniform = evaluate_time_based(df, use_sample_weight=False)
+
+    print(f"\n{SEP}")
+    print("  EVALUATION SUMMARY")
+    print(SEP)
+    print(f"  Raw N                  : {len(df)}")
+    print(f"  Effective N            : {df['_group'].nunique()}")
+    print(f"  LOCO ROC-AUC (weighted): {auc_loco_weighted:.3f}" if not np.isnan(auc_loco_weighted) else "  LOCO ROC-AUC (weighted): nan")
+    print(f"  LOCO ROC-AUC (uniform) : {auc_loco_uniform:.3f}" if not np.isnan(auc_loco_uniform) else "  LOCO ROC-AUC (uniform) : nan")
+    print(f"  Time ROC-AUC (weighted): {auc_time_weighted:.3f}" if not np.isnan(auc_time_weighted) else "  Time ROC-AUC (weighted): nan")
+    print(f"  Time ROC-AUC (uniform) : {auc_time_uniform:.3f}" if not np.isnan(auc_time_uniform) else "  Time ROC-AUC (uniform) : nan")
+
+    analyze_thresholds(df, y_proba_loco_weighted)
+
     final_model = make_pipe()
     final_model.fit(X, y, lr__sample_weight=sample_weights)
-    
+
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(final_model, MODEL_PATH)
     print(f"\n  [✅] Model saved successfully to {MODEL_PATH}")

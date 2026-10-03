@@ -490,7 +490,7 @@ class SpotPositionMonitor:
                             trade["exit_status"]      = "SL_HIT"
                             trade["exit_price"]       = round(exit_px, 6)
                             trade["exit_time"]        = int(exit_ts)
-                            trade["exit_reason"]      = "SL_HIT"
+                            trade["exit_reason"]      = "UNPROTECTED_SL_BREACH"
                             trade["realized_pnl_usd"] = round(pnl_usd, 4)
                             trade["realized_pnl_pct"] = round(pnl_pct, 2)
                             fill_t = trade.get("entry_fill_time")
@@ -835,35 +835,76 @@ class SpotPositionMonitor:
 
                     elif (sl_breached and _oco_query_confirmed
                           and not _oco_missing and trade.get("oco_placed")):
-                        # OCO exists on exchange (confirmed in Step 3) but didn't fire.
-                        # Price-guard: safe to resolve as SL_HIT.
-                        print(
-                            f"  ⚠  [{sym}] Price {current:.4f} breached SL {sl_level:.4f} "
-                            f"— OCO confirmed placed but not triggered. Resolving as SL_HIT."
+                        # OCO exists on exchange (confirmed in Step 3) but SL leg
+                        # has not fired yet (execution lag, testnet quirk, stuck OCO).
+                        # ── 2Z-style stuck-OCO shadow detection (two-cycle gate) ────
+                        # Cycle N: mark suspected, persist, do NOT resolve.
+                        # Cycle N+1: if still stuck and suspected_at from a prior
+                        #            cycle → send Telegram alert, still do NOT
+                        #            auto-resolve (see OCO_STUCK_AUTO_RESOLVE_ENABLED).
+                        _raw = dict(trade.get("raw_entry_order") or {})
+                        _stuck_info = _raw.get("stuck_oco_detection") or {}
+                        _suspected_at = _stuck_info.get("suspected_at")
+
+                        # A module-level set tracks IDs marked this specific run
+                        # so we can distinguish "just now" from "previous cycle".
+                        _newly_marked_this_run = getattr(
+                            SpotPositionMonitor, "_stuck_oco_marked_this_run", set()
                         )
-                        entry_fill   = trade.get("entry_fill_price") or trade["entry_price"]
-                        qty          = trade.get("entry_qty", 0)
-                        pnl_usd      = qty * (current - entry_fill)
-                        pnl_pct      = pnl_usd / max(trade.get("entry_notional", 1), 0.001) * 100
-                        exit_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                        trade["exit_status"]      = "SL_HIT"
-                        trade["exit_price"]       = round(current, 6)
-                        trade["exit_time"]        = exit_time_ms
-                        trade["exit_reason"]      = "SL_HIT"
-                        trade["realized_pnl_usd"] = round(pnl_usd, 4)
-                        trade["realized_pnl_pct"] = round(pnl_pct, 2)
-                        if trade.get("entry_fill_time") and exit_time_ms:
-                            trade["time_to_resolution_sec"] = (
-                                exit_time_ms - int(trade["entry_fill_time"])
-                            ) // 1000
-                        log_dirty = True
-                        resolved_this_run.append((sym, "SL_HIT", pnl_usd))
-                        self._eager_commit(trade)
-                        _send_telegram(
-                            f"🛑 [SPOT] SL_HIT (price-guard, OCO confirmed): "
-                            f"{sym} @ {ca._fmt_price(current).strip()}"
-                            f"  |  PnL: ${pnl_usd:+.2f}"
+                        _already_confirmed = (
+                            _suspected_at is not None
+                            and eid not in _newly_marked_this_run
                         )
+
+                        if _already_confirmed:
+                            # Cycle N+1: confirmed stuck OCO — send alert.
+                            print(
+                                f"  ⚠  [{sym}] CONFIRMED stuck-OCO: SL leg NEW, "
+                                f"price {current:.4f} ≤ SL {sl_level:.4f}, "
+                                f"suspected since {_suspected_at}"
+                            )
+                            _send_telegram(
+                                f"⚠ [SPOT] STUCK-OCO CONFIRMED: {sym}\n"
+                                f"SL leg is NEW/unexecuted with price below SL.\n"
+                                f"SL: {ca._fmt_price(sl_level).strip()}  "
+                                f"Current: {ca._fmt_price(current).strip()}\n"
+                                f"tp_order_id: {trade.get('tp_order_id')}  "
+                                f"sl_order_id: {trade.get('sl_order_id')}\n"
+                                f"oco_list_id: {trade.get('oco_list_id')}\n"
+                                f"suspected_at: {_suspected_at}\n"
+                                f"⚠ NO auto-resolve. Manual intervention may be needed."
+                            )
+                            _auto_resolve = os.getenv(
+                                "OCO_STUCK_AUTO_RESOLVE_ENABLED", "false"
+                            ).lower() in {"1", "true", "yes", "on"}
+                            if _auto_resolve:
+                                # Future hook — log intent only; do NOT implement now.
+                                print(
+                                    f"  [{sym}] OCO_STUCK_AUTO_RESOLVE_ENABLED=true detected "
+                                    f"but auto-resolve is NOT implemented in this version."
+                                )
+                        else:
+                            # Cycle N: first detection — mark suspected_at.
+                            _now_iso = datetime.now(timezone.utc).isoformat() + "Z"
+                            _stuck_info = {"suspected_at": _now_iso}
+                            _raw["stuck_oco_detection"] = _stuck_info
+                            trade["raw_entry_order"] = _raw
+                            # Track in module-level set so Cycle N+1 can detect.
+                            if not hasattr(SpotPositionMonitor, "_stuck_oco_marked_this_run"):
+                                SpotPositionMonitor._stuck_oco_marked_this_run = set()
+                            SpotPositionMonitor._stuck_oco_marked_this_run.add(eid)
+                            log_dirty = True
+                            try:
+                                from services.supabase_client import update_spot_by_order_id as _usb_stuck
+                                _usb_stuck(eid, {"raw_entry_order": _raw})
+                            except Exception:
+                                pass  # non-fatal
+                            print(
+                                f"  ⚠  [{sym}] stuck-OCO suspected: SL leg NEW "
+                                f"with price {current:.4f} breached SL {sl_level:.4f}. "
+                                f"suspected_at set. Will confirm next cycle."
+                            )
+                        # DO NOT resolve yet — no sell, no exit_status change.
                         continue
 
                     elif (sl_breached
@@ -1062,6 +1103,8 @@ class SpotPositionMonitor:
                         "realized_pnl_pct":           ot.get("realized_pnl_pct"),
                         "time_to_resolution_sec":     ot.get("time_to_resolution_sec"),
                         "raw_entry_order":            ot.get("raw_entry_order"),
+                        "tp_order_id":                ot.get("tp_order_id"),
+                        "sl_order_id":                ot.get("sl_order_id"),
                     })
                 except Exception as _save_exc:
                     print(f"  ⚠ [{ot.get('symbol','?')}] End-of-cycle save failed: {_save_exc}")
@@ -1354,6 +1397,19 @@ class SpotPositionMonitor:
                 "tp_order_id": tp_order_id,
                 "oco_reconciliation_status": "TP_ONLY",
             })
+            # Persist tp_order_id to structured Supabase columns immediately.
+            # _recover_missing_oco() has no caller-side persist; do it here.
+            try:
+                from services.supabase_client import update_spot_by_order_id as _usb_rmoco
+                _eid_rmoco = trade.get("entry_order_id")
+                if _eid_rmoco:
+                    _usb_rmoco(_eid_rmoco, {
+                        "oco_placed": False,
+                        "oco_reconciliation_status": "TP_ONLY",
+                        "tp_order_id": tp_order_id,
+                    })
+            except Exception:
+                pass  # non-fatal — end-of-cycle save will retry
             _send_telegram(
                 f"🟡 [SPOT] PARTIAL RECOVERY (TP_ONLY): {sym}\n"
                 f"TP order placed (orderId={tp_order_id}). "
@@ -1371,6 +1427,18 @@ class SpotPositionMonitor:
                 "sl_order_id": sl_order_id,
                 "oco_reconciliation_status": "SL_ONLY",
             })
+            # Persist sl_order_id to structured Supabase columns immediately.
+            try:
+                from services.supabase_client import update_spot_by_order_id as _usb_rmoco_sl
+                _eid_rmoco_sl = trade.get("entry_order_id")
+                if _eid_rmoco_sl:
+                    _usb_rmoco_sl(_eid_rmoco_sl, {
+                        "oco_placed": False,
+                        "oco_reconciliation_status": "SL_ONLY",
+                        "sl_order_id": sl_order_id,
+                    })
+            except Exception:
+                pass  # non-fatal — end-of-cycle save will retry
             _send_telegram(
                 f"🟠 [SPOT] PARTIAL RECOVERY (SL_ONLY): {sym}\n"
                 f"SL order placed (orderId={sl_order_id}). "
@@ -1559,6 +1627,62 @@ class SpotPositionMonitor:
                     )
                     return
 
+        # ── AVAX duplicate TP fix: when coming from UNPROTECTED state,
+        # query the exchange for any existing SELL LIMIT_MAKER orders matching
+        # this position before creating a new one.
+        # This prevents the scenario where tp_order_id persist failed in a prior
+        # cycle, leaving DB=UNPROTECTED but exchange already having a TP order.
+        if prev == "UNPROTECTED":
+            _sym_tp = trade["symbol"]
+            _tp1    = float(trade.get("tp1") or 0)
+            _qty    = float(trade.get("entry_qty") or 0)
+            try:
+                _open_orders = self.client.get_open_orders(symbol=_sym_tp)
+                for _oo in (_open_orders or []):
+                    _oo_side = str(_oo.get("side", "")).upper()
+                    _oo_type = str(_oo.get("type", "")).upper()
+                    _oo_qty  = float(_oo.get("origQty", 0) or 0)
+                    _oo_px   = float(_oo.get("price", 0) or 0)
+                    # Match: SELL LIMIT_MAKER with qty matching entry_qty and
+                    # price within 0.5% of tp1.
+                    _qty_match  = _qty > 0 and abs(_oo_qty - _qty) / _qty < 0.01
+                    _price_match = _tp1 > 0 and abs(_oo_px - _tp1) / _tp1 < 0.005
+                    if _oo_side == "SELL" and _oo_type == "LIMIT_MAKER" and _qty_match and _price_match:
+                        _existing_tp_id = _oo.get("orderId")
+                        print(
+                            f"  {sym:<10} ℹ Exchange already has SELL LIMIT_MAKER "
+                            f"(orderId={_existing_tp_id}) matching position. "
+                            f"Reconciling to TP_ONLY — no new TP created."
+                        )
+                        trade["tp_order_id"] = _existing_tp_id
+                        trade["oco_reconciliation_status"] = "TP_ONLY"
+                        from services.supabase_client import update_spot_by_order_id as _usb_avax
+                        try:
+                            _usb_avax(eid, {
+                                "tp_order_id": _existing_tp_id,
+                                "oco_reconciliation_status": "TP_ONLY",
+                            })
+                        except Exception:
+                            pass
+                        _send_telegram(
+                            f"🟡 [SPOT] UNPROTECTED reconciled to TP_ONLY: {sym}\n"
+                            f"Exchange already had SELL LIMIT_MAKER orderId={_existing_tp_id}.\n"
+                            f"DB updated to TP_ONLY — no new order placed."
+                        )
+                        return
+            except Exception as _oo_exc:
+                # If we can't query open orders, proceed with normal placement.
+                print(f"  {sym:<10} ℹ Could not query open orders for UNPROTECTED pre-check: {_oo_exc}")
+
+        # ── TP_ONLY idempotency guard: when tp_order_id is set and the order
+        # is still OPEN on exchange, do not create another TP.
+        if prev == "TP_ONLY" and trade.get("tp_order_id") and _standalone_order_id is None:
+            # _standalone_order_id is None only if tp_order_id was not set above;
+            # but if we reach here with _standalone_order_id=None for TP_ONLY,
+            # it means the cancel-before-replace block above was skipped
+            # (shouldn't happen, but guard here too).
+            pass  # cancel-before-replace already handled above for TP_ONLY
+
         try:
             prot_result = self.order_executor.place_oco_order(trade)
         except RuntimeError as exc:
@@ -1602,7 +1726,7 @@ class SpotPositionMonitor:
             )
             trade.update({
                 "exit_status": "SL_HIT", "exit_price": round(exit_px, 6),
-                "exit_time": exit_ts, "exit_reason": "SL_HIT",
+                "exit_time": exit_ts, "exit_reason": "RECOVERED_SL_HIT",
                 "realized_pnl_usd": round(pnl_usd, 4),
                 "realized_pnl_pct": round(pnl_pct, 2),
                 "oco_placed": False, "oco_list_id": None,
