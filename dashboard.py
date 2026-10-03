@@ -445,7 +445,24 @@ def load_trade_data() -> pd.DataFrame:
 
 
 def build_metrics(df: pd.DataFrame):
+    # Spot-only provenance exclusion — mirrors ml/train_v1.py & train_v2.py.
+    # Futures uses a separate function (build_futures_side_stats) with its own
+    # exit_reason vocabulary (EXCHANGE_SL/EXCHANGE_TP/EMERGENCY_*), so this
+    # list never applies to Futures.
+    SPOT_EXCLUDED_EXIT_REASONS = {
+        "PRICE_GUARD_SL",
+        "UNPROTECTED_SL_BREACH",
+        "UNPROTECTED_TP_BREACH",
+        "OCO_STUCK_MANUAL_RESOLUTION",
+        "EMERGENCY_CLOSED",
+        "RECOVERED_SL_HIT",
+        "STALE_SETUP_CANCELLED",
+    }
     resolved        = df[df["is_outcome"]].copy()
+    # Apply provenance filter: exclude non-genuine exits (phantom price-guard,
+    # emergency closes, manual resolutions) from Effective N.
+    if "exit_reason" in resolved.columns:
+        resolved = resolved[~resolved["exit_reason"].isin(SPOT_EXCLUDED_EXIT_REASONS)]
     total_trades    = int(len(df))
     resolved_trades = int(len(resolved))
     win_rate        = round((resolved["is_win"].mean() * 100) if resolved_trades else 0.0, 2)
