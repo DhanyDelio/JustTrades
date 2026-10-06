@@ -74,11 +74,15 @@ jobs:
         env:
           VM_HOST: ${{ secrets.VM_HOST }}
           VM_USER: ${{ secrets.VM_USER }}
+          TOKOCRYPTO_API_KEY:    ${{ secrets.TOKOCRYPTO_API_KEY }}
+          TOKOCRYPTO_API_SECRET: ${{ secrets.TOKOCRYPTO_API_SECRET }}
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=15 \
               "${VM_USER}@${VM_HOST}" \
+              TOKOCRYPTO_API_KEY="${TOKOCRYPTO_API_KEY}" \
+              TOKOCRYPTO_API_SECRET="${TOKOCRYPTO_API_SECRET}" \
           'bash -s' << 'REMOTE'
             set -e
 
@@ -95,6 +99,29 @@ jobs:
             NEW_HASH=$(git rev-parse --short HEAD)
             echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
             echo "Post-pull commit: ${NEW_HASH}"
+
+            # Inject Tokocrypto env vars into .env if provided
+            # Uses upsert pattern: remove old line, append new value
+            if [ -n "$TOKOCRYPTO_API_KEY" ]; then
+              sed -i '/^TOKOCRYPTO_API_KEY=/d' .env 2>/dev/null || true
+              echo "TOKOCRYPTO_API_KEY=${TOKOCRYPTO_API_KEY}" >> .env
+              echo "✅ TOKOCRYPTO_API_KEY injected into .env"
+            fi
+            if [ -n "$TOKOCRYPTO_API_SECRET" ]; then
+              sed -i '/^TOKOCRYPTO_API_SECRET=/d' .env 2>/dev/null || true
+              echo "TOKOCRYPTO_API_SECRET=${TOKOCRYPTO_API_SECRET}" >> .env
+              echo "✅ TOKOCRYPTO_API_SECRET injected into .env"
+            fi
+
+            # Inject Tokocrypto pipeline config (idempotent — safe to re-run)
+            for VAR in ENABLE_TOKO TOKO_MAX_POSITIONS TOKO_BUDGET_IDR TOKO_TRADING_PHASE; do
+              sed -i "/^${VAR}=/d" .env 2>/dev/null || true
+            done
+            echo "ENABLE_TOKO=1"               >> .env
+            echo "TOKO_MAX_POSITIONS=5"        >> .env
+            echo "TOKO_BUDGET_IDR=196000"      >> .env
+            echo "TOKO_TRADING_PHASE=PHASE_3"  >> .env
+            echo "✅ Tokocrypto pipeline config injected into .env"
 
             # Rebuild and restart container
             docker compose down
