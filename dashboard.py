@@ -366,6 +366,7 @@ def _get_autorefresh_interval_ms(now_wib: datetime, is_vm_down: bool) -> int:
 
 
 STARTING_LAB_CAPITAL = 240.0
+MAX_TOKO_SLOTS = 10   # Tokocrypto real-money position limit
 
 
 # ---------------------------------------------------------------------------
@@ -1873,6 +1874,198 @@ def render_open_positions_tab(
 
 
 # ---------------------------------------------------------------------------
+# TOKOCRYPTO — data loading + helpers (real money, IDR-denominated)
+# ---------------------------------------------------------------------------
+
+# Slippage thresholds from the Tokocrypto state machine design
+TOKO_SLIP_ENTRY_THRESHOLD_PCT = 0.3    # entry slippage flag level
+TOKO_SLIP_EXIT_THRESHOLD_PCT  = 0.1    # exit  slippage flag level
+
+# Exit reasons excluded from "genuine" PnL totals — same provenance discipline
+# as SPOT_EXCLUDED_EXIT_REASONS in build_metrics().
+TOKO_EXCLUDED_EXIT_REASONS = {
+    "OCO_STUCK_MANUAL_RESOLUTION",
+    "CRITICAL_ANOMALY",
+    "BOTH_CANCELED_ANOMALY",
+    "RECONCILIATION_REQUIRED",
+}
+
+# OCO states that require an unmissable anomaly card (Section 4)
+TOKO_ANOMALY_STATES = {
+    "CRITICAL_ANOMALY",
+    "BOTH_CANCELED_ANOMALY",
+    "RECONCILIATION_REQUIRED",
+}
+
+
+def load_tokocrypto_data() -> pd.DataFrame:
+    """
+    Load trades_tokocrypto rows from Supabase.
+    Returns empty DataFrame on error.
+    NEVER touches trades_spot or trades_futures.
+    """
+    try:
+        from services.supabase_client import fetch_all_tokocrypto
+        rows = fetch_all_tokocrypto()
+    except Exception as exc:
+        st.error("Failed to load Tokocrypto trades from Supabase.")
+        st.exception(exc)
+        return pd.DataFrame()
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    for col in [
+        "entry_price", "entry_fill_price", "entry_qty",
+        "entry_notional_idr", "tp_price", "sl_price",
+        "realized_pnl_idr", "realized_pnl_pct",
+        "slippage_pct", "exit_fill_slippage_pct",
+        "slot_size_idr",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    exit_st = df["exit_status"].fillna("").astype(str).str.upper() \
+              if "exit_status" in df.columns else pd.Series("", index=df.index)
+    df["is_resolved"] = exit_st.isin(["TP_HIT", "SL_HIT"])
+    df["is_win"]      = df["realized_pnl_idr"].gt(0) if "realized_pnl_idr" in df.columns \
+                        else pd.Series(False, index=df.index)
+
+    oco_st = df["oco_state"].fillna("").astype(str) \
+             if "oco_state" in df.columns else pd.Series("", index=df.index)
+    df["has_anomaly"] = oco_st.isin(TOKO_ANOMALY_STATES)
+
+    def _parse_epoch_ms(series):
+        vals = pd.to_numeric(series, errors="coerce")
+        return pd.to_datetime(vals, unit="ms", utc=True, errors="coerce")
+
+    df["entry_fill_dt"] = _parse_epoch_ms(df["entry_fill_time"]) \
+                          if "entry_fill_time" in df.columns else pd.NaT
+    df["exit_dt"]       = _parse_epoch_ms(df["exit_time"]) \
+                          if "exit_time" in df.columns else pd.NaT
+
+    # Age of position (seconds since entry fill)
+    now_utc = pd.Timestamp.utcnow().tz_localize("UTC") \
+              if pd.Timestamp.utcnow().tzinfo is None \
+              else pd.Timestamp.utcnow()
+    if "entry_fill_dt" in df.columns:
+        df["age_seconds"] = (now_utc - df["entry_fill_dt"]).dt.total_seconds()
+    else:
+        df["age_seconds"] = pd.NA
+
+    # Age since anomaly was first detected
+    if "oco_state_detected_at" in df.columns:
+        df["anomaly_detected_dt"] = pd.to_datetime(
+            df["oco_state_detected_at"], utc=True, errors="coerce"
+        )
+        df["anomaly_age_seconds"] = (now_utc - df["anomaly_detected_dt"]).dt.total_seconds()
+    else:
+        df["anomaly_detected_dt"]  = pd.NaT
+        df["anomaly_age_seconds"]  = pd.NA
+
+    return df
+
+
+def build_toko_metrics(df: pd.DataFrame) -> dict:
+    """
+    Compute summary metrics for the Tokocrypto tab header.
+    Provenance filter applied: non-genuine exits excluded from effective totals.
+    """
+    resolved = df[df["is_resolved"]].copy()
+    if "exit_reason" in resolved.columns:
+        genuine = resolved[~resolved["exit_reason"].isin(TOKO_EXCLUDED_EXIT_REASONS)]
+    else:
+        genuine = resolved
+
+    total_trades     = int(len(df))
+    resolved_count   = int(len(resolved))
+    genuine_count    = int(len(genuine))
+    win_rate         = round(float(genuine["is_win"].mean() * 100) if genuine_count else 0.0, 2)
+    total_pnl_idr    = round(float(genuine["realized_pnl_idr"].sum()) if genuine_count else 0.0, 0)
+
+    open_rows        = df[df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"] \
+                       if "exit_status" in df.columns else pd.DataFrame()
+    slots_occupied   = int(len(open_rows))
+
+    return {
+        "total_trades":     total_trades,
+        "resolved_count":   resolved_count,
+        "genuine_count":    genuine_count,
+        "win_rate":         win_rate,
+        "total_pnl_idr":    total_pnl_idr,
+        "slots_occupied":   slots_occupied,
+    }
+
+
+def build_toko_equity_curve(df: pd.DataFrame):
+    """IDR equity curve for Tokocrypto (genuine exits only). Never combined with Spot/Futures."""
+    resolved = df[df["is_resolved"]].copy()
+    if resolved.empty:
+        return None
+    if "exit_reason" in resolved.columns:
+        resolved = resolved[~resolved["exit_reason"].isin(TOKO_EXCLUDED_EXIT_REASONS)]
+    if resolved.empty:
+        return None
+
+    resolved = resolved.sort_values("exit_dt")
+    resolved["cumulative_pnl_idr"] = resolved["realized_pnl_idr"].cumsum()
+    fig = px.line(
+        resolved, x="exit_dt", y="cumulative_pnl_idr", markers=True,
+        labels={"exit_dt": "Exit time", "cumulative_pnl_idr": "Cumulative PnL (Rp)"},
+    )
+    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+    return fig
+
+
+def build_toko_exit_provenance(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count exits by exit_reason for the provenance breakdown (Section 5).
+    Non-genuine exits are flagged, not hidden.
+    """
+    if df.empty or "exit_reason" not in df.columns:
+        return pd.DataFrame(columns=["exit_reason", "count", "genuine"])
+
+    resolved = df[df["is_resolved"]].copy()
+    if resolved.empty:
+        return pd.DataFrame(columns=["exit_reason", "count", "genuine"])
+
+    counts = (
+        resolved.groupby(resolved["exit_reason"].fillna("UNSPECIFIED"), as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+    )
+    counts["genuine"] = ~counts["exit_reason"].isin(TOKO_EXCLUDED_EXIT_REASONS)
+    return counts.sort_values("count", ascending=False)
+
+
+def _fmt_idr(val) -> str:
+    """Format an IDR value as Rp xxx,xxx."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "Rp —"
+    try:
+        return f"Rp {float(val):,.0f}"
+    except (TypeError, ValueError):
+        return "Rp —"
+
+
+def _age_str(seconds) -> str:
+    """Convert seconds to human-readable age string."""
+    try:
+        s = float(seconds)
+        if math.isnan(s) or s < 0:
+            return "n/a"
+    except (TypeError, ValueError):
+        return "n/a"
+    h, rem = divmod(int(s), 3600)
+    m_val  = rem // 60
+    if h >= 24:
+        return f"{h // 24}d {h % 24}h"
+    return f"{h}h {m_val}m" if h else f"{m_val}m"
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -1991,7 +2184,7 @@ def main():
 
     st.write("")
 
-    tab_spot, tab_futures, tab_open, tab_ml = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions", "🧪 ML Shadow Metrics"])
+    tab_spot, tab_futures, tab_open, tab_ml, tab_toko = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions", "🧪 ML Shadow Metrics", "🏦 Tokocrypto"])
 
     # ── TAB 1: SPOT ──────────────────────────────────────────────────────────
     with tab_spot:
@@ -2379,6 +2572,271 @@ def main():
                     "Futures pipeline runs independently without ML scoring. "
                     "A dedicated Futures ML model will be trained when Effective N > 100."
                 )
+
+    # ── TAB 5: TOKOCRYPTO (REAL MONEY) ───────────────────────────────────
+    with tab_toko:
+        # ── Section 1: Header / status bar ───────────────────────────────
+        st.markdown(
+            "<div style='background:#7b1010;color:#fff;border-radius:8px;"
+            "padding:10px 18px;margin-bottom:10px;font-size:1.05em;font-weight:700;"
+            "letter-spacing:0.03em'>🏦 REAL MONEY — Tokocrypto Spot &nbsp;·&nbsp; IDR</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Determine current phase from any row in the table (most recent)
+        _toko_rows_raw: list[dict] = []
+        try:
+            from services.supabase_client import fetch_all_tokocrypto
+            _toko_rows_raw = fetch_all_tokocrypto()
+        except Exception:
+            pass
+
+        _current_phase  = 1
+        _supervised     = True
+        if _toko_rows_raw:
+            _latest = _toko_rows_raw[-1]
+            try:
+                _current_phase = int(_latest.get("trading_phase", 1))
+            except (TypeError, ValueError):
+                _current_phase = 1
+            _supervised = bool(_latest.get("supervised", True))
+
+        _phase_labels = {
+            1: "Phase 1: Read-only / Pre-trade validation",
+            2: "Phase 2: 1 position max, manual-supervised",
+            3: "Phase 3: 1 position max, Rp 50,000 notional cap",
+        }
+        _phase_note = _phase_labels.get(_current_phase, f"Phase {_current_phase}")
+        _supervised_badge = (
+            "<span style='background:#555;color:#eee;border-radius:3px;"
+            "padding:1px 7px;font-size:0.82em'>manual-supervised</span>"
+            if _supervised else
+            "<span style='background:#8b0000;color:#fff;border-radius:3px;"
+            "padding:1px 7px;font-size:0.82em;font-weight:700'>AUTOMATED</span>"
+        )
+
+        st.markdown(
+            f"<div style='font-size:0.92em;margin-bottom:4px'>"
+            f"<b>{_phase_note}</b> &nbsp; {_supervised_badge}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Connection/last-cycle bar — same pattern as main status bar
+        _toko_conn_color = "#2ca02c" if global_state.connected else "#d62728"
+        _toko_conn_text  = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        st.markdown(
+            f"<div style='font-size:0.84em;color:#888'>"
+            f"{_toko_conn_text} &nbsp;·&nbsp; "
+            f"Last cycle: {global_state.last_event_time or 'Waiting...'} WIB"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+
+        # ── Load data (always from trades_tokocrypto only) ────────────────
+        toko_df = load_tokocrypto_data()
+
+        # ── Section 2: Capital & slots ────────────────────────────────────
+        st.subheader("Capital & Slots")
+
+        _idr_balance: float | None = None
+        _idr_locked:  float | None = None
+        try:
+            # Import inside tab block — never at module level
+            from core.clients.tokocrypto_client import TokocryptoClient
+            _toko_client = TokocryptoClient.build()
+            if _toko_client.authenticated:
+                _idr_bal = _toko_client.get_balance("IDR")
+                _idr_balance = _idr_bal.free
+                _idr_locked  = _idr_bal.locked
+        except Exception as _e:
+            st.warning(f"Could not fetch IDR balance from Tokocrypto: {_e}")
+
+        _toko_metrics = build_toko_metrics(toko_df) if not toko_df.empty else {
+            "total_trades": 0, "resolved_count": 0, "genuine_count": 0,
+            "win_rate": 0.0, "total_pnl_idr": 0.0, "slots_occupied": 0,
+        }
+
+        _slots_occupied = _toko_metrics["slots_occupied"]
+        _slot_size = (
+            round(_idr_balance / MAX_TOKO_SLOTS, 0) if _idr_balance else None
+        )
+
+        cap_c1, cap_c2, cap_c3, cap_c4 = st.columns(4)
+        cap_c1.metric(
+            "IDR Balance (free)",
+            _fmt_idr(_idr_balance),
+            delta=f"locked {_fmt_idr(_idr_locked)}" if _idr_locked else None,
+        )
+        cap_c2.metric(
+            "Slots occupied",
+            f"{_slots_occupied} / {MAX_TOKO_SLOTS}",
+        )
+        cap_c3.metric(
+            "Next slot size",
+            _fmt_idr(_slot_size) if _slot_size else "—",
+            help=f"available_balance / {MAX_TOKO_SLOTS} — recalculated every cycle",
+        )
+        cap_c4.metric(
+            "MAX_TOKO_SLOTS",
+            MAX_TOKO_SLOTS,
+        )
+
+        st.divider()
+
+        # ── Section 4: Anomaly panel (rendered BEFORE open positions table,
+        #    always visible, never buried) ────────────────────────────────
+        if not toko_df.empty and "has_anomaly" in toko_df.columns:
+            _anomaly_rows = toko_df[toko_df["has_anomaly"]].to_dict("records")
+        else:
+            _anomaly_rows = []
+
+        if _anomaly_rows:
+            st.markdown(
+                "<div style='background:#8b0000;color:#fff;border-radius:8px;"
+                "padding:8px 16px;font-size:1.0em;font-weight:700;margin-bottom:8px'>"
+                "🚨 ANOMALY ALERT — ACTION REQUIRED</div>",
+                unsafe_allow_html=True,
+            )
+            for _arow in _anomaly_rows:
+                _a_sym       = _arow.get("symbol", "?")
+                _a_state     = _arow.get("oco_state", "?")
+                _a_detected  = _arow.get("oco_state_detected_at", "?")
+                _a_tp_status = _arow.get("tp_order_id", "?")
+                _a_sl_status = _arow.get("sl_order_id", "?")
+                _a_age       = _age_str(_arow.get("anomaly_age_seconds"))
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div style='background:#8b0000;color:#fff;border-radius:6px;"
+                        f"padding:6px 14px;margin-bottom:6px'>"
+                        f"<b>🚨 {_a_sym}</b> &nbsp;—&nbsp; <code style='color:#ffcdd2'>"
+                        f"{_a_state}</code>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    ac1, ac2, ac3 = st.columns(3)
+                    ac1.markdown(f"**Detected at:** `{_a_detected}`")
+                    ac2.markdown(f"**Age:** {_a_age}")
+                    ac3.markdown(f"**TP leg:** `{_a_tp_status}` &nbsp; **SL leg:** `{_a_sl_status}`")
+                    st.caption(
+                        "⚠ Both legs status shown raw — do NOT assume one is correct. "
+                        "Reconcile manually via Tokocrypto order API before acting."
+                    )
+            st.divider()
+        else:
+            st.success("✅ No anomalies detected")
+            st.divider()
+
+        # ── Section 3: Open positions table ──────────────────────────────
+        st.subheader("Open Positions")
+
+        if toko_df.empty:
+            st.info("No Tokocrypto positions yet. Table will populate once trades are recorded.")
+        else:
+            _open_mask = (
+                toko_df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"
+            ) if "exit_status" in toko_df.columns else pd.Series(False, index=toko_df.index)
+            _open_toko = toko_df[_open_mask].copy()
+
+            if _open_toko.empty:
+                st.info("No open Tokocrypto positions.")
+            else:
+                _display_open_cols = [c for c in [
+                    "symbol", "entry_status", "oco_state",
+                    "entry_price", "tp_price", "sl_price",
+                    "entry_fill_price", "entry_notional_idr",
+                    "slippage_pct", "age_seconds",
+                    "trading_phase", "supervised", "b_order_list_id",
+                ] if c in _open_toko.columns]
+
+                _open_display = _open_toko[_display_open_cols].copy()
+                if "age_seconds" in _open_display.columns:
+                    _open_display["age"] = _open_display["age_seconds"].apply(_age_str)
+                    _open_display = _open_display.drop(columns=["age_seconds"])
+
+                st.dataframe(_open_display, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Section 5: Realized PnL and history ──────────────────────────
+        st.subheader("Realized PnL & History")
+
+        if not toko_df.empty and _toko_metrics["resolved_count"] > 0:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Realized PnL",
+                      _fmt_idr(_toko_metrics["total_pnl_idr"]))
+            m2.metric("Win rate (genuine exits)",
+                      f"{_toko_metrics['win_rate']:.2f}%")
+            m3.metric("Resolved trades",
+                      _toko_metrics["resolved_count"])
+            m4.metric("Genuine exits",
+                      _toko_metrics["genuine_count"],
+                      delta=f"{_toko_metrics['resolved_count'] - _toko_metrics['genuine_count']} excluded"
+                            if _toko_metrics["resolved_count"] > _toko_metrics["genuine_count"] else None)
+
+            # IDR equity curve — never shared with Spot/Futures charts
+            st.subheader("IDR Equity Curve (genuine exits only)")
+            _toko_equity = build_toko_equity_curve(toko_df)
+            if _toko_equity:
+                st.plotly_chart(_toko_equity, use_container_width=True)
+            else:
+                st.info("No genuine exits yet for equity curve.")
+
+            # Slippage review table
+            st.subheader("Per-trade Slippage")
+            _slip_cols = [c for c in [
+                "symbol", "entry_fill_price", "slippage_pct",
+                "exit_price" if "exit_price" in toko_df.columns else None,
+                "exit_fill_slippage_pct", "exit_reason",
+            ] if c and c in toko_df.columns]
+            if _slip_cols:
+                _slip_df = toko_df[toko_df["is_resolved"]][_slip_cols].copy()
+                # Flag rows exceeding thresholds
+                if "slippage_pct" in _slip_df.columns:
+                    _slip_df["entry_slip_flag"] = _slip_df["slippage_pct"].abs().gt(
+                        TOKO_SLIP_ENTRY_THRESHOLD_PCT
+                    )
+                if "exit_fill_slippage_pct" in _slip_df.columns:
+                    _slip_df["exit_slip_flag"] = _slip_df["exit_fill_slippage_pct"].abs().gt(
+                        TOKO_SLIP_EXIT_THRESHOLD_PCT
+                    )
+                st.dataframe(_slip_df, use_container_width=True, hide_index=True)
+                _n_entry_flag = int(_slip_df.get("entry_slip_flag", pd.Series(dtype=bool)).sum())
+                _n_exit_flag  = int(_slip_df.get("exit_slip_flag",  pd.Series(dtype=bool)).sum())
+                if _n_entry_flag or _n_exit_flag:
+                    st.warning(
+                        f"⚠ {_n_entry_flag} trade(s) exceeded entry slippage threshold "
+                        f"({TOKO_SLIP_ENTRY_THRESHOLD_PCT}%) · "
+                        f"{_n_exit_flag} trade(s) exceeded exit slippage threshold "
+                        f"({TOKO_SLIP_EXIT_THRESHOLD_PCT}%)"
+                    )
+
+            # Exit provenance breakdown
+            st.subheader("Exit Provenance Breakdown")
+            _prov_df = build_toko_exit_provenance(toko_df)
+            if not _prov_df.empty:
+                st.dataframe(_prov_df, use_container_width=True, hide_index=True)
+                _non_genuine = _prov_df[~_prov_df["genuine"]]
+                if not _non_genuine.empty:
+                    st.caption(
+                        "ℹ️ Non-genuine exits (shown above, not pooled into win rate): "
+                        + ", ".join(_non_genuine["exit_reason"].tolist())
+                    )
+        else:
+            st.info("No resolved Tokocrypto trades yet. PnL history will appear here.")
+
+        st.divider()
+
+        # ── Section 6: Read-only / real-money disclaimer ──────────────────
+        st.caption(
+            "🔴 REAL MONEY — Read-only analysis · Supabase: trades_tokocrypto · "
+            "Stats are INDEPENDENT from Binance paper Spot tab and Futures tab · "
+            "No order placement on this dashboard · "
+            f"Phase {_current_phase} {'(manual-supervised)' if _supervised else '(automated)'}"
+        )
 
     # Realtime is the normal path.  This is its bounded fallback for a missed
     # WebSocket event: query only in the short period after an expected cycle,

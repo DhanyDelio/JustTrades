@@ -62,9 +62,10 @@ def get_client():
 # ---------------------------------------------------------------------------
 # Table constants — single source of truth
 # ---------------------------------------------------------------------------
-TABLE_SPOT      = "trades_spot"
-TABLE_FUTURES   = "trades_futures"
-TABLE_HEARTBEAT = "system_heartbeat"   # bot liveness + next cycle promise
+TABLE_SPOT        = "trades_spot"
+TABLE_FUTURES     = "trades_futures"
+TABLE_HEARTBEAT   = "system_heartbeat"   # bot liveness + next cycle promise
+TABLE_TOKOCRYPTO  = "trades_tokocrypto"
 
 
 # ---------------------------------------------------------------------------
@@ -184,4 +185,29 @@ def fetch_heartbeat() -> dict | None:
     finally:
         _elapsed_ms = (time.perf_counter() - _t0) * 1000
         log_timing(f"[TIMING] query_fetch_heartbeat: {_elapsed_ms:.0f}ms")
+
+
+def fetch_all_tokocrypto() -> list[dict]:
+    """Return all rows from trades_tokocrypto. Returns [] if table does not exist."""
+    try:
+        _t0 = time.perf_counter()
+        client = get_client()
+        result = client.table(TABLE_TOKOCRYPTO).select("*").order("id").execute()
+        _elapsed_ms = (time.perf_counter() - _t0) * 1000
+        log_timing(f"[TIMING] query_fetch_all_tokocrypto: {_elapsed_ms:.0f}ms")
+        return result.data or []
+    except Exception:
+        return []   # graceful: table may not exist yet
+
+
+def upsert_tokocrypto(record: dict) -> None:
+    get_client().table(TABLE_TOKOCRYPTO).upsert(record, on_conflict="entry_order_id").execute()
+
+
+def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
+    (get_client()
+     .table(TABLE_TOKOCRYPTO)
+     .update(fields)
+     .eq("entry_order_id", entry_order_id)
+     .execute())
 
