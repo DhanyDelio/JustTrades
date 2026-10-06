@@ -1020,6 +1020,52 @@ class TokocryptoClient:
     # ---------------------------------------------------------------------------
 
 
+    def _signed_post(self, path: str, params: dict) -> dict:
+        """
+        Perform a SIGNED POST against BASE_URL.
+        Params are sent as application/x-www-form-urlencoded body (data=),
+        NOT as query params — this is required by Tokocrypto's auth scheme.
+        Raises TokocryptoAuthError if credentials not configured.
+        """
+        self._require_credentials()
+        signed_params = self._sign_params(params)
+        url = f"{self.BASE_URL}{path}"
+        try:
+            r = self._session.post(
+                url,
+                data=signed_params,   # x-www-form-urlencoded body
+                headers={"X-MBX-APIKEY": self._api_key},  # type: ignore[arg-type]
+                timeout=self._timeout,
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise TokocryptoNetworkError(f"Connection failed: {e}") from e
+        except requests.exceptions.Timeout as e:
+            raise TokocryptoNetworkError(f"Request timed out: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise TokocryptoNetworkError(f"Network error: {e}") from e
+        return self._handle_response(r)
+
+    def get_order_detail(self, symbol: str, order_id: str) -> dict:
+        """
+        Query a single order by orderId (SIGNED GET).
+        Maps to GET /open/v1/orders.
+
+        Returns the 'data' sub-dict from the response.
+        Raises TokocryptoAPIError (code -2013) if orderId not found.
+        Raises TokocryptoMalformedResponseError if 'data' is absent.
+        """
+        resp = self._signed_get("/open/v1/orders", {
+            "symbol":  self.normalize_symbol(symbol),
+            "orderId": str(order_id),
+        })
+        data = resp.get("data")
+        if data is None:
+            raise TokocryptoMalformedResponseError(
+                f"get_order_detail({symbol}, {order_id}): 'data' field missing in response"
+            )
+        return data
+
+
 # ---------------------------------------------------------------------------
 # Convenience re-exports for callers that only need normalization helpers
 # ---------------------------------------------------------------------------
