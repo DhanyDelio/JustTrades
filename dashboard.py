@@ -366,7 +366,8 @@ def _get_autorefresh_interval_ms(now_wib: datetime, is_vm_down: bool) -> int:
 
 
 STARTING_LAB_CAPITAL = 240.0
-MAX_TOKO_SLOTS = 10   # Tokocrypto real-money position limit
+MAX_TOKO_SLOTS = 10          # Tokocrypto real-money position limit
+TOKO_INITIAL_DEPOSIT_IDR = float(os.getenv("TOKO_INITIAL_DEPOSIT_IDR", "200000"))  # IDR baseline for growth/drawdown display
 
 
 # ---------------------------------------------------------------------------
@@ -2583,23 +2584,21 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # Determine current phase from any row in the table (most recent)
-        _toko_rows_raw: list[dict] = []
-        try:
-            from services.supabase_client import fetch_all_tokocrypto
-            _toko_rows_raw = fetch_all_tokocrypto()
-        except Exception:
-            pass
+        # ── Load data (always from trades_tokocrypto only) ────────────────
+        # NOTE: load_tokocrypto_data() is the single fetch point — derive
+        # trading_phase from toko_df rather than issuing a second fetch call.
+        toko_df = load_tokocrypto_data()
 
+        # Determine current phase from the most recent loaded row
         _current_phase  = 1
         _supervised     = True
-        if _toko_rows_raw:
-            _latest = _toko_rows_raw[-1]
+        if not toko_df.empty and "trading_phase" in toko_df.columns:
             try:
-                _current_phase = int(_latest.get("trading_phase", 1))
+                _current_phase = int(toko_df.iloc[-1].get("trading_phase", 1) or 1)
             except (TypeError, ValueError):
                 _current_phase = 1
-            _supervised = bool(_latest.get("supervised", True))
+        if not toko_df.empty and "supervised" in toko_df.columns:
+            _supervised = bool(toko_df.iloc[-1].get("supervised", True))
 
         _phase_labels = {
             1: "Phase 1: Read-only / Pre-trade validation",
@@ -2634,9 +2633,6 @@ def main():
         )
 
         st.divider()
-
-        # ── Load data (always from trades_tokocrypto only) ────────────────
-        toko_df = load_tokocrypto_data()
 
         # ── Section 2: Capital & slots ────────────────────────────────────
         st.subheader("Capital & Slots")
@@ -2680,8 +2676,11 @@ def main():
             help=f"available_balance / {MAX_TOKO_SLOTS} — recalculated every cycle",
         )
         cap_c4.metric(
-            "MAX_TOKO_SLOTS",
-            MAX_TOKO_SLOTS,
+            "Balance vs Initial Deposit",
+            _fmt_idr(_idr_balance) if _idr_balance is not None else "—",
+            delta=f"{_fmt_idr(_idr_balance - TOKO_INITIAL_DEPOSIT_IDR)} vs Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f} deposited"
+            if _idr_balance is not None else None,
+            help=f"Initial deposit: Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f} (set via TOKO_INITIAL_DEPOSIT_IDR env var)",
         )
 
         st.divider()
@@ -2704,8 +2703,14 @@ def main():
                 _a_sym       = _arow.get("symbol", "?")
                 _a_state     = _arow.get("oco_state", "?")
                 _a_detected  = _arow.get("oco_state_detected_at", "?")
-                _a_tp_status = _arow.get("tp_order_id", "?")
-                _a_sl_status = _arow.get("sl_order_id", "?")
+                # Show leg execution statuses (FILLED/CANCELED/EXPIRED) from oco_state
+                # sub-fields. The schema stores raw per-leg status in exit_status when
+                # resolved; for anomaly rows the oco_state itself is the best available
+                # status indicator. Show order IDs alongside for manual reconciliation.
+                _a_tp_id     = _arow.get("tp_order_id", "n/a")
+                _a_sl_id     = _arow.get("sl_order_id", "n/a")
+                _a_exit_st   = _arow.get("exit_status") or "OPEN"
+                _a_entry_st  = _arow.get("entry_status") or "n/a"
                 _a_age       = _age_str(_arow.get("anomaly_age_seconds"))
 
                 with st.container(border=True):
@@ -2720,14 +2725,21 @@ def main():
                     ac1, ac2, ac3 = st.columns(3)
                     ac1.markdown(f"**Detected at:** `{_a_detected}`")
                     ac2.markdown(f"**Age:** {_a_age}")
-                    ac3.markdown(f"**TP leg:** `{_a_tp_status}` &nbsp; **SL leg:** `{_a_sl_status}`")
+                    ac3.markdown(f"**Entry status:** `{_a_entry_st}` &nbsp; **Exit status:** `{_a_exit_st}`")
+                    st.markdown(
+                        f"TP order ID: `{_a_tp_id}` &nbsp;·&nbsp; SL order ID: `{_a_sl_id}`"
+                    )
                     st.caption(
-                        "⚠ Both legs status shown raw — do NOT assume one is correct. "
-                        "Reconcile manually via Tokocrypto order API before acting."
+                        "⚠ Use order IDs above to query execution status (FILLED/CANCELED/EXPIRED) "
+                        "directly via Tokocrypto order API — do NOT assume either leg resolved correctly. "
+                        "Reconcile both legs manually before acting."
                     )
             st.divider()
-        else:
+        elif not toko_df.empty:
             st.success("✅ No anomalies detected")
+            st.divider()
+        else:
+            st.info("No Tokocrypto trades recorded yet — anomaly monitor will activate once trading begins.")
             st.divider()
 
         # ── Section 3: Open positions table ──────────────────────────────
