@@ -77,63 +77,61 @@ jobs:
           TOKOCRYPTO_API_KEY:    ${{ secrets.TOKOCRYPTO_API_KEY }}
           TOKOCRYPTO_API_SECRET: ${{ secrets.TOKOCRYPTO_API_SECRET }}
         run: |
-          # Write remote script to a temp file — avoids heredoc env var expansion issues
-          cat > /tmp/remote_deploy.sh << 'REMOTE_SCRIPT'
-          #!/bin/bash
-          set -e
-          cd ~/JustTrades
+          # ── Step A: Generate toko_inject.env on the runner ───────────────
+          # This file contains the Tokocrypto secrets as plain key=value.
+          # It is never committed — only exists on the runner and VM transiently.
+          cat > /tmp/toko_inject.env << EOF
+          TOKOCRYPTO_API_KEY=${TOKOCRYPTO_API_KEY}
+          TOKOCRYPTO_API_SECRET=${TOKOCRYPTO_API_SECRET}
+          ENABLE_TOKO=1
+          TOKO_MAX_POSITIONS=5
+          TOKO_BUDGET_IDR=196000
+          TOKO_TRADING_PHASE=PHASE_3
+          EOF
 
-          # Capture current commit hash BEFORE pull for rollback
-          PREV_HASH=$(git rev-parse --short HEAD)
-          echo "PREV_HASH=${PREV_HASH}" >> /tmp/deploy_state
-          echo "Pre-deploy commit: ${PREV_HASH}"
-
-          # Pull latest changes
-          git pull origin main
-
-          NEW_HASH=$(git rev-parse --short HEAD)
-          echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
-          echo "Post-pull commit: ${NEW_HASH}"
-          REMOTE_SCRIPT
-
-          # Append env injection — vars expand HERE (on runner), written as literals to remote script
-          cat >> /tmp/remote_deploy.sh << INJECT_SCRIPT
-
-          # Inject Tokocrypto API keys (values from GitHub Secrets)
-          sed -i '/^TOKOCRYPTO_API_KEY=/d' .env 2>/dev/null || true
-          sed -i '/^TOKOCRYPTO_API_SECRET=/d' .env 2>/dev/null || true
-          echo "TOKOCRYPTO_API_KEY=${TOKOCRYPTO_API_KEY}" >> .env
-          echo "TOKOCRYPTO_API_SECRET=${TOKOCRYPTO_API_SECRET}" >> .env
-          echo "✅ Tokocrypto API keys injected"
-
-          # Inject Tokocrypto pipeline config (idempotent)
-          for VAR in ENABLE_TOKO TOKO_MAX_POSITIONS TOKO_BUDGET_IDR TOKO_TRADING_PHASE; do
-            sed -i "/^\${VAR}=/d" .env 2>/dev/null || true
-          done
-          echo "ENABLE_TOKO=1"               >> .env
-          echo "TOKO_MAX_POSITIONS=5"        >> .env
-          echo "TOKO_BUDGET_IDR=196000"      >> .env
-          echo "TOKO_TRADING_PHASE=PHASE_3"  >> .env
-          echo "✅ Tokocrypto pipeline config injected"
-
-          # Rebuild and restart container
-          docker compose down
-          docker compose up -d --build
-          echo "Container restarted. Waiting for health check..."
-          INJECT_SCRIPT
-
-          chmod +x /tmp/remote_deploy.sh
-
+          # ── Step B: SCP the inject file to VM ────────────────────────────
           scp -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
-              /tmp/remote_deploy.sh \
-              "${VM_USER}@${VM_HOST}:/tmp/remote_deploy.sh"
+              /tmp/toko_inject.env \
+              "${VM_USER}@${VM_HOST}:/tmp/toko_inject.env"
 
+          # ── Step C: Run deploy + inject on VM ────────────────────────────
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=15 \
-              "${VM_USER}@${VM_HOST}" \
-              "bash /tmp/remote_deploy.sh"
+              "${VM_USER}@${VM_HOST}" bash << 'ENDSSH'
+            set -e
+            cd ~/JustTrades
+
+            # Capture current commit hash BEFORE pull for rollback
+            PREV_HASH=$(git rev-parse --short HEAD)
+            echo "PREV_HASH=${PREV_HASH}" > /tmp/deploy_state
+            echo "Pre-deploy commit: ${PREV_HASH}"
+
+            # Pull latest changes
+            git pull origin main
+
+            NEW_HASH=$(git rev-parse --short HEAD)
+            echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
+            echo "Post-pull commit: ${NEW_HASH}"
+
+            # Inject Tokocrypto vars from scp'd file into .env (upsert per key)
+            while IFS='=' read -r KEY VALUE; do
+              KEY=$(echo "$KEY" | tr -d ' ')
+              VALUE=$(echo "$VALUE" | tr -d ' ')
+              [ -z "$KEY" ] && continue
+              sed -i "/^${KEY}=/d" .env 2>/dev/null || true
+              echo "${KEY}=${VALUE}" >> .env
+              echo "  ✅ ${KEY} injected"
+            done < /tmp/toko_inject.env
+            rm -f /tmp/toko_inject.env
+            echo "Env injection complete."
+
+            # Rebuild and restart container
+            docker compose down
+            docker compose up -d --build
+            echo "Container restarted. Waiting for health check..."
+          ENDSSH
 
       # ── 3. Health check ──────────────────────────────────────────────────
       # Wait 2.5 minutes after container restart before checking.
