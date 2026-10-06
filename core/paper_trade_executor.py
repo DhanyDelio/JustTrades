@@ -321,6 +321,26 @@ def _send_telegram(message: str) -> None:
         pass
 
 
+def _send_toko_telegram(message: str) -> None:
+    """
+    Send a Tokocrypto-specific Telegram notification.
+
+    Automatically prefixes every message with "[Toko_Crypto_Spot]" so
+    Tokocrypto real-money alerts are immediately distinguishable from
+    Binance paper/testnet notifications in the same Telegram channel.
+
+    Examples:
+        _send_toko_telegram("✅ TP HIT: BTC_IDR @ Rp 1,350,000,000")
+        → "[Toko_Crypto_Spot] ✅ TP HIT: BTC_IDR @ Rp 1,350,000,000"
+
+        _send_toko_telegram("🔴 SL HIT: ETH_IDR  PnL: -Rp 12,500")
+        → "[Toko_Crypto_Spot] 🔴 SL HIT: ETH_IDR  PnL: -Rp 12,500"
+
+    Respects TELEGRAM_ENABLED=false for local suppression.
+    """
+    _send_telegram(f"[Toko_Crypto_Spot] {message}")
+
+
 # ---------------------------------------------------------------------------
 
 def cmd_propose(scan_n: int, symbol_filter: str | None = None,
