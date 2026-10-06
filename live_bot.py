@@ -40,6 +40,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 3600))
 # Set via environment to disable one pipeline without rebuilding
 ENABLE_SPOT    = os.environ.get("ENABLE_SPOT", "1") == "1"
 ENABLE_FUTURES = os.environ.get("ENABLE_FUTURES", "1") == "1"
+ENABLE_TOKO    = os.environ.get("ENABLE_TOKO", "0") == "1"
 
 # Exit code produced by executors when exchange is down (maintenance/outage)
 _RC_MAINTENANCE = 2
@@ -120,6 +121,35 @@ def run_futures_pipeline() -> str:
     return _STATUS_SUCCESS if step2 == _STATUS_SUCCESS else _STATUS_ERROR
 
 
+def run_tokocrypto_pipeline() -> str:
+    """
+    Tokocrypto IDR Spot pipeline — real money, fully automated (Phase 3).
+    Independent from Binance Spot and Futures pipelines.
+
+    Step 1: check-positions — update open positions, detect OCO resolutions
+    Step 2: propose        — scan 29 IDR pairs, fill empty slots (max 5)
+
+    Returns pipeline status string for cycle summary.
+    """
+    print(f"\n{'=' * 50}", flush=True)
+    print("  TOKOCRYPTO IDR SPOT PIPELINE  🔴 REAL MONEY", flush=True)
+    print(f"{'=' * 50}", flush=True)
+
+    print("[Toko 1/2] Checking Tokocrypto Positions...", flush=True)
+    status = _run_step([sys.executable, "tokocrypto_executor.py", "--check-positions"])
+    if status == _STATUS_MAINTENANCE:
+        print("⚠️ Tokocrypto unavailable. Skipping Toko pipeline.", flush=True)
+        return _STATUS_MAINTENANCE
+
+    print("[Toko 2/2] Proposing New Tokocrypto Trades...", flush=True)
+    step2 = _run_step([sys.executable, "tokocrypto_executor.py", "--propose"])
+    if step2 == _STATUS_MAINTENANCE:
+        print("⚠️ Tokocrypto unavailable on propose step.", flush=True)
+        return _STATUS_MAINTENANCE
+
+    return _STATUS_SUCCESS if step2 == _STATUS_SUCCESS else _STATUS_ERROR
+
+
 def _send_outage_telegram(spot_status: str, futures_status: str) -> None:
     """
     Kirim SATU Telegram alert kalau ada pipeline yang kena maintenance.
@@ -168,6 +198,7 @@ def run_cycle() -> float:
 
     spot_status    = _STATUS_SUCCESS
     futures_status = _STATUS_SUCCESS
+    toko_status    = _STATUS_SUCCESS
 
     if ENABLE_SPOT:
         spot_status = run_spot_pipeline()
@@ -181,10 +212,17 @@ def run_cycle() -> float:
         print("[SKIP] Futures pipeline disabled (ENABLE_FUTURES=0)", flush=True)
         futures_status = "DISABLED"
 
+    if ENABLE_TOKO:
+        toko_status = run_tokocrypto_pipeline()
+    else:
+        print("[SKIP] Tokocrypto pipeline disabled (ENABLE_TOKO=0)", flush=True)
+        toko_status = "DISABLED"
+
     # ── Kirim Telegram alert jika ada outage (sekali per cycle) ──────
     any_maintenance = (
         spot_status    == _STATUS_MAINTENANCE or
-        futures_status == _STATUS_MAINTENANCE
+        futures_status == _STATUS_MAINTENANCE or
+        toko_status    == _STATUS_MAINTENANCE
     )
     if any_maintenance:
         _send_outage_telegram(spot_status, futures_status)
@@ -205,6 +243,8 @@ def run_cycle() -> float:
         bot_status = "SPOT_MAINTENANCE"
     elif futures_status == _STATUS_MAINTENANCE:
         bot_status = "FUTURES_MAINTENANCE"
+    elif toko_status == _STATUS_MAINTENANCE:
+        bot_status = "TOKO_MAINTENANCE"
     else:
         bot_status = "ONLINE"
 
@@ -231,6 +271,7 @@ def run_cycle() -> float:
     print(f"{'=' * 50}", flush=True)
     print(f"  Spot     : {spot_status}", flush=True)
     print(f"  Futures  : {futures_status}", flush=True)
+    print(f"  Toko IDR : {toko_status}", flush=True)
     print(f"  Heartbeat: SENT  (status={bot_status})", flush=True)
     print(f"{'=' * 50}", flush=True)
 
