@@ -1901,7 +1901,7 @@ TOKO_ANOMALY_STATES = {
 
 def load_tokocrypto_data() -> pd.DataFrame:
     """
-    Load trades_tokocrypto rows from Supabase.
+    Load Toko_Crypto_Spot rows from Supabase.
     Returns empty DataFrame on error.
     NEVER touches trades_spot or trades_futures.
     """
@@ -2584,7 +2584,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # ── Load data (always from trades_tokocrypto only) ────────────────
+        # ── Load data (always from Toko_Crypto_Spot only) ────────────────
         # NOTE: load_tokocrypto_data() is the single fetch point — derive
         # trading_phase from toko_df rather than issuing a second fetch call.
         toko_df = load_tokocrypto_data()
@@ -2858,7 +2858,7 @@ def main():
 
         # ── Section 6: Read-only / real-money disclaimer ──────────────────
         st.caption(
-            "🔴 REAL MONEY — Read-only analysis · Supabase: trades_tokocrypto · "
+            "🔴 REAL MONEY — Read-only analysis · Supabase: Toko_Crypto_Spot · "
             "Stats are INDEPENDENT from Binance paper Spot tab and Futures tab · "
             "No order placement on this dashboard · "
             f"Phase {_current_phase} {'(manual-supervised)' if _supervised else '(automated)'}"

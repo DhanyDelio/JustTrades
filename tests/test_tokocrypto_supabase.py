@@ -24,7 +24,7 @@ class TestTokoSupabaseHelpers(unittest.TestCase):
             mock_client = MagicMock()
             mock_get_client.return_value = mock_client
             mock_client.table.return_value.select.return_value.order.return_value.execute.side_effect = Exception(
-                "relation \"trades_tokocrypto\" does not exist"
+                "relation \"Toko_Crypto_Spot\" does not exist"
             )
             from services.supabase_client import fetch_all_tokocrypto
             result = fetch_all_tokocrypto()

@@ -65,7 +65,7 @@ def get_client():
 TABLE_SPOT        = "trades_spot"
 TABLE_FUTURES     = "trades_futures"
 TABLE_HEARTBEAT   = "system_heartbeat"   # bot liveness + next cycle promise
-TABLE_TOKOCRYPTO  = "trades_tokocrypto"
+TABLE_TOKOCRYPTO  = "Toko_Crypto_Spot"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ def fetch_heartbeat() -> dict | None:
 
 
 def fetch_all_tokocrypto() -> list[dict]:
-    """Return all rows from trades_tokocrypto. Returns [] if table does not exist."""
+    """Return all rows from Toko_Crypto_Spot. Returns [] if table does not exist."""
     try:
         _t0 = time.perf_counter()
         client = get_client()
