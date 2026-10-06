@@ -48,5 +48,5 @@ CREATE TABLE IF NOT EXISTS trades_tokocrypto (
 CREATE INDEX IF NOT EXISTS idx_toko_exit_status  ON trades_tokocrypto (exit_status);
 CREATE INDEX IF NOT EXISTS idx_toko_symbol       ON trades_tokocrypto (symbol);
 CREATE INDEX IF NOT EXISTS idx_toko_open_time    ON trades_tokocrypto (open_time DESC);
-CREATE INDEX IF NOT EXISTS idx_toko_entry_order  ON trades_tokocrypto (entry_order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_toko_entry_order  ON trades_tokocrypto (entry_order_id);
 CREATE INDEX IF NOT EXISTS idx_toko_b_list_id    ON trades_tokocrypto (b_order_list_id);

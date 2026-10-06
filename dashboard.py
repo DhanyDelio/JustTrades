@@ -2594,11 +2594,26 @@ def main():
         _supervised     = True
         if not toko_df.empty and "trading_phase" in toko_df.columns:
             try:
-                _current_phase = int(toko_df.iloc[-1].get("trading_phase", 1) or 1)
+                # Sort by open_time descending so backfills/manual inserts don't
+                # poison the phase display — always read from the most recent trade.
+                _phase_source = (
+                    toko_df.sort_values("open_time", ascending=False)
+                    if "open_time" in toko_df.columns
+                    else toko_df
+                )
+                _current_phase = int(_phase_source.iloc[0].get("trading_phase", 1) or 1)
             except (TypeError, ValueError):
                 _current_phase = 1
         if not toko_df.empty and "supervised" in toko_df.columns:
-            _supervised = bool(toko_df.iloc[-1].get("supervised", True))
+            try:
+                _phase_source_sv = (
+                    toko_df.sort_values("open_time", ascending=False)
+                    if "open_time" in toko_df.columns
+                    else toko_df
+                )
+                _supervised = bool(_phase_source_sv.iloc[0].get("supervised", True))
+            except (TypeError, ValueError):
+                _supervised = True
 
         _phase_labels = {
             1: "Phase 1: Read-only / Pre-trade validation",
@@ -2735,11 +2750,10 @@ def main():
                         "Reconcile both legs manually before acting."
                     )
             st.divider()
-        elif not toko_df.empty:
-            st.success("✅ No anomalies detected")
-            st.divider()
         else:
-            st.info("No Tokocrypto trades recorded yet — anomaly monitor will activate once trading begins.")
+            # Always show all-clear state so a reviewer can confirm the monitor
+            # is active before any trade is recorded (spec: "always visible").
+            st.success("✅ No anomalies detected")
             st.divider()
 
         # ── Section 3: Open positions table ──────────────────────────────
