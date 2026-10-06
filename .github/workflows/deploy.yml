@@ -77,58 +77,63 @@ jobs:
           TOKOCRYPTO_API_KEY:    ${{ secrets.TOKOCRYPTO_API_KEY }}
           TOKOCRYPTO_API_SECRET: ${{ secrets.TOKOCRYPTO_API_SECRET }}
         run: |
+          # Write remote script to a temp file — avoids heredoc env var expansion issues
+          cat > /tmp/remote_deploy.sh << 'REMOTE_SCRIPT'
+          #!/bin/bash
+          set -e
+          cd ~/JustTrades
+
+          # Capture current commit hash BEFORE pull for rollback
+          PREV_HASH=$(git rev-parse --short HEAD)
+          echo "PREV_HASH=${PREV_HASH}" >> /tmp/deploy_state
+          echo "Pre-deploy commit: ${PREV_HASH}"
+
+          # Pull latest changes
+          git pull origin main
+
+          NEW_HASH=$(git rev-parse --short HEAD)
+          echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
+          echo "Post-pull commit: ${NEW_HASH}"
+          REMOTE_SCRIPT
+
+          # Append env injection — vars expand HERE (on runner), written as literals to remote script
+          cat >> /tmp/remote_deploy.sh << INJECT_SCRIPT
+
+          # Inject Tokocrypto API keys (values from GitHub Secrets)
+          sed -i '/^TOKOCRYPTO_API_KEY=/d' .env 2>/dev/null || true
+          sed -i '/^TOKOCRYPTO_API_SECRET=/d' .env 2>/dev/null || true
+          echo "TOKOCRYPTO_API_KEY=${TOKOCRYPTO_API_KEY}" >> .env
+          echo "TOKOCRYPTO_API_SECRET=${TOKOCRYPTO_API_SECRET}" >> .env
+          echo "✅ Tokocrypto API keys injected"
+
+          # Inject Tokocrypto pipeline config (idempotent)
+          for VAR in ENABLE_TOKO TOKO_MAX_POSITIONS TOKO_BUDGET_IDR TOKO_TRADING_PHASE; do
+            sed -i "/^\${VAR}=/d" .env 2>/dev/null || true
+          done
+          echo "ENABLE_TOKO=1"               >> .env
+          echo "TOKO_MAX_POSITIONS=5"        >> .env
+          echo "TOKO_BUDGET_IDR=196000"      >> .env
+          echo "TOKO_TRADING_PHASE=PHASE_3"  >> .env
+          echo "✅ Tokocrypto pipeline config injected"
+
+          # Rebuild and restart container
+          docker compose down
+          docker compose up -d --build
+          echo "Container restarted. Waiting for health check..."
+          INJECT_SCRIPT
+
+          chmod +x /tmp/remote_deploy.sh
+
+          scp -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              /tmp/remote_deploy.sh \
+              "${VM_USER}@${VM_HOST}:/tmp/remote_deploy.sh"
+
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=15 \
               "${VM_USER}@${VM_HOST}" \
-              TOKOCRYPTO_API_KEY="${TOKOCRYPTO_API_KEY}" \
-              TOKOCRYPTO_API_SECRET="${TOKOCRYPTO_API_SECRET}" \
-          'bash -s' << 'REMOTE'
-            set -e
-
-            cd ~/JustTrades
-
-            # Capture current commit hash BEFORE pull for rollback
-            PREV_HASH=$(git rev-parse --short HEAD)
-            echo "PREV_HASH=${PREV_HASH}" >> /tmp/deploy_state
-            echo "Pre-deploy commit: ${PREV_HASH}"
-
-            # Pull latest changes
-            git pull origin main
-
-            NEW_HASH=$(git rev-parse --short HEAD)
-            echo "NEW_HASH=${NEW_HASH}" >> /tmp/deploy_state
-            echo "Post-pull commit: ${NEW_HASH}"
-
-            # Inject Tokocrypto env vars into .env if provided
-            # Uses upsert pattern: remove old line, append new value
-            if [ -n "$TOKOCRYPTO_API_KEY" ]; then
-              sed -i '/^TOKOCRYPTO_API_KEY=/d' .env 2>/dev/null || true
-              echo "TOKOCRYPTO_API_KEY=${TOKOCRYPTO_API_KEY}" >> .env
-              echo "✅ TOKOCRYPTO_API_KEY injected into .env"
-            fi
-            if [ -n "$TOKOCRYPTO_API_SECRET" ]; then
-              sed -i '/^TOKOCRYPTO_API_SECRET=/d' .env 2>/dev/null || true
-              echo "TOKOCRYPTO_API_SECRET=${TOKOCRYPTO_API_SECRET}" >> .env
-              echo "✅ TOKOCRYPTO_API_SECRET injected into .env"
-            fi
-
-            # Inject Tokocrypto pipeline config (idempotent — safe to re-run)
-            for VAR in ENABLE_TOKO TOKO_MAX_POSITIONS TOKO_BUDGET_IDR TOKO_TRADING_PHASE; do
-              sed -i "/^${VAR}=/d" .env 2>/dev/null || true
-            done
-            echo "ENABLE_TOKO=1"               >> .env
-            echo "TOKO_MAX_POSITIONS=5"        >> .env
-            echo "TOKO_BUDGET_IDR=196000"      >> .env
-            echo "TOKO_TRADING_PHASE=PHASE_3"  >> .env
-            echo "✅ Tokocrypto pipeline config injected into .env"
-
-            # Rebuild and restart container
-            docker compose down
-            docker compose up -d --build
-
-            echo "Container restarted. Waiting for health check..."
-          REMOTE
+              "bash /tmp/remote_deploy.sh"
 
       # ── 3. Health check ──────────────────────────────────────────────────
       # Wait 2.5 minutes after container restart before checking.
