@@ -466,7 +466,26 @@ class TokocryptoOrderExecutor:
             if (tp2 == 2 and sl2 == 0) or (tp2 == 0 and sl2 == 2):
                 return {"state": "STUCK_COUNTERPART", "exit_price": None,
                         "slippage_flagged": False, "raw_tp": raw_tp2, "raw_sl": raw_sl2}
-            # Re-evaluate with refreshed status
+            # Clean exits resolved during the 1-second window — evaluate before anomaly checks
+            if tp2 == 2 and sl2 == 3:
+                exit_price = _exit_price_from(raw_tp2)
+                return {
+                    "state":            "TP_HIT",
+                    "exit_price":       exit_price,
+                    "slippage_flagged": _slippage_flag(exit_price, float(trade.get("tp_price", 0)), is_tp=True),
+                    "raw_tp":           raw_tp2,
+                    "raw_sl":           raw_sl2,
+                }
+            if tp2 == 3 and sl2 == 2:
+                exit_price = _exit_price_from(raw_sl2)
+                return {
+                    "state":            "SL_HIT",
+                    "exit_price":       exit_price,
+                    "slippage_flagged": _slippage_flag(exit_price, float(trade.get("sl_price", 0)), is_tp=False),
+                    "raw_tp":           raw_tp2,
+                    "raw_sl":           raw_sl2,
+                }
+            # Re-evaluate with refreshed status for remaining anomaly checks
             raw_tp, raw_sl   = raw_tp2, raw_sl2
             tp_status, sl_status = tp2, sl2
 

@@ -450,6 +450,53 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(result["state"], "STUCK_COUNTERPART")
         mock_sleep.assert_called_once_with(1)
 
+    @patch("time.sleep")
+    def test_requery_resolves_to_tp_hit_2_3(self, mock_sleep, mock_tg, mock_up, mock_upd):
+        """
+        (2, 0) race window → re-query resolves (2, 3) → TP_HIT (not RECONCILIATION_REQUIRED).
+
+        This covers finding #2 from the review: the clean-exit (2,3)/(3,2) branches
+        must be checked immediately after the re-query, before the anomaly catch-all.
+        """
+        executor, client, sym = _make_executor()
+        executed_price = 1_032_000.0
+        # initial: tp FILLED, sl NEW → triggers re-query
+        # re-query: tp FILLED, sl CANCELED → exchange processed cancel during 1-second window
+        client.get_order_detail.side_effect = [
+            _order_detail(2, executed_price),  # initial tp: FILLED
+            _order_detail(0, 0.0),             # initial sl: NEW
+            _order_detail(2, executed_price),  # re-query tp: FILLED
+            _order_detail(3, 0.0),             # re-query sl: CANCELED
+        ]
+        trade = _base_trade(tp_price=1_030_000.0)
+        result = executor.query_oco_state(trade)
+        self.assertEqual(result["state"], "TP_HIT")
+        self.assertAlmostEqual(result["exit_price"], executed_price)
+        mock_sleep.assert_called_once_with(1)
+
+    @patch("time.sleep")
+    def test_requery_resolves_to_sl_hit_3_2(self, mock_sleep, mock_tg, mock_up, mock_upd):
+        """
+        (0, 2) race window → re-query resolves (3, 2) → SL_HIT (not RECONCILIATION_REQUIRED).
+
+        Symmetric case to test_requery_resolves_to_tp_hit_2_3.
+        """
+        executor, client, sym = _make_executor()
+        executed_price = 968_000.0
+        # initial: tp NEW, sl FILLED → triggers re-query
+        # re-query: tp CANCELED, sl FILLED → exchange processed cancel during 1-second window
+        client.get_order_detail.side_effect = [
+            _order_detail(0, 0.0),             # initial tp: NEW
+            _order_detail(2, executed_price),  # initial sl: FILLED
+            _order_detail(3, 0.0),             # re-query tp: CANCELED
+            _order_detail(2, executed_price),  # re-query sl: FILLED
+        ]
+        trade = _base_trade(sl_price=970_000.0)
+        result = executor.query_oco_state(trade)
+        self.assertEqual(result["state"], "SL_HIT")
+        self.assertAlmostEqual(result["exit_price"], executed_price)
+        mock_sleep.assert_called_once_with(1)
+
 
 if __name__ == "__main__":
     unittest.main()
