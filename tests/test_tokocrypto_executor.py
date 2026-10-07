@@ -387,6 +387,46 @@ class TestSupervisedEntry(unittest.TestCase):
             result = executor.execute_entry(cand, slot_size_idr=100_000.0)
         self.assertIsNotNone(result)
         client._signed_post.assert_called_once()
+        # Verify supervised and trading_phase written to DB — not column default
+        call_kwargs = mock_up.call_args[0][0]  # first positional arg to upsert_tokocrypto
+        self.assertEqual(call_kwargs["supervised"], True,
+                         "supervised=True must be written to DB, not left to column default")
+        self.assertIn("trading_phase", call_kwargs,
+                      "trading_phase must be explicitly written to DB")
+
+    def test_phase3_unsupervised_writes_false_to_db(self, mock_tg, mock_up, mock_upd):
+        """PHASE_3 executor (supervised=False) writes supervised=False to DB row."""
+        from core.clients.tokocrypto_order_executor import TokocryptoOrderExecutor
+        client, sym = _mock_client()
+        executor = TokocryptoOrderExecutor(
+            client, supervised=False, trading_phase="PHASE_3", dry_run=False
+        )
+        cand = _base_cand()
+        fake_resp = {"data": {"orderId": "88888", "status": 0}}
+        client._signed_post.return_value = fake_resp
+        result = executor.execute_entry(cand, slot_size_idr=100_000.0)
+        self.assertIsNotNone(result)
+        call_kwargs = mock_up.call_args[0][0]
+        self.assertIs(call_kwargs["supervised"], False,
+                      "PHASE_3 must write supervised=False — not column default True")
+        self.assertEqual(call_kwargs["trading_phase"], "PHASE_3")
+
+    def test_phase2_supervised_writes_true_to_db(self, mock_tg, mock_up, mock_upd):
+        """PHASE_2 executor (supervised=True) writes supervised=True and trading_phase=PHASE_2."""
+        from core.clients.tokocrypto_order_executor import TokocryptoOrderExecutor
+        client, sym = _mock_client()
+        executor = TokocryptoOrderExecutor(
+            client, supervised=True, trading_phase="PHASE_2", dry_run=False
+        )
+        cand = _base_cand()
+        fake_resp = {"data": {"orderId": "77777", "status": 0}}
+        client._signed_post.return_value = fake_resp
+        with patch("core.clients.tokocrypto_order_executor._confirm", return_value=True):
+            result = executor.execute_entry(cand, slot_size_idr=100_000.0)
+        self.assertIsNotNone(result)
+        call_kwargs = mock_up.call_args[0][0]
+        self.assertIs(call_kwargs["supervised"], True)
+        self.assertEqual(call_kwargs["trading_phase"], "PHASE_2")
 
 
 # ===========================================================================

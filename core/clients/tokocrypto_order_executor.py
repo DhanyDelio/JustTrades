@@ -87,11 +87,13 @@ class TokocryptoOrderExecutor:
         self,
         client: TokocryptoClient,
         supervised: bool = True,
+        trading_phase: str = "PHASE_3",
         dry_run: bool = False,
     ) -> None:
-        self.client     = client
-        self.supervised = supervised
-        self.dry_run    = dry_run
+        self.client         = client
+        self.supervised     = supervised
+        self._trading_phase = trading_phase   # written to DB at upsert — never rely on column default
+        self.dry_run        = dry_run
 
     # ------------------------------------------------------------------
     # validate_and_size
@@ -221,17 +223,24 @@ class TokocryptoOrderExecutor:
         now_iso     = datetime.now(timezone.utc).isoformat()
 
         upsert_tokocrypto({
-            "symbol":          sym,
-            "entry_order_id":  entry_oid,
-            "entry_price":     float(cand["entry_price"]),
-            "tp_price":        float(cand.get("tp_price", 0)),
-            "sl_price":        float(cand.get("sl_price", 0)),
-            "entry_qty":       float(qty),
-            "entry_status":    "NEW",
-            "exit_status":     "OPEN",
+            "symbol":             sym,
+            "entry_order_id":     entry_oid,
+            "entry_price":        float(cand["entry_price"]),
+            "tp_price":           float(cand.get("tp_price", 0)),
+            "sl_price":           float(cand.get("sl_price", 0)),
+            "entry_qty":          float(qty),
+            "entry_status":       "NEW",
+            "exit_status":        "OPEN",
             "entry_notional_idr": float(qty) * float(cand["entry_price"]),
-            "created_at":      now_iso,
-            "updated_at":      now_iso,
+            # Provenance — always write actual runtime values, never rely on column defaults
+            "supervised":         self.supervised,
+            "trading_phase":      self._trading_phase,
+            # Strategy metadata
+            "planned_rr":         cand.get("rr"),
+            "risk_pct":           cand.get("risk_pct"),
+            "slot_size_idr":      slot_size_idr,
+            "created_at":         now_iso,
+            "updated_at":         now_iso,
         })
 
         # 7. Telegram

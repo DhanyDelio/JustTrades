@@ -70,7 +70,12 @@ def _build_client():
 def _build_executor(client):
     """Build and return a TokocryptoOrderExecutor."""
     from core.clients.tokocrypto_order_executor import TokocryptoOrderExecutor
-    return TokocryptoOrderExecutor(client, supervised=SUPERVISED, dry_run=False)
+    return TokocryptoOrderExecutor(
+        client,
+        supervised=SUPERVISED,
+        trading_phase=TRADING_PHASE,
+        dry_run=False,
+    )
 
 
 def _build_monitor(client, executor):
