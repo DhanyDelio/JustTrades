@@ -94,10 +94,6 @@ class TestFilterLogic(unittest.TestCase):
         with patch("services.chart_analyzer.analyze_symbol") as mock_ca:
             mock_ca.return_value = self._mock_analyze_result(tier="T1")
             with patch("time.sleep"):
-                # Only scan one symbol
-                from core.scanners.tokocrypto_candidate_scanner import IDR_PAIRS, SKIP_SYMBOLS
-                tradeable = [s for s in IDR_PAIRS if s not in SKIP_SYMBOLS]
-                mock_ca.return_value = self._mock_analyze_result(tier="T1")
                 result = scanner.gather_candidates(max_positions=10)
         # At least something passed (exact count depends on mock applying to all symbols)
         self.assertIsInstance(result, list)
@@ -127,8 +123,24 @@ class TestFilterLogic(unittest.TestCase):
         self.assertEqual(len(result), 0, "no_tp_in_range=True must be excluded")
 
     def test_skip_stablecoins(self):
-        """USDC_IDR, USDT_IDR, TKO_IDR must never appear in results."""
+        """USDC_IDR, USDT_IDR, TKO_IDR, and other fiat/stablecoins must never appear."""
+        from core.scanners.tokocrypto_candidate_scanner import _is_skip_base
+        # Verify the skip function catches stablecoins, fiat, and exchange tokens
+        self.assertTrue(_is_skip_base("USDC"), "USDC must be skipped")
+        self.assertTrue(_is_skip_base("USDT"), "USDT must be skipped")
+        self.assertTrue(_is_skip_base("TKO"), "TKO must be skipped")
+        self.assertTrue(_is_skip_base("FDUSD"), "FDUSD must be skipped")
+        self.assertTrue(_is_skip_base("USD1"), "USD1 must be skipped")
+        self.assertTrue(_is_skip_base("IDRT"), "IDRT must be skipped")
+        self.assertTrue(_is_skip_base("PAXG"), "PAXG must be skipped")
+        # Real crypto coins should NOT be skipped
+        self.assertFalse(_is_skip_base("BTC"), "BTC must NOT be skipped")
+        self.assertFalse(_is_skip_base("DOGE"), "DOGE must NOT be skipped")
+        self.assertFalse(_is_skip_base("SOL"), "SOL must NOT be skipped")
+
+        # Also verify via gather_candidates that skipped pairs don't appear
         scanner = self._make_scanner()
+        scanner._discovered_pairs = ["BTC_IDR", "USDC_IDR", "USDT_IDR", "TKO_IDR", "DOGE_IDR"]
         with patch("services.chart_analyzer.analyze_symbol") as mock_ca:
             mock_ca.return_value = self._mock_analyze_result(tier="T1")
             with patch("time.sleep"):
@@ -178,10 +190,9 @@ class TestPriceConversion(unittest.TestCase):
         # Only scan BTC_IDR to keep test fast
         with patch("services.chart_analyzer.analyze_symbol", return_value=analyze_result):
             with patch("time.sleep"):
-                from core.scanners.tokocrypto_candidate_scanner import IDR_PAIRS, SKIP_SYMBOLS
-                # Patch IDR_PAIRS to just one symbol
-                with patch("core.scanners.tokocrypto_candidate_scanner.IDR_PAIRS", ["BTC_IDR"]):
-                    result = scanner.gather_candidates()
+                # Inject discovered pairs directly on scanner instance
+                scanner._discovered_pairs = ["BTC_IDR"]
+                result = scanner.gather_candidates()
 
         self.assertEqual(len(result), 1)
         cand = result[0]
@@ -215,13 +226,13 @@ class TestTopNCap(unittest.TestCase):
             "resistance_zones": [], "nearest_sup_dist": 0.05, "nearest_res_dist": 0.10,
         }
 
-        # Patch to 15 tradeable symbols (more than max_positions=10)
+        # Inject 15 tradeable symbols (more than max_positions=10)
         fake_pairs = [f"COIN{i}_IDR" for i in range(15)]
-        with patch("core.scanners.tokocrypto_candidate_scanner.IDR_PAIRS", fake_pairs):
-            with patch("core.scanners.tokocrypto_candidate_scanner.SKIP_SYMBOLS", set()):
-                with patch("services.chart_analyzer.analyze_symbol", return_value=analyze_result):
-                    with patch("time.sleep"):
-                        result = scanner.gather_candidates(max_positions=10)
+        scanner._discovered_pairs = fake_pairs
+        with patch("core.scanners.tokocrypto_candidate_scanner._is_skip_base", return_value=False):
+            with patch("services.chart_analyzer.analyze_symbol", return_value=analyze_result):
+                with patch("time.sleep"):
+                    result = scanner.gather_candidates(max_positions=10)
 
         self.assertLessEqual(len(result), 10, "Must cap at max_positions")
 
@@ -260,12 +271,11 @@ class TestSortOrder(unittest.TestCase):
             toko = sym.replace("USDT", "_IDR")
             return results_map.get(toko)
 
-        with patch("core.scanners.tokocrypto_candidate_scanner.IDR_PAIRS",
-                   ["A_IDR", "B_IDR", "C_IDR"]):
-            with patch("core.scanners.tokocrypto_candidate_scanner.SKIP_SYMBOLS", set()):
-                with patch("services.chart_analyzer.analyze_symbol", side_effect=mock_analyze):
-                    with patch("time.sleep"):
-                        result = scanner.gather_candidates()
+        scanner._discovered_pairs = ["A_IDR", "B_IDR", "C_IDR"]
+        with patch("core.scanners.tokocrypto_candidate_scanner._is_skip_base", return_value=False):
+            with patch("services.chart_analyzer.analyze_symbol", side_effect=mock_analyze):
+                with patch("time.sleep"):
+                    result = scanner.gather_candidates()
 
         syms = [c["symbol"] for c in result]
         risks = [c["risk_pct"] for c in result]

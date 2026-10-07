@@ -4,7 +4,9 @@ tokocrypto_candidate_scanner.py
 Candidate scanner for Tokocrypto IDR spot trading.
 
 Strategy:
-  - Analyze all 29 IDR pairs using Binance USDT data via chart_analyzer
+  - Dynamically discover all IDR pairs from Tokocrypto API (auto-adapts
+    to new listings and delistings — no hardcoded pair list to maintain)
+  - Analyze each pair using Binance USDT data via chart_analyzer
     (mature, proven — same logic as Binance testnet scanner)
   - Convert entry/SL/TP prices to IDR using live USDT_IDR rate from Tokocrypto
   - Apply IDENTICAL filtering as SpotCandidateScanner:
@@ -16,7 +18,6 @@ Strategy:
 
 Rate-limit discipline:
   - 0.1s sleep between analyze_symbol calls (~3 symbols/sec)
-  - 29 symbols = ~3 seconds total scan time
   - Well within 1,200 weight/min Tokocrypto limit
 """
 
@@ -31,18 +32,44 @@ from core.paper_trade_executor import ZONE_ENTRY_BUFFER_PCT
 # Constants
 # ---------------------------------------------------------------------------
 
-# All 29 IDR pairs on Tokocrypto with OCO + spot enabled (confirmed live)
-IDR_PAIRS = [
-    "ADA_IDR", "ARB_IDR", "ASTER_IDR", "AVAX_IDR", "BNB_IDR",
-    "BTC_IDR", "DOGE_IDR", "DOGS_IDR", "ETH_IDR", "FLOKI_IDR",
-    "GRAM_IDR", "HBAR_IDR", "MANTA_IDR", "ONDO_IDR", "POL_IDR",
-    "RENDER_IDR", "SCR_IDR", "SOL_IDR", "SUI_IDR", "TAO_IDR",
-    "TKO_IDR", "USDC_IDR", "USDT_IDR", "U_IDR", "VIRTUAL_IDR",
-    "WIF_IDR", "WLD_IDR", "XRP_IDR", "ZIL_IDR",
+# Fallback list — used ONLY if API discovery fails (e.g. network error).
+# The scanner normally discovers IDR pairs dynamically from get_symbols().
+_FALLBACK_IDR_PAIRS = [
+    "ADA_IDR", "ALCH_IDR", "ARB_IDR", "ASTER_IDR", "AVAX_IDR",
+    "BNB_IDR", "BTC_IDR", "CARV_IDR", "DOGE_IDR", "DOGS_IDR",
+    "DRX_IDR", "ETH_IDR", "FLOKI_IDR", "GOAT_IDR", "GRAM_IDR",
+    "HBAR_IDR", "JELLYJELLY_IDR", "MANTA_IDR", "MOODENG_IDR", "NBT_IDR",
+    "ONDO_IDR", "POL_IDR", "RENDER_IDR", "SCR_IDR", "SKYA_IDR",
+    "SOL_IDR", "SOON_IDR", "SPX_IDR", "SUI_IDR", "TAO_IDR",
+    "TKO_IDR", "USDC_IDR", "USDT_IDR", "U_IDR", "VELO_IDR",
+    "VIRTUAL_IDR", "WIF_IDR", "WLD_IDR", "XRP_IDR", "ZIL_IDR",
 ]
 
-# Skip stablecoins and the exchange's own token
-SKIP_SYMBOLS = {"USDC_IDR", "USDT_IDR", "TKO_IDR"}
+# Skip rules — reuse the same stablecoin / fiat / commodity filters from
+# chart_analyzer so both scanners stay consistent. Applied to the base asset
+# of each IDR pair (e.g. base of "USDC_IDR" is "USDC").
+from services.chart_analyzer import (
+    STABLECOIN_KEYWORDS,
+    FIAT_KEYWORDS,
+    COMMODITY_RWA_KEYWORDS,
+)
+
+# Exchange token + USDT (which is base asset in USDT_IDR — no point swing-trading it)
+_EXCHANGE_TOKENS = {"TKO", "USDT"}
+
+
+def _is_skip_base(base_asset: str) -> bool:
+    """Return True if base_asset should be skipped (stablecoin/fiat/commodity/exchange token)."""
+    b = base_asset.upper()
+    if b in _EXCHANGE_TOKENS:
+        return True
+    if any(b == sc or b.startswith(sc) for sc in STABLECOIN_KEYWORDS):
+        return True
+    if any(b == fk or b.startswith(fk) for fk in FIAT_KEYWORDS):
+        return True
+    if any(b == rw or b.startswith(rw) for rw in COMMODITY_RWA_KEYWORDS):
+        return True
+    return False
 
 # Max concurrent positions (slot budget)
 MAX_TOKO_SLOTS = 10
@@ -79,9 +106,12 @@ def _to_binance_symbol(toko_symbol: str) -> str:
 
 class TokocryptoCandidateScanner:
     """
-    Scans all 29 Tokocrypto IDR pairs for T1 zone-backed long setups,
+    Scans all Tokocrypto IDR pairs for T1 zone-backed long setups,
     using Binance USDT kline data as the analysis source and converting
     all prices to IDR via the live USDT_IDR rate.
+
+    IDR pairs are discovered dynamically from the API — new listings are
+    automatically included and delisted pairs are excluded.
 
     Filtering logic is identical to SpotCandidateScanner to ensure
     consistent candidate quality between testnet and production.
@@ -96,8 +126,9 @@ class TokocryptoCandidateScanner:
         self.repo        = repo
         self._rate_cache: float | None = None
         self._rate_cached_at: float    = 0.0
-        # Cache Tokocrypto symbol constraints (tick/step sizes)
+        # Cache Tokocrypto symbol info (constraints + discovered pairs)
         self._sym_constraints: dict[str, dict] = {}
+        self._discovered_pairs: list[str] | None = None
 
     # ------------------------------------------------------------------
     # Public — USDT/IDR rate
@@ -131,6 +162,40 @@ class TokocryptoCandidateScanner:
     # Public — Symbol constraints
     # ------------------------------------------------------------------
 
+    def _load_symbols(self) -> None:
+        """Fetch all symbols from API and populate constraints + IDR pairs cache."""
+        syms = self.toko_client.get_symbols()
+        idr_pairs = []
+        for s in syms:
+            self._sym_constraints[s.symbol] = {
+                "tick_size":    s.tick_size,
+                "step_size":    s.step_size,
+                "min_notional": s.min_notional or MIN_NOTIONAL_IDR,
+            }
+            if s.quote_asset == "IDR" and s.spot_enabled:
+                idr_pairs.append(s.symbol)
+        self._discovered_pairs = sorted(idr_pairs)
+
+    def _discover_idr_pairs(self) -> list[str]:
+        """
+        Dynamically discover all spot-enabled IDR pairs from Tokocrypto API.
+
+        Results are cached for the scanner's lifetime (one scan cycle).
+        Falls back to _FALLBACK_IDR_PAIRS if the API call fails.
+        """
+        if self._discovered_pairs is not None:
+            return self._discovered_pairs
+
+        try:
+            self._load_symbols()
+        except Exception as e:
+            print(f"  ⚠ Failed to discover IDR pairs from API: {e}")
+            print(f"  ⚠ Falling back to static list ({len(_FALLBACK_IDR_PAIRS)} pairs)")
+            self._discovered_pairs = list(_FALLBACK_IDR_PAIRS)
+            return self._discovered_pairs
+
+        return self._discovered_pairs  # type: ignore[return-value]
+
     def _get_constraints(self, toko_symbol: str) -> dict:
         """
         Return tick_size and step_size for a Tokocrypto IDR symbol.
@@ -139,13 +204,7 @@ class TokocryptoCandidateScanner:
         if toko_symbol not in self._sym_constraints:
             # Lazy-load all symbols once and cache
             if not self._sym_constraints:
-                syms = self.toko_client.get_symbols()
-                for s in syms:
-                    self._sym_constraints[s.symbol] = {
-                        "tick_size":    s.tick_size,
-                        "step_size":    s.step_size,
-                        "min_notional": s.min_notional or MIN_NOTIONAL_IDR,
-                    }
+                self._load_symbols()
             if toko_symbol not in self._sym_constraints:
                 return {"tick_size": 1.0, "step_size": 0.01, "min_notional": MIN_NOTIONAL_IDR}
         return self._sym_constraints[toko_symbol]
@@ -165,15 +224,26 @@ class TokocryptoCandidateScanner:
         Returns list of candidate dicts, sorted by risk_pct ASC then -rr.
         """
         usdt_idr = self.get_usdt_idr_rate()
+
+        # Dynamic pair discovery — adapts to new listings / delistings
+        idr_pairs = self._discover_idr_pairs()
+        skipped = []
+        tradeable = []
+        for p in idr_pairs:
+            base = p.replace("_IDR", "")
+            if _is_skip_base(base):
+                skipped.append(p)
+            else:
+                tradeable.append(p)
+
         print(f"\n  USDT/IDR rate: {usdt_idr:,.0f}")
-        print(f"  Scanning {len(IDR_PAIRS) - len(SKIP_SYMBOLS)} IDR pairs "
-              f"(skipping {sorted(SKIP_SYMBOLS)})...\n")
+        print(f"  Scanning {len(tradeable)} IDR pairs "
+              f"(discovered {len(idr_pairs)} total, skipped {len(skipped)}: "
+              f"{', '.join(skipped) if skipped else 'none'})...\n")
 
         candidates: list[dict] = []
 
-        for toko_sym in IDR_PAIRS:
-            if toko_sym in SKIP_SYMBOLS:
-                continue
+        for toko_sym in tradeable:
 
             binance_sym = _to_binance_symbol(toko_sym)
 
@@ -306,7 +376,7 @@ class TokocryptoCandidateScanner:
                 print(f"  No T1 candidates found for {sym_up} in this scan.")
                 return None
 
-        slot_size_idr = available_idr   # use full available IDR for this candidate
+        slot_size_idr = available_idr   # per-slot budget (caller divides total across slots)
 
         for cand in pool:
             toko_sym    = cand["symbol"]

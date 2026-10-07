@@ -178,12 +178,11 @@ def cmd_propose() -> None:
 
         print(f"  Candidates found: {len(candidates)}", flush=True)
 
-        # Flexible slot sizing — use actual available IDR, not fixed slot_size.
-        # For each candidate: try to size an order using available IDR.
-        # If IDR is enough for min notional → order, deduct from available.
-        # If not enough → skip this candidate, try next.
-        # This means: if one coin needs Rp 200,000 and we only have Rp 39,200,
-        # we skip it and try the next cheaper coin instead.
+        # Even slot sizing — divide remaining IDR across unfilled slots.
+        # Each candidate gets (remaining_idr / slots_remaining) so budget is
+        # spread across multiple coins instead of dumping everything into one.
+        # If per-slot budget < min notional (Rp 20,000), reduce effective
+        # slots until each slot meets the minimum.
         filled = 0
         remaining_idr = idr_bal
 
@@ -194,8 +193,16 @@ def cmd_propose() -> None:
                 print(f"  Remaining IDR Rp {remaining_idr:,.0f} below min — stopping.", flush=True)
                 break
 
-            # Size using remaining IDR (not fixed slot_size)
-            best = scanner.pick_best_candidate([cand], available_idr=remaining_idr)
+            # Divide remaining IDR evenly across unfilled slots
+            slots_remaining = slots_available - filled
+            max_fillable = max(1, int(remaining_idr / 20_000))
+            effective_slots = min(slots_remaining, max_fillable)
+            per_slot_idr = remaining_idr / effective_slots
+
+            print(f"  Slot budget: Rp {per_slot_idr:,.0f}  "
+                  f"({slots_remaining} slots left, {effective_slots} fillable)", flush=True)
+
+            best = scanner.pick_best_candidate([cand], available_idr=per_slot_idr)
             if best is None:
                 continue
 

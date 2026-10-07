@@ -1947,6 +1947,22 @@ def load_tokocrypto_data() -> pd.DataFrame:
     df["exit_dt"]       = _parse_epoch_ms(df["exit_time"]) \
                           if "exit_time" in df.columns else pd.NaT
 
+    # is_outcome — only TP_HIT / SL_HIT count as genuine outcomes (same as Spot)
+    df["is_outcome"] = exit_st.isin(["TP_HIT", "SL_HIT"])
+
+    # WIB-localised entry time + hour for hourly analysis
+    df["entry_fill_wib"] = (df["entry_fill_dt"].dt.tz_convert("Asia/Jakarta")
+                            if "entry_fill_dt" in df.columns
+                            else pd.Series(dtype="datetime64[ns, UTC]"))
+    df["entry_hour"] = (df["entry_fill_wib"].dt.hour
+                        if "entry_fill_wib" in df.columns
+                        else pd.Series(dtype="float64"))
+
+    # Ensure planned_rr and realized_pnl_pct are numeric
+    for _num_col in ["planned_rr", "realized_pnl_pct"]:
+        if _num_col in df.columns:
+            df[_num_col] = pd.to_numeric(df[_num_col], errors="coerce")
+
     # Age of position (seconds since entry fill)
     now_utc = pd.Timestamp.utcnow().tz_localize("UTC") \
               if pd.Timestamp.utcnow().tzinfo is None \
@@ -2039,6 +2055,399 @@ def build_toko_exit_provenance(df: pd.DataFrame) -> pd.DataFrame:
     )
     counts["genuine"] = ~counts["exit_reason"].isin(TOKO_EXCLUDED_EXIT_REASONS)
     return counts.sort_values("count", ascending=False)
+
+
+def build_toko_symbol_pnl(df: pd.DataFrame):
+    """Win/Loss by Symbol bar chart for Tokocrypto — IDR denominated."""
+    resolved = df[df["is_outcome"]].copy()
+    if resolved.empty:
+        return None
+
+    summary = (
+        resolved.groupby("symbol", as_index=False)
+        .agg(realized_pnl_idr=("realized_pnl_idr", "sum"), win=("is_win", "mean"))
+    )
+    summary["win_label"] = summary["win"].ge(0.5)
+    fig = px.bar(
+        summary, x="symbol", y="realized_pnl_idr", color="win_label",
+        color_discrete_map={True: "#2ca02c", False: "#d62728"},
+        labels={"symbol": "Symbol", "realized_pnl_idr": "Realized PnL (Rp)", "win_label": "Win"},
+    )
+    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), xaxis_tickangle=-30)
+    return fig
+
+
+def build_toko_hourly_charts(df: pd.DataFrame):
+    """Win rate by hour + Avg PnL % by hour for Tokocrypto."""
+    resolved = df[df["is_outcome"]].copy()
+    if resolved.empty or "entry_hour" not in resolved.columns:
+        return None, None
+
+    hourly = (
+        resolved.groupby("entry_hour", as_index=False)
+        .agg(
+            win_rate=("is_win", "mean"),
+            avg_realized_pnl_pct=("realized_pnl_pct", "mean"),
+            trades=("symbol", "count"),
+        )
+        .sort_values("entry_hour")
+    )
+    hourly["entry_hour"]   = hourly["entry_hour"].fillna(-1).astype(int)
+    hourly["win_rate_pct"] = hourly["win_rate"] * 100
+    hourly["count_label"]  = hourly["trades"].apply(lambda n: f"{n}t")
+
+    win_fig = px.bar(
+        hourly, x="entry_hour", y="win_rate_pct", text="count_label",
+        labels={"entry_hour": "Hour (WIB/UTC+7)", "win_rate_pct": "Win rate (%)"},
+        hover_data={"trades": True, "win_rate_pct": ":.1f"},
+    )
+    win_fig.update_traces(textposition="outside")
+    win_fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+    win_fig.update_yaxes(range=[0, 110])
+
+    pnl_fig = px.bar(
+        hourly, x="entry_hour", y="avg_realized_pnl_pct", text="count_label",
+        labels={"entry_hour": "Hour (WIB/UTC+7)", "avg_realized_pnl_pct": "Avg PnL (%)"},
+        hover_data={"trades": True},
+    )
+    pnl_fig.update_traces(textposition="outside")
+    pnl_fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+    return win_fig, pnl_fig
+
+
+def build_toko_rr_scatter(df: pd.DataFrame):
+    """Planned R:R vs Realized PnL scatter for Tokocrypto."""
+    resolved = df[df["is_resolved"]].copy()
+    if resolved.empty or "planned_rr" not in resolved.columns:
+        return None
+
+    resolved = resolved.dropna(subset=["planned_rr"])
+    if resolved.empty:
+        return None
+
+    fig = px.scatter(
+        resolved, x="planned_rr", y="realized_pnl_pct", color="is_win",
+        color_discrete_map={True: "#2ca02c", False: "#d62728"},
+        hover_name="symbol",
+        labels={"planned_rr": "Planned R:R", "realized_pnl_pct": "Realized PnL (%)", "is_win": "Win"},
+    )
+    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
+    return fig
+
+
+def render_toko_open_card(
+    trade: dict,
+    current_price: float | None,
+    toko_client=None,
+) -> None:
+    """
+    Render a single open Tokocrypto position as a visual card.
+    Mirrors render_spot_open_card layout but IDR-denominated.
+    """
+    sym          = trade.get("symbol", "?")
+    entry_status = str(trade.get("entry_status", "NEW")).upper()
+    entry_price  = trade.get("entry_price")
+    fill_price   = trade.get("entry_fill_price")
+    sl           = trade.get("sl_price") or trade.get("sl")
+    tp1          = trade.get("tp_price") or trade.get("tp1")
+    qty          = trade.get("entry_qty") or 0
+    oco_state    = trade.get("oco_state", "")
+    rr           = trade.get("planned_rr")
+    risk_pct     = trade.get("risk_pct")
+    notional     = trade.get("entry_notional_idr")
+    slip_pct     = trade.get("slippage_pct")
+    oco_list_id  = trade.get("b_order_list_id")
+    open_time    = trade.get("open_time") or trade.get("created_at", "")
+
+    ref_price = fill_price or entry_price
+
+    # ── Derived ───────────────────────────────────────────────────────
+    unreal_pnl:   float | None = None
+    pct_to_fill:  float | None = None
+    pct_to_sl:    float | None = None
+    pct_to_tp:    float | None = None
+
+    if current_price and current_price > 0:
+        if entry_status == "FILLED" and ref_price and qty:
+            unreal_pnl = float(qty) * (current_price - float(ref_price))
+        if entry_status in ("NEW", "PARTIALLY_FILLED") and entry_price:
+            pct_to_fill = (float(entry_price) - current_price) / current_price * 100
+        if sl and entry_price:
+            pct_to_sl = (float(sl) - float(entry_price)) / float(entry_price) * 100
+        if tp1 and entry_price:
+            pct_to_tp = (float(tp1) - float(entry_price)) / float(entry_price) * 100
+
+    ot_str = ""
+    if open_time:
+        try:
+            ot_str = str(open_time)[:19].replace("T", " ") + " UTC"
+        except Exception:
+            ot_str = str(open_time)
+
+    is_filled    = entry_status == "FILLED"
+    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
+    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
+    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
+
+    # OCO badge
+    oco_st_upper = str(oco_state).upper() if oco_state else ""
+    if oco_st_upper in TOKO_ANOMALY_STATES:
+        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                     f"🚨 {oco_st_upper}</span>")
+    elif oco_st_upper == "FULLY_PROTECTED":
+        oco_badge = ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+                     "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
+    elif oco_list_id:
+        oco_badge = ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+                     "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
+    elif is_filled:
+        oco_badge = ("<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+                     "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
+    else:
+        oco_badge = ""
+
+    # PENDING FILL badge
+    pending_badge = (
+        f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"⏳ PENDING FILL</span>"
+        if entry_status == "NEW" else
+        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+        f"🔄 PARTIAL FILL</span>"
+        if entry_status == "PARTIALLY_FILLED" else ""
+    )
+
+    pnl_color = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
+
+    def _fmt_idr_price(val) -> str:
+        if val is None:
+            return "n/a"
+        try:
+            v = float(val)
+            if v >= 1000:
+                return f"Rp {v:,.2f}"
+            elif v >= 1:
+                return f"Rp {v:,.4f}"
+            else:
+                return f"Rp {v:,.8f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    with st.container(border=True):
+        # ── Header row ────────────────────────────────────────────────
+        h1, h2 = st.columns([3, 2])
+        with h1:
+            st.markdown(
+                f"<div style='line-height:1.3'>"
+                f"<span style='font-size:1.25em;font-weight:700'>{sym}</span>"
+                f"&nbsp;&nbsp;"
+                f"<code style='background:#e8f4e8;color:#1a6b1a;padding:2px 8px;"
+                f"border-radius:4px;font-size:0.9em'>LONG</code>"
+                f"&nbsp;&nbsp;{oco_badge}"
+                f"{'&nbsp;&nbsp;' + pending_badge if pending_badge else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with h2:
+            st.markdown(
+                f"<div style='text-align:right;line-height:1.3'>"
+                f"<span style='font-size:0.8em;color:#aaa'>{ot_str}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # ── Status + PnL banner ───────────────────────────────────────
+        if is_filled and unreal_pnl is not None:
+            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
+                f"<span style='font-size:1.1em;font-weight:700;color:{pnl_color}'>"
+                f"Unrealized&nbsp;{_fmt_idr(unreal_pnl)}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        elif is_pending:
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:rgba(184,92,0,0.10);border-left:4px solid #b85c00;"
+                f"border-radius:0 6px 6px 0;padding:7px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:700'>{status_icon} {entry_status}</span>"
+                f"<span style='font-size:0.88em;font-weight:700;color:#b85c00'>"
+                f"⏳ Waiting for exchange fill…</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div style='background:rgba(255,127,14,0.12);border-left:3px solid #ff7f0e;"
+                f"border-radius:0 6px 6px 0;padding:6px 12px;margin-bottom:8px'>"
+                f"<span style='color:{status_color};font-weight:600'>{status_icon} {entry_status}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Price grid ────────────────────────────────────────────────
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Entry</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{_fmt_idr_price(entry_price)}</div>"
+                f"{'<div style=\"font-size:0.78em;color:#aaa\">fill ' + _fmt_idr_price(fill_price) + '</div>' if is_filled and fill_price and fill_price != entry_price else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with pc2:
+            cur_str = _fmt_idr_price(current_price) if current_price else "—"
+            dist_str = f"{pct_to_fill:+.2f}%" if pct_to_fill is not None else ""
+            dist_color = "#2ca02c" if (pct_to_fill or 0) <= 0 else "#ff7f0e"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px;border-radius:6px;"
+                f"border:1px solid rgba(128,128,128,0.25)'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;"
+                f"letter-spacing:0.05em'>Current</div>"
+                f"<div style='font-size:1.05em;font-weight:700;font-family:monospace'>{cur_str}</div>"
+                f"{'<div style=\"font-size:0.78em;color:' + dist_color + '\">' + dist_str + ' to fill</div>' if dist_str else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with pc3:
+            notional_str = _fmt_idr(notional) if notional else "—"
+            qty_str      = f"{float(qty):.6f}".rstrip("0").rstrip(".") if qty else "—"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
+                f"<div style='font-size:0.98em;font-weight:600;font-family:monospace'>{qty_str}</div>"
+                f"<div style='font-size:0.78em;color:#aaa'>{notional_str} notional</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # ── SL / TP row ───────────────────────────────────────────────
+        sc1, sc2, sc3 = st.columns([2, 2, 1])
+        with sc1:
+            sl_pct = f"  {pct_to_sl:+.2f}%" if pct_to_sl is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(214,39,40,0.07);border-left:3px solid #d62728;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#d62728;font-weight:600'>STOP LOSS</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_idr_price(sl)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{sl_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            tp_pct = f"  {pct_to_tp:+.2f}%" if pct_to_tp is not None else ""
+            st.markdown(
+                f"<div style='background:rgba(44,160,44,0.07);border-left:3px solid #2ca02c;"
+                f"border-radius:0 6px 6px 0;padding:6px 10px'>"
+                f"<div style='font-size:0.72em;color:#2ca02c;font-weight:600'>TAKE PROFIT</div>"
+                f"<div style='font-family:monospace;font-weight:700'>{_fmt_idr_price(tp1)}"
+                f"<span style='font-size:0.8em;color:#888;font-weight:400'>{tp_pct}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with sc3:
+            rr_val   = f"{float(rr):.2f}:1"   if rr       else "—"
+            risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
+            st.markdown(
+                f"<div style='text-align:center;padding:4px'>"
+                f"<div style='font-size:0.72em;color:#888'>R:R</div>"
+                f"<div style='font-weight:700'>{rr_val}</div>"
+                f"<div style='font-size:0.78em;color:#888'>risk {risk_val}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Footer ────────────────────────────────────────────────────
+        foot_parts = []
+        if slip_pct is not None:
+            try:
+                foot_parts.append(f"Slip: {float(slip_pct):+.3f}%")
+            except (TypeError, ValueError):
+                pass
+        if oco_list_id:
+            foot_parts.append(f"OCO #{oco_list_id}")
+        if trade.get("age_seconds") is not None:
+            foot_parts.append(f"Age: {_age_str(trade.get('age_seconds'))}")
+        if foot_parts:
+            st.markdown(
+                f"<div style='font-size:0.78em;color:#aaa;margin-top:4px'>"
+                f"{'  ·  '.join(foot_parts)}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def render_toko_resolved_card(trade: dict) -> None:
+    """
+    Render a resolved Tokocrypto trade as a compact card — same style as spot.
+    """
+    sym        = trade.get("symbol", "?")
+    exit_st    = str(trade.get("exit_status", "")).upper()
+    pnl_idr    = trade.get("realized_pnl_idr")
+    pnl_pct    = trade.get("realized_pnl_pct")
+    entry_p    = trade.get("entry_price")
+    exit_p     = trade.get("exit_price") or trade.get("exit_fill_price")
+    exit_reason = trade.get("exit_reason", "")
+
+    is_win = (pnl_idr or 0) > 0
+    badge_bg    = "#2ca02c" if exit_st == "TP_HIT" else "#d62728" if exit_st == "SL_HIT" else "#888"
+    badge_label = {"TP_HIT": "🟢 TP HIT", "SL_HIT": "🔴 SL HIT", "CANCELED": "⚪ CANCELED"}.get(exit_st, exit_st)
+    pnl_color   = "#2ca02c" if is_win else "#d62728"
+
+    def _fmt_idr_price(val) -> str:
+        if val is None:
+            return "n/a"
+        try:
+            v = float(val)
+            if v >= 1000:
+                return f"Rp {v:,.2f}"
+            elif v >= 1:
+                return f"Rp {v:,.4f}"
+            else:
+                return f"Rp {v:,.8f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c1:
+            st.markdown(
+                f"<div>"
+                f"<span style='font-size:1.1em;font-weight:700'>{sym}</span><br>"
+                f"<span style='background:{badge_bg};color:#fff;border-radius:4px;"
+                f"padding:1px 7px;font-size:0.78em'>{badge_label}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div style='font-size:0.88em;color:#888'>"
+                f"Entry: <b>{_fmt_idr_price(entry_p)}</b> → "
+                f"Exit: <b>{_fmt_idr_price(exit_p)}</b>"
+                f"{'<br>Reason: <code>' + str(exit_reason) + '</code>' if exit_reason else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            pnl_str = _fmt_idr(pnl_idr) if pnl_idr is not None else "—"
+            pct_str = f"{float(pnl_pct):+.2f}%" if pnl_pct is not None else ""
+            st.markdown(
+                f"<div style='text-align:right'>"
+                f"<div style='font-size:1.05em;font-weight:700;color:{pnl_color}'>{pnl_str}</div>"
+                f"<div style='font-size:0.82em;color:{pnl_color}'>{pct_str}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def _fmt_idr(val) -> str:
@@ -2576,26 +2985,23 @@ def main():
 
     # ── TAB 5: TOKOCRYPTO (REAL MONEY) ───────────────────────────────────
     with tab_toko:
-        # ── Section 1: Header / status bar ───────────────────────────────
+        # ── Header banner ─────────────────────────────────────────────────
         st.markdown(
             "<div style='background:#7b1010;color:#fff;border-radius:8px;"
             "padding:10px 18px;margin-bottom:10px;font-size:1.05em;font-weight:700;"
             "letter-spacing:0.03em'>🏦 REAL MONEY — Tokocrypto Spot &nbsp;·&nbsp; IDR</div>",
             unsafe_allow_html=True,
         )
+        st.caption("Read-only analysis — Supabase: Toko_Crypto_Spot  |  Stats are INDEPENDENT from Spot/Futures tabs")
 
-        # ── Load data (always from Toko_Crypto_Spot only) ────────────────
-        # NOTE: load_tokocrypto_data() is the single fetch point — derive
-        # trading_phase from toko_df rather than issuing a second fetch call.
+        # ── Load data ─────────────────────────────────────────────────────
         toko_df = load_tokocrypto_data()
 
-        # Determine current phase from the most recent loaded row
+        # Determine current phase
         _current_phase  = 1
         _supervised     = True
         if not toko_df.empty and "trading_phase" in toko_df.columns:
             try:
-                # Sort by open_time descending so backfills/manual inserts don't
-                # poison the phase display — always read from the most recent trade.
                 _phase_source = (
                     toko_df.sort_values("open_time", ascending=False)
                     if "open_time" in toko_df.columns
@@ -2636,7 +3042,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # Connection/last-cycle bar — same pattern as main status bar
+        # Connection bar
         _toko_conn_color = "#2ca02c" if global_state.connected else "#d62728"
         _toko_conn_text  = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
         st.markdown(
@@ -2649,119 +3055,191 @@ def main():
 
         st.divider()
 
-        # ── Section 2: Capital & slots ────────────────────────────────────
-        st.subheader("Capital & Slots")
-
-        _idr_balance: float | None = None
-        _idr_locked:  float | None = None
-        try:
-            # Import inside tab block — never at module level
-            from core.clients.tokocrypto_client import TokocryptoClient
-            _toko_client = TokocryptoClient.build()
-            if _toko_client.authenticated:
-                _idr_bal = _toko_client.get_balance("IDR")
-                _idr_balance = _idr_bal.free
-                _idr_locked  = _idr_bal.locked
-        except Exception as _e:
-            st.warning(f"Could not fetch IDR balance from Tokocrypto: {_e}")
-
-        _toko_metrics = build_toko_metrics(toko_df) if not toko_df.empty else {
-            "total_trades": 0, "resolved_count": 0, "genuine_count": 0,
-            "win_rate": 0.0, "total_pnl_idr": 0.0, "slots_occupied": 0,
-        }
-
-        _slots_occupied = _toko_metrics["slots_occupied"]
-        _slot_size = (
-            round(_idr_balance / MAX_TOKO_SLOTS, 0) if _idr_balance else None
-        )
-
-        cap_c1, cap_c2, cap_c3, cap_c4 = st.columns(4)
-        cap_c1.metric(
-            "IDR Balance (free)",
-            _fmt_idr(_idr_balance),
-            delta=f"locked {_fmt_idr(_idr_locked)}" if _idr_locked else None,
-        )
-        cap_c2.metric(
-            "Slots occupied",
-            f"{_slots_occupied} / {MAX_TOKO_SLOTS}",
-        )
-        cap_c3.metric(
-            "Next slot size",
-            _fmt_idr(_slot_size) if _slot_size else "—",
-            help=f"available_balance / {MAX_TOKO_SLOTS} — recalculated every cycle",
-        )
-        cap_c4.metric(
-            "Balance vs Initial Deposit",
-            _fmt_idr(_idr_balance) if _idr_balance is not None else "—",
-            delta=f"{_fmt_idr(_idr_balance - TOKO_INITIAL_DEPOSIT_IDR)} vs Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f} deposited"
-            if _idr_balance is not None else None,
-            help=f"Initial deposit: Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f} (set via TOKO_INITIAL_DEPOSIT_IDR env var)",
-        )
-
-        st.divider()
-
-        # ── Section 4: Anomaly panel (rendered BEFORE open positions table,
-        #    always visible, never buried) ────────────────────────────────
-        if not toko_df.empty and "has_anomaly" in toko_df.columns:
-            _anomaly_rows = toko_df[toko_df["has_anomaly"]].to_dict("records")
-        else:
-            _anomaly_rows = []
-
-        if _anomaly_rows:
-            st.markdown(
-                "<div style='background:#8b0000;color:#fff;border-radius:8px;"
-                "padding:8px 16px;font-size:1.0em;font-weight:700;margin-bottom:8px'>"
-                "🚨 ANOMALY ALERT — ACTION REQUIRED</div>",
-                unsafe_allow_html=True,
-            )
-            for _arow in _anomaly_rows:
-                _a_sym       = _arow.get("symbol", "?")
-                _a_state     = _arow.get("oco_state", "?")
-                _a_detected  = _arow.get("oco_state_detected_at", "?")
-                # Show leg execution statuses (FILLED/CANCELED/EXPIRED) from oco_state
-                # sub-fields. The schema stores raw per-leg status in exit_status when
-                # resolved; for anomaly rows the oco_state itself is the best available
-                # status indicator. Show order IDs alongside for manual reconciliation.
-                _a_tp_id     = _arow.get("tp_order_id", "n/a")
-                _a_sl_id     = _arow.get("sl_order_id", "n/a")
-                _a_exit_st   = _arow.get("exit_status") or "OPEN"
-                _a_entry_st  = _arow.get("entry_status") or "n/a"
-                _a_age       = _age_str(_arow.get("anomaly_age_seconds"))
-
-                with st.container(border=True):
-                    st.markdown(
-                        f"<div style='background:#8b0000;color:#fff;border-radius:6px;"
-                        f"padding:6px 14px;margin-bottom:6px'>"
-                        f"<b>🚨 {_a_sym}</b> &nbsp;—&nbsp; <code style='color:#ffcdd2'>"
-                        f"{_a_state}</code>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                    ac1, ac2, ac3 = st.columns(3)
-                    ac1.markdown(f"**Detected at:** `{_a_detected}`")
-                    ac2.markdown(f"**Age:** {_a_age}")
-                    ac3.markdown(f"**Entry status:** `{_a_entry_st}` &nbsp; **Exit status:** `{_a_exit_st}`")
-                    st.markdown(
-                        f"TP order ID: `{_a_tp_id}` &nbsp;·&nbsp; SL order ID: `{_a_sl_id}`"
-                    )
-                    st.caption(
-                        "⚠ Use order IDs above to query execution status (FILLED/CANCELED/EXPIRED) "
-                        "directly via Tokocrypto order API — do NOT assume either leg resolved correctly. "
-                        "Reconcile both legs manually before acting."
-                    )
-            st.divider()
-        else:
-            # Always show all-clear state so a reviewer can confirm the monitor
-            # is active before any trade is recorded (spec: "always visible").
-            st.success("✅ No anomalies detected")
-            st.divider()
-
-        # ── Section 3: Open positions table ──────────────────────────────
-        st.subheader("Open Positions")
-
         if toko_df.empty:
-            st.info("No Tokocrypto positions yet. Table will populate once trades are recorded.")
+            st.info("No Tokocrypto trade data available yet.")
         else:
+            # ── Metrics bar (mirrors Spot) ────────────────────────────────
+            _toko_metrics = build_toko_metrics(toko_df)
+
+            # Fetch portfolio data
+            _idr_balance: float | None = None
+            _idr_locked:  float | None = None
+            _all_balances: list = []
+            _toko_client = None
+            try:
+                from core.clients.tokocrypto_client import TokocryptoClient
+                _toko_client = TokocryptoClient.build()
+                if _toko_client.authenticated:
+                    _all_balances = _toko_client.get_balances()
+                    _idr_obj = next((b for b in _all_balances if b.asset == "IDR"), None)
+                    if _idr_obj:
+                        _idr_balance = _idr_obj.free
+                        _idr_locked  = _idr_obj.locked
+            except Exception as _e:
+                st.warning(f"Could not fetch IDR balance from Tokocrypto: {_e}")
+
+            # Compute total portfolio value
+            _total_portfolio_idr: float | None = None
+            _crypto_holdings_idr: float = 0.0
+            _holdings_breakdown: list[dict] = []
+
+            if _all_balances and _toko_client:
+                _idr_total_cash = (_idr_balance or 0.0) + (_idr_locked or 0.0)
+                _total_portfolio_idr = _idr_total_cash
+
+                for _bal in _all_balances:
+                    if _bal.asset == "IDR":
+                        continue
+                    _asset_total = _bal.free + _bal.locked
+                    if _asset_total <= 0:
+                        continue
+                    _asset_value_idr = 0.0
+                    _asset_price_idr = 0.0
+                    try:
+                        _asset_price_idr = _toko_client.get_ticker(f"{_bal.asset}_IDR")
+                        _asset_value_idr = _asset_total * _asset_price_idr
+                    except Exception:
+                        try:
+                            _usdt_price = _toko_client.get_ticker(f"{_bal.asset}_USDT")
+                            _usdt_idr   = _toko_client.get_ticker("USDT_IDR")
+                            _asset_price_idr = _usdt_price * _usdt_idr
+                            _asset_value_idr = _asset_total * _asset_price_idr
+                        except Exception:
+                            _asset_price_idr = 0.0
+                            _asset_value_idr = 0.0
+
+                    _crypto_holdings_idr += _asset_value_idr
+                    _total_portfolio_idr += _asset_value_idr
+                    _holdings_breakdown.append({
+                        "Asset": _bal.asset,
+                        "Free": _bal.free,
+                        "Locked": _bal.locked,
+                        "Total Qty": _asset_total,
+                        "Price (IDR)": _asset_price_idr,
+                        "Value (IDR)": _asset_value_idr,
+                    })
+
+                _holdings_breakdown.sort(key=lambda x: x["Value (IDR)"], reverse=True)
+
+            _slots_occupied = _toko_metrics["slots_occupied"]
+            _slot_size = (
+                round(_idr_balance / MAX_TOKO_SLOTS, 0) if _idr_balance else None
+            )
+
+            # ── Row 1: Header metrics (same pattern as Spot col1-6) ───────
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            col1.metric("Total trades",   _toko_metrics["total_trades"])
+            col2.metric("Resolved",       _toko_metrics["resolved_count"])
+            col3.metric("Win rate",       f"{_toko_metrics['win_rate']:.2f}%")
+            col4.metric("Realized PnL",   _fmt_idr(_toko_metrics["total_pnl_idr"]))
+            col5.metric("💰 Portfolio",
+                        _fmt_idr(_total_portfolio_idr),
+                        delta=f"{_fmt_idr(_total_portfolio_idr - TOKO_INITIAL_DEPOSIT_IDR)} vs deposit"
+                        if _total_portfolio_idr is not None else None)
+            col6.metric("Slots",
+                        f"{_slots_occupied} / {MAX_TOKO_SLOTS}",
+                        delta=f"slot {_fmt_idr(_slot_size)}" if _slot_size else None)
+
+            # ── Capital detail (collapsible) ──────────────────────────────
+            with st.expander("💵 Capital & Wallet Details", expanded=False):
+                cap_c1, cap_c2, cap_c3, cap_c4 = st.columns(4)
+                cap_c1.metric(
+                    "IDR Balance (free)",
+                    _fmt_idr(_idr_balance),
+                    delta=f"locked {_fmt_idr(_idr_locked)}" if _idr_locked else None,
+                )
+                cap_c2.metric(
+                    "IDR Cash (free + locked)",
+                    _fmt_idr((_idr_balance or 0) + (_idr_locked or 0))
+                    if _idr_balance is not None else "—",
+                )
+                cap_c3.metric(
+                    "Crypto Holdings Value",
+                    _fmt_idr(_crypto_holdings_idr) if _crypto_holdings_idr > 0 else "Rp 0",
+                    delta=f"{len(_holdings_breakdown)} asset(s)"
+                    if _holdings_breakdown else None,
+                )
+                cap_c4.metric(
+                    "Balance vs Initial Deposit",
+                    _fmt_idr(_idr_balance) if _idr_balance is not None else "—",
+                    delta=f"{_fmt_idr(_idr_balance - TOKO_INITIAL_DEPOSIT_IDR)} vs Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f}"
+                    if _idr_balance is not None else None,
+                )
+
+                # Wallet breakdown table
+                if _holdings_breakdown:
+                    st.markdown(f"**🪙 Wallet Holdings ({len(_holdings_breakdown)} assets)**")
+                    _hold_df = pd.DataFrame(_holdings_breakdown)
+                    _hold_display = _hold_df.copy()
+                    _hold_display["Price (IDR)"] = _hold_display["Price (IDR)"].apply(
+                        lambda v: f"Rp {v:,.2f}" if v > 0 else "—"
+                    )
+                    _hold_display["Value (IDR)"] = _hold_display["Value (IDR)"].apply(
+                        lambda v: f"Rp {v:,.0f}" if v > 0 else "—"
+                    )
+                    _hold_display["Free"] = _hold_display["Free"].apply(
+                        lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
+                    )
+                    _hold_display["Locked"] = _hold_display["Locked"].apply(
+                        lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
+                    )
+                    _hold_display["Total Qty"] = _hold_display["Total Qty"].apply(
+                        lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
+                    )
+                    st.dataframe(_hold_display, use_container_width=True, hide_index=True)
+
+            # ── Anomaly panel (always visible) ────────────────────────────
+            if not toko_df.empty and "has_anomaly" in toko_df.columns:
+                _anomaly_rows = toko_df[toko_df["has_anomaly"]].to_dict("records")
+            else:
+                _anomaly_rows = []
+
+            if _anomaly_rows:
+                st.markdown(
+                    "<div style='background:#8b0000;color:#fff;border-radius:8px;"
+                    "padding:8px 16px;font-size:1.0em;font-weight:700;margin-bottom:8px'>"
+                    "🚨 ANOMALY ALERT — ACTION REQUIRED</div>",
+                    unsafe_allow_html=True,
+                )
+                for _arow in _anomaly_rows:
+                    _a_sym       = _arow.get("symbol", "?")
+                    _a_state     = _arow.get("oco_state", "?")
+                    _a_detected  = _arow.get("oco_state_detected_at", "?")
+                    _a_tp_id     = _arow.get("tp_order_id", "n/a")
+                    _a_sl_id     = _arow.get("sl_order_id", "n/a")
+                    _a_exit_st   = _arow.get("exit_status") or "OPEN"
+                    _a_entry_st  = _arow.get("entry_status") or "n/a"
+                    _a_age       = _age_str(_arow.get("anomaly_age_seconds"))
+
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<div style='background:#8b0000;color:#fff;border-radius:6px;"
+                            f"padding:6px 14px;margin-bottom:6px'>"
+                            f"<b>🚨 {_a_sym}</b> &nbsp;—&nbsp; <code style='color:#ffcdd2'>"
+                            f"{_a_state}</code>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                        ac1, ac2, ac3 = st.columns(3)
+                        ac1.markdown(f"**Detected at:** `{_a_detected}`")
+                        ac2.markdown(f"**Age:** {_a_age}")
+                        ac3.markdown(f"**Entry status:** `{_a_entry_st}` &nbsp; **Exit status:** `{_a_exit_st}`")
+                        st.markdown(
+                            f"TP order ID: `{_a_tp_id}` &nbsp;·&nbsp; SL order ID: `{_a_sl_id}`"
+                        )
+                        st.caption(
+                            "⚠ Use order IDs above to query execution status (FILLED/CANCELED/EXPIRED) "
+                            "directly via Tokocrypto order API — do NOT assume either leg resolved correctly. "
+                            "Reconcile both legs manually before acting."
+                        )
+                st.divider()
+            else:
+                st.success("✅ No anomalies detected")
+                st.divider()
+
+            # ── Open Positions (visual cards — same as Spot tab) ──────────
+            st.subheader("Open Positions")
+
             _open_mask = (
                 toko_df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"
             ) if "exit_status" in toko_df.columns else pd.Series(False, index=toko_df.index)
@@ -2770,57 +3248,89 @@ def main():
             if _open_toko.empty:
                 st.info("No open Tokocrypto positions.")
             else:
-                _display_open_cols = [c for c in [
-                    "symbol", "entry_status", "oco_state",
-                    "entry_price", "tp_price", "sl_price",
-                    "entry_fill_price", "entry_notional_idr",
-                    "slippage_pct", "age_seconds",
-                    "trading_phase", "supervised", "b_order_list_id",
-                ] if c in _open_toko.columns]
+                # Fetch live prices for each open position
+                _toko_live_prices: dict[str, float] = {}
+                if _toko_client:
+                    for _, _orow in _open_toko.iterrows():
+                        _o_sym = _orow.get("symbol", "")
+                        if _o_sym and _o_sym not in _toko_live_prices:
+                            try:
+                                _toko_live_prices[_o_sym] = _toko_client.get_ticker(_o_sym)
+                            except Exception:
+                                _toko_live_prices[_o_sym] = 0.0
 
-                _open_display = _open_toko[_display_open_cols].copy()
-                if "age_seconds" in _open_display.columns:
-                    _open_display["age"] = _open_display["age_seconds"].apply(_age_str)
-                    _open_display = _open_display.drop(columns=["age_seconds"])
+                for _, _orow in _open_toko.iterrows():
+                    _o_sym = _orow.get("symbol", "")
+                    _o_price = _toko_live_prices.get(_o_sym)
+                    render_toko_open_card(_orow.to_dict(), _o_price, _toko_client)
+                    st.write("")  # spacer
 
-                st.dataframe(_open_display, use_container_width=True, hide_index=True)
+            # ── Recently Resolved (24h) — visual cards ────────────────────
+            st.divider()
+            from datetime import timezone as _tz
+            _now_utc_toko = datetime.now(_tz.utc)
+            _cutoff_24h = (_now_utc_toko - timedelta(hours=24))
+            _resolved_toko = toko_df[
+                toko_df["is_resolved"] &
+                toko_df["exit_dt"].notna() &
+                (toko_df["exit_dt"] >= _cutoff_24h)
+            ].sort_values("exit_dt", ascending=False) if not toko_df.empty else pd.DataFrame()
 
-        st.divider()
+            st.subheader(f"Recently Resolved — last 24h ({len(_resolved_toko)} trade(s))")
+            if not _resolved_toko.empty:
+                for _, _rrow in _resolved_toko.iterrows():
+                    render_toko_resolved_card(_rrow.to_dict())
+                    st.write("")
+            else:
+                st.info("No Tokocrypto trades resolved in the last 24 hours.")
 
-        # ── Section 5: Realized PnL and history ──────────────────────────
-        st.subheader("Realized PnL & History")
+            st.divider()
 
-        if not toko_df.empty and _toko_metrics["resolved_count"] > 0:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Realized PnL",
-                      _fmt_idr(_toko_metrics["total_pnl_idr"]))
-            m2.metric("Win rate (genuine exits)",
-                      f"{_toko_metrics['win_rate']:.2f}%")
-            m3.metric("Resolved trades",
-                      _toko_metrics["resolved_count"])
-            m4.metric("Genuine exits",
-                      _toko_metrics["genuine_count"],
-                      delta=f"{_toko_metrics['resolved_count'] - _toko_metrics['genuine_count']} excluded"
-                            if _toko_metrics["resolved_count"] > _toko_metrics["genuine_count"] else None)
-
-            # IDR equity curve — never shared with Spot/Futures charts
-            st.subheader("IDR Equity Curve (genuine exits only)")
+            # ── Equity Curve ──────────────────────────────────────────────
+            st.subheader("Equity Curve (IDR)")
             _toko_equity = build_toko_equity_curve(toko_df)
             if _toko_equity:
                 st.plotly_chart(_toko_equity, use_container_width=True)
             else:
                 st.info("No genuine exits yet for equity curve.")
 
-            # Slippage review table
+            # ── Win/Loss by Symbol ────────────────────────────────────────
+            st.subheader("Win/loss by symbol")
+            _toko_sym_fig = build_toko_symbol_pnl(toko_df)
+            if _toko_sym_fig:
+                st.plotly_chart(_toko_sym_fig, use_container_width=True)
+            else:
+                st.info("No resolved trades for symbol analysis.")
+
+            # ── Win Rate by Hour ──────────────────────────────────────────
+            st.subheader("Win rate by hour of day")
+            _toko_win_fig, _toko_pnl_fig = build_toko_hourly_charts(toko_df)
+            if _toko_win_fig and _toko_pnl_fig:
+                _th1, _th2 = st.columns(2)
+                with _th1:
+                    st.plotly_chart(_toko_win_fig, use_container_width=True)
+                with _th2:
+                    st.plotly_chart(_toko_pnl_fig, use_container_width=True)
+            else:
+                st.info("No resolved trades for hourly analysis.")
+
+            # ── Planned R:R vs Realized PnL ───────────────────────────────
+            st.subheader("Planned R:R vs realized PnL")
+            _toko_rr_fig = build_toko_rr_scatter(toko_df)
+            if _toko_rr_fig:
+                st.plotly_chart(_toko_rr_fig, use_container_width=True)
+            else:
+                st.info("No resolved trades for R:R analysis.")
+
+            # ── Slippage Review ───────────────────────────────────────────
             st.subheader("Per-trade Slippage")
             _slip_cols = [c for c in [
                 "symbol", "entry_fill_price", "slippage_pct",
                 "exit_price" if "exit_price" in toko_df.columns else None,
                 "exit_fill_slippage_pct", "exit_reason",
             ] if c and c in toko_df.columns]
-            if _slip_cols:
+            if _slip_cols and _toko_metrics["resolved_count"] > 0:
                 _slip_df = toko_df[toko_df["is_resolved"]][_slip_cols].copy()
-                # Flag rows exceeding thresholds
                 if "slippage_pct" in _slip_df.columns:
                     _slip_df["entry_slip_flag"] = _slip_df["slippage_pct"].abs().gt(
                         TOKO_SLIP_ENTRY_THRESHOLD_PCT
@@ -2839,8 +3349,10 @@ def main():
                         f"{_n_exit_flag} trade(s) exceeded exit slippage threshold "
                         f"({TOKO_SLIP_EXIT_THRESHOLD_PCT}%)"
                     )
+            else:
+                st.info("No resolved trades for slippage analysis yet.")
 
-            # Exit provenance breakdown
+            # ── Exit Provenance Breakdown ─────────────────────────────────
             st.subheader("Exit Provenance Breakdown")
             _prov_df = build_toko_exit_provenance(toko_df)
             if not _prov_df.empty:
@@ -2851,18 +3363,22 @@ def main():
                         "ℹ️ Non-genuine exits (shown above, not pooled into win rate): "
                         + ", ".join(_non_genuine["exit_reason"].tolist())
                     )
-        else:
-            st.info("No resolved Tokocrypto trades yet. PnL history will appear here.")
+
+            # ── Raw data ──────────────────────────────────────────────────
+            st.subheader("Raw data")
+            with st.expander("Show full Tokocrypto trade log", expanded=False):
+                st.dataframe(toko_df, use_container_width=True, hide_index=True)
 
         st.divider()
 
-        # ── Section 6: Read-only / real-money disclaimer ──────────────────
+        # ── Disclaimer ────────────────────────────────────────────────────
         st.caption(
             "🔴 REAL MONEY — Read-only analysis · Supabase: Toko_Crypto_Spot · "
             "Stats are INDEPENDENT from Binance paper Spot tab and Futures tab · "
             "No order placement on this dashboard · "
             f"Phase {_current_phase} {'(manual-supervised)' if _supervised else '(automated)'}"
         )
+
 
     # Realtime is the normal path.  This is its bounded fallback for a missed
     # WebSocket event: query only in the short period after an expected cycle,
