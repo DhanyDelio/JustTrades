@@ -164,6 +164,52 @@ class TokocryptoPositionMonitor:
                     "oco_state":  "EXECUTING",
                     "updated_at": now_iso,
                 })
+                # ── Stuck-OCO shadow detection ────────────────────────────
+                # If OCO shows EXECUTING but price has already breached SL,
+                # the SL leg may be stuck (same 2ZUSDT pattern from Binance).
+                # Cycle N:   set stuck_oco_suspected_at, alert, do NOT cancel.
+                # Cycle N+1: if still stuck → escalate alert.
+                try:
+                    ticker = self.client.get_ticker(sym)
+                    current = float(ticker) if ticker else None
+                except Exception:
+                    current = None
+
+                if current is not None and trade.get("sl_price"):
+                    sl_level = float(trade["sl_price"])
+                    if current <= sl_level:
+                        raw = dict(trade.get("raw_entry_order") or {})
+                        detection = raw.get("stuck_oco_detection", {})
+                        suspected_at = detection.get("suspected_at")
+
+                        if not suspected_at:
+                            # Cycle N — first detection
+                            detection["suspected_at"] = now_iso
+                            raw["stuck_oco_detection"] = detection
+                            update_tokocrypto_by_order_id(entry_oid, {
+                                "raw_entry_order": raw,
+                                "updated_at": now_iso,
+                            })
+                            _send_toko_telegram(
+                                f"⚠️ STUCK-OCO SUSPECTED: {sym}\n"
+                                f"Price {current:,.2f} ≤ SL {sl_level:,.2f} "
+                                f"but OCO still EXECUTING.\n"
+                                f"First detected: {now_iso}\n"
+                                f"Monitoring next cycle — no action yet."
+                            )
+                            print(f"  [{sym}] ⚠ Stuck-OCO suspected: "
+                                  f"price {current:,.2f} ≤ SL {sl_level:,.2f}", flush=True)
+                        else:
+                            # Cycle N+1 — confirmed stuck, escalate
+                            _send_toko_telegram(
+                                f"🚨 STUCK-OCO CONFIRMED: {sym}\n"
+                                f"Price {current:,.2f} ≤ SL {sl_level:,.2f} "
+                                f"for 2+ cycles, OCO still EXECUTING.\n"
+                                f"First detected: {suspected_at}\n"
+                                f"Manual intervention required — check OCO legs."
+                            )
+                            print(f"  [{sym}] 🚨 Stuck-OCO confirmed — "
+                                  f"escalated alert sent.", flush=True)
 
             elif oco_state in ("TP_HIT", "SL_HIT"):
                 self._resolve_exit(trade, state_dict)

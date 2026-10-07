@@ -306,7 +306,7 @@ class TokocryptoCandidateScanner:
                 print(f"  No T1 candidates found for {sym_up} in this scan.")
                 return None
 
-        slot_size_idr = available_idr / MAX_TOKO_SLOTS
+        slot_size_idr = available_idr   # use full available IDR for this candidate
 
         for cand in pool:
             toko_sym    = cand["symbol"]
@@ -370,6 +370,11 @@ class TokocryptoCandidateScanner:
 
             # ── Sizing ───────────────────────────────────────────────────
             qty = _round_step(slot_size_idr / entry_idr, step_size)
+
+            # If rounding down causes notional to fall below min_notional,
+            # round UP by one step — we still stay within slot budget.
+            if qty > 0 and entry_idr * qty < min_notional:
+                qty = _round_step(qty + step_size, step_size)
 
             if qty <= 0:
                 print(f"  [{toko_sym}] ⛔ Cannot size — qty=0 (slot={slot_size_idr:,.0f} IDR)")

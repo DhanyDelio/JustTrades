@@ -152,24 +152,45 @@ def cmd_propose() -> None:
             print("  All slots occupied — skipping scan.", flush=True)
             return
 
-        # Scan
+        # Scan — get ALL candidates (up to slots_available), sorted by score
         candidates = scanner.gather_candidates(max_positions=slots_available)
         if not candidates:
             print("  No T1 candidates found this cycle.", flush=True)
             return
 
-        slot_size_idr = BUDGET_IDR / MAX_POSITIONS
-        print(f"  Slot size: Rp {slot_size_idr:,.0f}", flush=True)
+        # Fetch live IDR balance — this is the actual budget we can spend
+        try:
+            bals = client.get_balances()
+            idr_bal = next((b.free for b in bals if b.asset == "IDR"), 0.0)
+        except Exception:
+            idr_bal = BUDGET_IDR  # fallback to configured budget
+
+        print(f"  Available IDR balance: Rp {idr_bal:,.0f}", flush=True)
+
+        if idr_bal < 20_000:
+            print(f"  Insufficient IDR balance (Rp {idr_bal:,.0f} < min Rp 20,000). Skipping.", flush=True)
+            return
+
         print(f"  Candidates found: {len(candidates)}", flush=True)
 
-        # Try to fill available slots
+        # Flexible slot sizing — use actual available IDR, not fixed slot_size.
+        # For each candidate: try to size an order using available IDR.
+        # If IDR is enough for min notional → order, deduct from available.
+        # If not enough → skip this candidate, try next.
+        # This means: if one coin needs Rp 200,000 and we only have Rp 39,200,
+        # we skip it and try the next cheaper coin instead.
         filled = 0
+        remaining_idr = idr_bal
+
         for cand in candidates:
             if filled >= slots_available:
                 break
+            if remaining_idr < 20_000:
+                print(f"  Remaining IDR Rp {remaining_idr:,.0f} below min — stopping.", flush=True)
+                break
 
-            # Finalise sizing
-            best = scanner.pick_best_candidate([cand], available_idr=BUDGET_IDR)
+            # Size using remaining IDR (not fixed slot_size)
+            best = scanner.pick_best_candidate([cand], available_idr=remaining_idr)
             if best is None:
                 continue
 
@@ -182,18 +203,20 @@ def cmd_propose() -> None:
             best["sl_limit_price"] = sl_limit
             best["sl_buffer_pct"]  = sl_buf * 100
 
+            notional = best.get("sizing", {}).get("notional_idr", entry * best.get("sizing", {}).get("qty", 0))
             print(
                 f"\n  [{best['symbol']}]  Entry: Rp {entry:,.2f}  "
                 f"SL: Rp {sl_stop:,.2f} (buf {sl_buf*100:.2f}%)  "
                 f"TP: Rp {best['tp1']:,.2f}  R:R {best['rr']:.2f}  "
-                f"risk {best['risk_pct']:.2f}%",
+                f"risk {best['risk_pct']:.2f}%  notional: Rp {notional:,.0f}",
                 flush=True,
             )
 
-            result = executor.execute_entry(best, slot_size_idr)
+            result = executor.execute_entry(best, notional)
             if result is not None:
                 filled += 1
-                print(f"  ✅ Entry placed: {best['symbol']}  orderId={result.get('orderId') or result.get('data',{}).get('orderId','?')}", flush=True)
+                remaining_idr -= notional   # deduct actual order cost from available
+                print(f"  ✅ Entry placed: {best['symbol']}  orderId={result.get('orderId') or result.get('data',{}).get('orderId','?')}  remaining IDR: Rp {remaining_idr:,.0f}", flush=True)
             else:
                 print(f"  ⚠ Entry skipped / failed: {best['symbol']}", flush=True)
 
