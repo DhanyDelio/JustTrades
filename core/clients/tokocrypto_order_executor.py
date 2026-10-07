@@ -226,8 +226,8 @@ class TokocryptoOrderExecutor:
             "symbol":             sym,
             "entry_order_id":     entry_oid,
             "entry_price":        float(cand["entry_price"]),
-            "tp_price":           float(cand.get("tp_price", 0)),
-            "sl_price":           float(cand.get("sl_price", 0)),
+            "tp_price":           float(cand.get("tp_price") or cand.get("tp1") or 0),
+            "sl_price":           float(cand.get("sl_price") or cand.get("sl") or 0),
             "entry_qty":          float(qty),
             "entry_status":       "NEW",
             "exit_status":        "OPEN",
@@ -278,6 +278,19 @@ class TokocryptoOrderExecutor:
 
         tick = sym_info.tick_size
         step = sym_info.step_size
+
+        # Fetch actual available balance — entry_qty may exceed free balance
+        # because trading fee was deducted from the bought amount.
+        try:
+            base_asset = sym.replace("_IDR", "")
+            bal = self.client.get_balance(base_asset)
+            available = bal.free if bal else 0.0
+            if available > 0 and available < qty:
+                print(f"  ℹ place_oco: adjusting qty from {qty} to {available} "
+                      f"(fee-adjusted balance)")
+                qty = available
+        except TokocryptoError:
+            pass  # fall through with original qty
 
         # OCO constraint check — tp must be above current price, sl below
         try:
@@ -330,7 +343,7 @@ class TokocryptoOrderExecutor:
         }
 
         try:
-            resp = self.client._signed_post("/open/v1/order-list", payload)
+            resp = self.client._signed_post("/open/v1/orders/oco", payload)
         except TokocryptoError as e:
             raise RuntimeError(f"place_oco: exchange call failed: {e}") from e
 

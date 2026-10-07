@@ -117,9 +117,15 @@ class TokocryptoPositionMonitor:
                 fill_qty   = float(detail.get("executedQty") or detail.get("origQty") or 0)
                 now_iso    = datetime.now(timezone.utc).isoformat()
 
+                # entry_fill_time is bigint (epoch ms) in Supabase — use exchange time
+                fill_time_ms = int(detail.get("createTime") or detail.get("time") or 0)
+                if fill_time_ms == 0:
+                    import time as _time
+                    fill_time_ms = int(_time.time() * 1000)
+
                 update_tokocrypto_by_order_id(entry_oid, {
                     "entry_fill_price":   fill_price,
-                    "entry_fill_time":    now_iso,
+                    "entry_fill_time":    fill_time_ms,
                     "entry_qty":          fill_qty,
                     "entry_status":       "FILLED",
                     "updated_at":         now_iso,

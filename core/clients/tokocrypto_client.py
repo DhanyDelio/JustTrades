@@ -1048,13 +1048,13 @@ class TokocryptoClient:
     def get_order_detail(self, symbol: str, order_id: str) -> dict:
         """
         Query a single order by orderId (SIGNED GET).
-        Maps to GET /open/v1/orders.
+        Maps to GET /open/v1/orders/detail.
 
         Returns the 'data' sub-dict from the response.
         Raises TokocryptoAPIError (code -2013) if orderId not found.
         Raises TokocryptoMalformedResponseError if 'data' is absent.
         """
-        resp = self._signed_get("/open/v1/orders", {
+        resp = self._signed_get("/open/v1/orders/detail", {
             "symbol":  self.normalize_symbol(symbol),
             "orderId": str(order_id),
         })
