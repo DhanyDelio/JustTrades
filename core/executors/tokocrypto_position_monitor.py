@@ -145,8 +145,76 @@ class TokocryptoPositionMonitor:
         # Phase B: Entry filled, OCO not yet placed
         # ----------------------------------------------------------------
         if entry_status == "FILLED" and not b_order_list:
-            self.executor.place_oco(trade)
-            return   # next cycle will query OCO state
+            # Retry guard — stop retrying after MAX_OCO_RETRIES to avoid
+            # Telegram spam.  The counter persists in Supabase.
+            MAX_OCO_RETRIES = 3
+            attempts = int(trade.get("oco_placement_attempts") or 0)
+            oco_state_cur = (trade.get("oco_state") or "").upper()
+
+            if oco_state_cur == "OCO_PLACEMENT_FAILED" and attempts >= MAX_OCO_RETRIES:
+                # Already exhausted retries — do NOT retry or re-alert.
+                # One-time escalation was sent on the last attempt.
+                if verbose:
+                    print(f"  [{sym}] OCO retries exhausted ({attempts}/{MAX_OCO_RETRIES}), "
+                          f"awaiting manual intervention.")
+                return
+
+            try:
+                oco_result = self.executor.place_oco(trade)
+                if oco_result is None:
+                    # place_oco returned None — constraint check failed or supervised abort
+                    attempts += 1
+                    now_fail = datetime.now(timezone.utc).isoformat()
+                    update_tokocrypto_by_order_id(entry_oid, {
+                        "oco_state":               "OCO_PLACEMENT_FAILED",
+                        "oco_placement_attempts":  attempts,
+                        "updated_at":              now_fail,
+                    })
+                    if attempts >= MAX_OCO_RETRIES:
+                        _send_toko_telegram(
+                            f"🚨 OCO PLACEMENT EXHAUSTED: {sym}\n"
+                            f"Failed {attempts}x (constraint/abort).\n"
+                            f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
+                            f"qty={trade.get('entry_qty', '?')}\n"
+                            f"Position is UNPROTECTED — MANUAL ACTION REQUIRED.\n"
+                            f"Bot will NOT retry until you reset oco_state."
+                        )
+                    else:
+                        _send_toko_telegram(
+                            f"⚠️ OCO NOT PLACED: {sym} (attempt {attempts}/{MAX_OCO_RETRIES})\n"
+                            f"place_oco returned None (constraint check or abort).\n"
+                            f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
+                            f"qty={trade.get('entry_qty', '?')}\n"
+                            f"Will retry next cycle."
+                        )
+            except Exception as oco_exc:
+                # Hard OCO failure — exchange error, network issue, etc.
+                attempts += 1
+                now_fail = datetime.now(timezone.utc).isoformat()
+                update_tokocrypto_by_order_id(entry_oid, {
+                    "oco_state":               "OCO_PLACEMENT_FAILED",
+                    "oco_placement_attempts":  attempts,
+                    "updated_at":              now_fail,
+                })
+                if attempts >= MAX_OCO_RETRIES:
+                    _send_toko_telegram(
+                        f"🚨 OCO PLACEMENT EXHAUSTED: {sym}\n"
+                        f"Failed {attempts}x — last error: {str(oco_exc)[:120]}\n"
+                        f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
+                        f"qty={trade.get('entry_qty', '?')}\n"
+                        f"Position is FILLED and UNPROTECTED.\n"
+                        f"Bot will NOT retry — MANUAL ACTION REQUIRED NOW."
+                    )
+                else:
+                    _send_toko_telegram(
+                        f"🚨 OCO PLACEMENT FAILED: {sym} (attempt {attempts}/{MAX_OCO_RETRIES})\n"
+                        f"Error: {str(oco_exc)[:120]}\n"
+                        f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
+                        f"qty={trade.get('entry_qty', '?')}\n"
+                        f"Position is UNPROTECTED — will retry next cycle."
+                    )
+                print(f"  [{sym}] 🚨 OCO placement failed (attempt {attempts}): {oco_exc}", flush=True)
+            return   # next cycle will retry (if attempts < MAX) or skip
 
         # ----------------------------------------------------------------
         # Phase C: OCO placed — query its state

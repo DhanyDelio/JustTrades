@@ -359,8 +359,12 @@ class TokocryptoOrderExecutor:
         )
 
         _send_toko_telegram(
-            f"🛡 OCO placed: {sym}  tp={tp_rounded:,.0f}  sl_stop={sl_stop:,.0f}  "
-            f"listId={b_order_list_id}"
+            f"🛡 OCO placed: {sym}\n"
+            f"Fill price:  Rp {float(trade.get('entry_fill_price', 0)):,.2f}\n"
+            f"TP:          Rp {tp_rounded:,.2f}  (orderId={tp_order_id})\n"
+            f"SL trigger:  Rp {sl_stop:,.2f}  limit={sl_limit:,.2f}  (orderId={sl_order_id})\n"
+            f"OCO listId:  {b_order_list_id}\n"
+            f"Qty:         {trade.get('entry_qty', '?')} {sym.replace('_IDR', '')}"
         )
 
         return resp
