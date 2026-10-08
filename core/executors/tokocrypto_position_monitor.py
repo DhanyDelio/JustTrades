@@ -345,13 +345,37 @@ class TokocryptoPositionMonitor:
                     _send_toko_telegram(
                         f"⏰ {oco_state}: {sym}  "
                         f"expired_leg_first_detected={now_iso}  "
-                        f"awaiting manual confirmation"
+                        f"awaiting fill or recovery on next cycle"
                     )
+                elif trade.get("recovery_attempted"):
+                    # Idempotency guard: Recovery was already attempted.
+                    # Do NOT retry recovery repeatedly every cycle — await manual intervention.
+                    if verbose:
+                        print(f"  [{sym}] Recovery already attempted previously, awaiting manual resolution.")
                 else:
-                    update_tokocrypto_by_order_id(entry_oid, {
-                        "oco_state":  oco_state,
-                        "updated_at": now_iso,
-                    })
+                    # Second+ cycle: SL leg is stuck unfilled!
+                    # Attempt safe recovery via executor once
+                    recovery_dict = self.executor.recover_stuck_sl(trade)
+                    if recovery_dict and recovery_dict.get("state") == "SL_HIT":
+                        self._resolve_exit(trade, recovery_dict)
+                        _send_toko_telegram(
+                            f"🚨 STUCK-SL RECOVERED: {sym}\n"
+                            f"Position closed via emergency exit.\n"
+                            f"Exit price: Rp {float(recovery_dict.get('exit_price', 0)):,.2f}\n"
+                            f"Reason: {recovery_dict.get('exit_reason')}"
+                        )
+                    else:
+                        update_tokocrypto_by_order_id(entry_oid, {
+                            "oco_state":              "RECONCILIATION_REQUIRED",
+                            "recovery_attempted":     True,
+                            "requires_manual_review": True,
+                            "updated_at":             now_iso,
+                        })
+                        _send_toko_telegram(
+                            f"🚨 STUCK-SL RECOVERY FAILED: {sym}\n"
+                            f"Order remains OPEN and UNRESOLVED.\n"
+                            f"Manual action required immediately!"
+                        )
 
             elif oco_state == "RECONCILIATION_REQUIRED":
                 update_tokocrypto_by_order_id(entry_oid, {
@@ -410,9 +434,10 @@ class TokocryptoPositionMonitor:
             except (TypeError, ValueError):
                 time_to_res = None
 
+        exit_reason = state_dict.get("exit_reason") or "OCO_TRIGGERED"
         update_tokocrypto_by_order_id(entry_oid, {
             "exit_status":                "TP_HIT" if is_tp else "SL_HIT",
-            "exit_reason":                "OCO_TRIGGERED",
+            "exit_reason":                exit_reason,
             "exit_price":                 exit_price,
             "exit_time":                  exit_time_ms,
             "time_to_resolution_sec":     time_to_res,
@@ -425,7 +450,12 @@ class TokocryptoPositionMonitor:
             "updated_at":                 now_iso,
         })
 
-        label = "✅ TP" if is_tp else "🔴 SL"
+        if is_tp:
+            label = "✅ TP"
+        elif exit_reason == "EMERGENCY_SL_MARKET":
+            label = "🚨 EMERGENCY SL"
+        else:
+            label = "🔴 SL"
         slip_label = "slippage flagged" if slip_flagged else "clean"
 
         _send_toko_telegram(

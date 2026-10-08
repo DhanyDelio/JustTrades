@@ -432,8 +432,13 @@ def cmd_propose(scan_n: int, symbol_filter: str | None = None,
         print("\n❌ No T1 zone-backed candidates found. Try again later.")
         sys.exit(0)
 
-    # Filter out symbols already in an open position
+    # Filter out symbols already in an open position (DB + live exchange open orders)
     open_symbols = {t["symbol"] for t in open_trades}
+    try:
+        live_open_orders = client.get_open_orders()
+        open_symbols.update(o["symbol"] for o in live_open_orders if o.get("status") in ("NEW", "PARTIALLY_FILLED"))
+    except Exception:
+        pass
     excluded_symbols = sorted({c["symbol"] for c in candidates} & open_symbols)
     candidates = [c for c in candidates if c["symbol"] not in open_symbols]
     if excluded_symbols:
@@ -597,6 +602,11 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
 
     open_trades = [t for t in repo.load_trade_log() if t.get("exit_status") == "OPEN"]
     open_symbols = {t["symbol"] for t in open_trades}
+    try:
+        live_open_orders = client.get_open_orders()
+        open_symbols.update(o["symbol"] for o in live_open_orders if o.get("status") in ("NEW", "PARTIALLY_FILLED"))
+    except Exception as exc:
+        print(f"  [WARN] Failed to query live open orders for exclusion: {exc}")
     if open_symbols:
         print(f"  Excluding already open symbol(s) from this batch: {', '.join(sorted(open_symbols))}\n")
 
@@ -691,14 +701,20 @@ def cmd_propose_all(scan_n: int, dry_run: bool = False,
 
     placed, failed = 0, 0
     placed_list: list[str] = []   # collect for Telegram summary
+    placed_symbols_in_batch: set[str] = set()
     from ml.ml_scorer import attach_shadow_score
     for cand in candidates:
+        sym = cand["symbol"]
+        if sym in placed_symbols_in_batch:
+            print(f"  [DUPLICATE SKIPPED] {sym} already placed in this batch.")
+            continue
         try:
             # ML score (observation only — does not affect decisions)
             attach_shadow_score(cand)
 
             executor = SpotOrderExecutor(client, auto_confirm=True, repo=repo)
             order = executor.execute(cand, correlation_cluster_id=cluster_id)
+            placed_symbols_in_batch.add(sym)
             ml_tag   = f"  ml={cand['ml_score']:.2f}" if cand.get('ml_score') is not None else ""
             rank_tag = f"  rank=#{cand['symbol_rank']}" if cand.get('symbol_rank') is not None else ""
             print(f"  ✅ {cand['symbol']:<12} order #{order.get('orderId')}  "

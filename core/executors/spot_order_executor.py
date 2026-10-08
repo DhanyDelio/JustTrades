@@ -67,10 +67,86 @@ class SpotOrderExecutor:
         return True
 
     # ------------------------------------------------------------------
+    # Class-level synchronization locks per symbol
+    _symbol_locks: dict = {}
+    _symbol_locks_guard = __import__("threading").Lock()
+
+    def get_active_exchange_order(self, symbol: str) -> dict | None:
+        """
+        Query Binance exchange as source of truth for active orders.
+        1. If active BUY order exists -> returns that order.
+        2. If active SELL order exists (e.g. OCO TP/SL) -> returns position marker order.
+        """
+        try:
+            if hasattr(self.client, "get_open_orders"):
+                open_orders = self.client.get_open_orders(symbol=symbol)
+                if isinstance(open_orders, list):
+                    active_buys = [
+                        o for o in open_orders
+                        if o.get("side") == "BUY" and o.get("status") in ("NEW", "PARTIALLY_FILLED")
+                    ]
+                    if active_buys:
+                        return active_buys[0]
+                    active_sells = [
+                        o for o in open_orders
+                        if o.get("side") == "SELL" and o.get("status") in ("NEW", "PARTIALLY_FILLED")
+                    ]
+                    if active_sells:
+                        return {"orderId": active_sells[0].get("orderId"), "symbol": symbol, "status": "FILLED"}
+        except Exception as exc:
+            print(f"  [WARN] Failed to query exchange open orders for {symbol}: {exc}")
+        return None
+
+    def has_active_exchange_position(self, symbol: str) -> bool:
+        """
+        Check if an active position exists in repo log AND base asset is held in wallet.
+        Arbitrary wallet balance without an OPEN trade in repo is NOT considered an active position.
+        """
+        try:
+            trades = self.repo.load_trade_log()
+            if not any(t.get("symbol") == symbol and t.get("exit_status") == "OPEN" for t in trades):
+                return False
+
+            base_asset = symbol.replace("USDT", "").replace("BUSD", "")
+            if hasattr(self.client, "get_asset_balance"):
+                bal = self.client.get_asset_balance(asset=base_asset)
+                if bal:
+                    free = float(bal.get("free", 0))
+                    locked = float(bal.get("locked", 0))
+                    return (free + locked) > 0
+        except Exception:
+            pass
+        return False
+
+    def _fetch_order_by_client_id_or_open(self, symbol: str, client_order_id: str | None = None) -> dict | None:
+        """
+        Query exchange by client_order_id or check open orders during reconciliation.
+        """
+        if client_order_id and hasattr(self.client, "get_order"):
+            try:
+                order = self.client.get_order(symbol=symbol, origClientOrderId=client_order_id)
+                if order and order.get("status") in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+                    return order
+            except Exception:
+                pass
+        return self.get_active_exchange_order(symbol)
+
+    def _ensure_repo_logged(self, order: dict, cand: dict, correlation_cluster_id: str | None = None) -> None:
+        """Ensure order is present in Supabase repo trade log."""
+        try:
+            trades = self.repo.load_trade_log()
+            oid = str(order.get("orderId"))
+            if not any(str(t.get("entry_order_id")) == oid for t in trades):
+                self.repo.log_trade(order, cand, correlation_cluster_id=correlation_cluster_id)
+        except Exception as e:
+            print(f"  [WARN] Failed to backfill repo log for order {order.get('orderId')}: {e}")
+
+    # ------------------------------------------------------------------
     # Payload Construction
     # ------------------------------------------------------------------
     def build_payload(self, cand: dict) -> dict:
         """Constructs the kwargs payload for Binance Spot create_order."""
+        import hashlib
         from binance.enums import SIDE_BUY, ORDER_TYPE_LIMIT, TIME_IN_FORCE_GTC
 
         sym       = cand["symbol"]
@@ -82,6 +158,10 @@ class SpotOrderExecutor:
         qty_str   = f"{round_step(qty, step):.8f}".rstrip("0").rstrip(".")
         price_str = f"{round_tick(entry, tick):.8f}".rstrip("0").rstrip(".")
 
+        # Deterministic client order ID (<36 chars) based on symbol + entry
+        h = hashlib.md5(f"{sym}_{entry}_{cand.get('sl')}".encode()).hexdigest()[:12]
+        cid = f"s_{sym[:8]}_{h}"
+
         return {
             "symbol": sym,
             "side": SIDE_BUY,
@@ -89,36 +169,93 @@ class SpotOrderExecutor:
             "timeInForce": TIME_IN_FORCE_GTC,
             "quantity": qty_str,
             "price": price_str,
+            "newClientOrderId": cid,
         }
 
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
     def execute(self, cand: dict, correlation_cluster_id: str | None = None) -> dict:
-        """Executes the order on testnet and logs it to Supabase."""
+        """
+        Executes the order on testnet with full idempotency protection:
+        1. Thread lock per symbol (prevents local race conditions).
+        2. Pre-flight exchange query (reconciles against exchange open orders & positions).
+        3. Deterministic newClientOrderId (prevents duplicate orders on exchange).
+        4. Timeout reconciliation (if POST times out, query exchange before retrying).
+        5. Synchronizes repo persistence.
+        """
+        import threading
         from binance.exceptions import BinanceAPIException
 
-        if self.dry_run:
-            print(f"\n  [DRY RUN] SpotOrderExecutor: skipping execution for {cand['symbol']}")
+        sym = cand["symbol"]
+
+        with self._symbol_locks_guard:
+            if sym not in self._symbol_locks:
+                self._symbol_locks[sym] = threading.RLock()
+            lock = self._symbol_locks[sym]
+
+        with lock:
+            # 1. Pre-flight check: query exchange open orders
+            existing_order = self.get_active_exchange_order(sym)
+            if existing_order:
+                print(f"\n  [DUPLICATE PREVENTED] Active entry order #{existing_order.get('orderId')} "
+                      f"already exists on Binance for {sym}. Using existing order.")
+                self._ensure_repo_logged(existing_order, cand, correlation_cluster_id)
+                return existing_order
+
+            # 2. Check if position is already active/open
+            if self.has_active_exchange_position(sym):
+                print(f"\n  [DUPLICATE PREVENTED] Position already open on Binance for {sym}. Skipping entry.")
+                trades = [t for t in self.repo.load_trade_log() if t.get("symbol") == sym and t.get("exit_status") == "OPEN"]
+                if trades:
+                    return {"orderId": trades[0].get("entry_order_id"), "symbol": sym, "status": "FILLED"}
+                return {"orderId": "EXISTING_POSITION", "symbol": sym, "status": "FILLED"}
+
+            if self.dry_run:
+                print(f"\n  [DRY RUN] SpotOrderExecutor: skipping execution for {cand['symbol']}")
+                payload = self.build_payload(cand)
+                print(f"  [DRY RUN] Payload: {payload}")
+                return {
+                    "orderId": f"DRY_{cand['symbol']}_123",
+                    "symbol": payload["symbol"],
+                    "side": payload["side"],
+                    "status": "NEW",
+                    "price": payload["price"],
+                    "origQty": payload["quantity"],
+                    "clientOrderId": payload.get("newClientOrderId", ""),
+                }
+
             payload = self.build_payload(cand)
-            print(f"  [DRY RUN] Payload: {payload}")
-            return {
-                "orderId": f"DRY_{cand['symbol']}_123",
-                "symbol": payload["symbol"],
-                "side": payload["side"],
-                "status": "NEW",
-                "price": payload["price"],
-                "origQty": payload["quantity"],
-            }
+            client_order_id = payload.get("newClientOrderId")
 
-        payload = self.build_payload(cand)
-        try:
-            order = self.client.create_order(**payload)
-        except BinanceAPIException as e:
-            raise RuntimeError(f"Binance API error: {e}") from e
+            try:
+                order = self.client.create_order(**payload)
+            except BinanceAPIException as e:
+                # Code -2010: Duplicate clientOrderId
+                if getattr(e, "code", None) == -2010 or "Duplicate clientOrderId" in str(e):
+                    print(f"  [DUPLICATE CAUGHT] Binance rejected duplicate clientOrderId {client_order_id}. "
+                          f"Reconciling existing order from exchange...")
+                    existing = self._fetch_order_by_client_id_or_open(sym, client_order_id)
+                    if existing:
+                        self._ensure_repo_logged(existing, cand, correlation_cluster_id)
+                        return existing
+                raise RuntimeError(f"Binance API error: {e}") from e
+            except Exception as e:
+                # Timeout, ConnectionError, or network drop:
+                # The exchange might have received and executed the order!
+                print(f"  [NETWORK TIMEOUT/ERROR] create_order for {sym} raised {e}. "
+                      f"Reconciling against Binance open orders before failing...")
+                reconciled = self._fetch_order_by_client_id_or_open(sym, client_order_id)
+                if reconciled:
+                    print(f"  ✅ Reconciled: Order #{reconciled.get('orderId')} was confirmed on Binance exchange! "
+                          f"Prevented duplicate retry.")
+                    self.repo.log_trade(reconciled, cand, correlation_cluster_id=correlation_cluster_id)
+                    return reconciled
+                # Truly not on exchange: propagate error
+                raise RuntimeError(f"Order submission failed and verified absent on exchange: {e}") from e
 
-        self.repo.log_trade(order, cand, correlation_cluster_id=correlation_cluster_id)
-        return order
+            self.repo.log_trade(order, cand, correlation_cluster_id=correlation_cluster_id)
+            return order
 
     # ------------------------------------------------------------------
     # Lifecycle Management (OCO, Cancel, Status)

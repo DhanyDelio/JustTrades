@@ -303,9 +303,16 @@ class TokocryptoOrderExecutor:
             print(f"  ✗ place_oco: get_ticker failed: {e}")
             return None
 
+        buf_pct = 0.0015
+        if hasattr(self, "_sl_buffer_pct_fn") and callable(self._sl_buffer_pct_fn):
+            try:
+                buf_pct = float(self._sl_buffer_pct_fn(float(trade.get("entry_price") or sl)))
+            except Exception:
+                buf_pct = 0.0015
+
         tp_rounded   = self.client.round_tick(tp, tick)
         sl_stop      = self.client.round_tick(sl, tick)
-        sl_limit     = self.client.round_tick(sl * 0.9985, tick)
+        sl_limit     = self.client.round_tick(sl * (1.0 - buf_pct), tick)
 
         # Guard: sl_limit must be strictly below sl_stop
         if sl_limit >= sl_stop:
@@ -624,3 +631,206 @@ class TokocryptoOrderExecutor:
 
         print(f"  ⚠ cancel_order: unexpected status={status!r} for orderId={order_id}")
         return False
+
+    # ------------------------------------------------------------------
+    # execute_market_sell
+    # ------------------------------------------------------------------
+
+    def execute_market_sell(self, symbol: str, quantity: float) -> dict | None:
+        """
+        Execute emergency MARKET SELL order for Tokocrypto spot.
+
+        Parameters
+        ----------
+        symbol   : str (e.g. "POL_IDR")
+        quantity : float (unrounded base asset amount)
+
+        Returns
+        -------
+        dict with order fill details or None on failure/abort.
+        """
+        try:
+            sym_info = self.client.get_symbol(symbol)
+        except TokocryptoError as e:
+            print(f"  ✗ execute_market_sell: get_symbol failed: {e}")
+            return None
+
+        qty_rounded = self.client.round_step(quantity, sym_info.step_size)
+        if qty_rounded <= 0 or qty_rounded < sym_info.min_qty:
+            print(f"  ✗ execute_market_sell: qty {qty_rounded} < min_qty {sym_info.min_qty}")
+            return None
+
+        if self.supervised:
+            if not _confirm(f"Emergency MARKET SELL {symbol} qty={qty_rounded}?"):
+                print("  ✗ Emergency MARKET SELL aborted by operator.")
+                return None
+
+        if self.dry_run:
+            print(f"[DRY RUN] execute_market_sell: SELL {symbol} qty={qty_rounded} MARKET")
+            ticker_p = 0.0
+            try:
+                ticker_p = float(self.client.get_ticker(symbol))
+            except Exception:
+                pass
+            return {
+                "orderId": "DRY_MARKET_SELL",
+                "status": 2,
+                "executedQty": str(qty_rounded),
+                "executedPrice": str(ticker_p),
+                "time": int(time.time() * 1000),
+            }
+
+        payload = {
+            "symbol":    self.client.normalize_symbol(symbol),
+            "side":      1,            # 1 = SELL
+            "type":      2,            # 2 = MARKET
+            "quantity":  qty_rounded,
+            "timestamp": int(time.time() * 1000),
+        }
+
+        try:
+            resp = self.client._signed_post("/open/v1/orders", payload)
+        except TokocryptoError as e:
+            print(f"  ✗ execute_market_sell: exchange call failed: {e}")
+            return None
+
+        resp_data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        oid = str(resp_data.get("orderId", ""))
+        status = int(resp_data.get("status", -99))
+        exec_price = float(resp_data.get("executedPrice", 0) or 0)
+
+        # If not fully detailed in post response, query order detail
+        if oid and (status != 2 or exec_price <= 0):
+            try:
+                detail = self.client.get_order_detail(symbol, oid)
+                if isinstance(detail, dict):
+                    resp_data = detail
+            except Exception as exc:
+                print(f"  ⚠ execute_market_sell: query detail failed: {exc}")
+
+        return resp_data
+
+    # ------------------------------------------------------------------
+    # recover_stuck_sl
+    # ------------------------------------------------------------------
+
+    def recover_stuck_sl(self, trade: dict) -> dict | None:
+        """
+        Safely recover a stuck SL limit order:
+        1. Query latest status of SL order from exchange.
+        2. If already FILLED, return clean SL_HIT dict without placing new orders.
+        3. If active, CANCEL the order. Abort if cancel fails to prevent duplicate sell.
+        4. Re-query order detail to confirm cancellation and get exact executedQty.
+        5. Verify available wallet balance.
+        6. Execute MARKET SELL for remaining unfilled quantity.
+        7. Compute blended exit price if partial fill occurred.
+        """
+        sym    = trade.get("symbol", "")
+        sl_oid = str(trade.get("sl_order_id", ""))
+        entry_qty = float(trade.get("entry_qty") or 0)
+
+        if not sl_oid:
+            print(f"  ✗ recover_stuck_sl({sym}): missing sl_order_id")
+            return None
+
+        # Step 1: Query order detail
+        try:
+            sl_detail = self.client.get_order_detail(sym, sl_oid)
+        except TokocryptoError as e:
+            print(f"  ✗ recover_stuck_sl({sym}): get_order_detail failed: {e}")
+            return None
+
+        sl_status = int(sl_detail.get("status", -99))
+        sl_exec_qty = float(sl_detail.get("executedQty", 0) or 0)
+        sl_exec_price = float(sl_detail.get("executedPrice", 0) or 0)
+        sl_orig_qty = float(sl_detail.get("origQty", 0) or entry_qty)
+
+        # Step 2: If already filled
+        if sl_status == 2 or (sl_orig_qty > 0 and sl_exec_qty >= sl_orig_qty):
+            return {
+                "state": "SL_HIT",
+                "exit_price": sl_exec_price,
+                "exit_qty": sl_exec_qty,
+                "exit_reason": "OCO_TRIGGERED",
+                "raw_sl": sl_detail,
+                "slippage_flagged": False,
+            }
+
+        # Step 3: Atomic Cancel
+        canceled = self.cancel_order(sym, sl_oid)
+        if not canceled:
+            print(f"  ✗ recover_stuck_sl({sym}): cancel_order({sl_oid}) failed. Aborting recovery to prevent duplicate sell.")
+            return None
+
+        # Step 4: Re-query post-cancel
+        try:
+            sl_detail_post = self.client.get_order_detail(sym, sl_oid)
+            sl_exec_qty = float(sl_detail_post.get("executedQty", 0) or 0)
+            sl_exec_price = float(sl_detail_post.get("executedPrice", 0) or 0)
+            sl_orig_qty = float(sl_detail_post.get("origQty", 0) or sl_orig_qty)
+        except Exception:
+            sl_detail_post = sl_detail
+
+        remaining_qty = max(0.0, sl_orig_qty - sl_exec_qty)
+        if remaining_qty <= 0:
+            # Filled during cancel window
+            return {
+                "state": "SL_HIT",
+                "exit_price": sl_exec_price,
+                "exit_qty": sl_exec_qty,
+                "exit_reason": "OCO_TRIGGERED",
+                "raw_sl": sl_detail_post,
+                "slippage_flagged": False,
+            }
+
+        if "_" in sym:
+            base_asset = sym.split("_")[0]
+        elif sym.endswith("IDR"):
+            base_asset = sym[:-3]
+        elif sym.endswith("USDT"):
+            base_asset = sym[:-4]
+        else:
+            base_asset = sym.replace("_IDR", "").replace("IDR", "")
+        try:
+            bal = self.client.get_balance(base_asset)
+            free_bal = float(bal.free) if bal else 0.0
+        except Exception as e:
+            print(f"  ✗ recover_stuck_sl({sym}): get_balance({base_asset}) failed: {e}")
+            return None
+
+        if free_bal <= 0:
+            print(f"  ✗ recover_stuck_sl({sym}): zero available balance for {base_asset} (free={free_bal})")
+            return None
+
+        sell_qty = min(remaining_qty, free_bal)
+
+        # Step 6: Execute MARKET SELL
+        mkt_resp = self.execute_market_sell(sym, sell_qty)
+        if not mkt_resp:
+            print(f"  ✗ recover_stuck_sl({sym}): emergency market sell failed.")
+            return None
+
+        mkt_exec_price = float(mkt_resp.get("executedPrice", 0) or 0)
+        mkt_exec_qty = float(mkt_resp.get("executedQty", 0) or sell_qty)
+
+        # Step 7: Blended price calculation
+        total_exit_qty = sl_exec_qty + mkt_exec_qty
+        if total_exit_qty > 0:
+            blended_price = (sl_exec_qty * sl_exec_price + mkt_exec_qty * mkt_exec_price) / total_exit_qty
+        else:
+            blended_price = mkt_exec_price
+
+        ref_price = float(trade.get("sl_price") or 0)
+        slip_flag = False
+        if ref_price > 0:
+            slip_pct = abs(blended_price - ref_price) / ref_price
+            slip_flag = slip_pct > 0.003  # 0.3%
+
+        return {
+            "state": "SL_HIT",
+            "exit_price": blended_price,
+            "exit_qty": total_exit_qty,
+            "exit_reason": "EMERGENCY_SL_MARKET",
+            "raw_sl": mkt_resp,
+            "slippage_flagged": slip_flag,
+        }
