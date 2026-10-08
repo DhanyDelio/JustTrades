@@ -205,6 +205,7 @@ def upsert_tokocrypto(record: dict) -> None:
         get_client().table(TABLE_TOKOCRYPTO).upsert(record, on_conflict="entry_order_id").execute()
     except Exception as e:
         print(f"⚠️ upsert_tokocrypto failed: {e}")
+        raise
 
 
 def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
@@ -216,4 +217,5 @@ def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
          .execute())
     except Exception as e:
         print(f"⚠️ update_tokocrypto_by_order_id failed: {e}")
+        raise
 

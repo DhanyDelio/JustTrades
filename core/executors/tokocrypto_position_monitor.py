@@ -375,11 +375,26 @@ class TokocryptoPositionMonitor:
         raw_exit_key   = "raw_tp" if is_tp else "raw_sl"
         raw_exit_detail = state_dict.get(raw_exit_key, {})
 
+        # exit_time is bigint (epoch ms) in Supabase — match entry_fill_time pattern
+        exit_time_ms = int(raw_exit_detail.get("createTime") or raw_exit_detail.get("time") or 0)
+        if exit_time_ms == 0:
+            import time as _time
+            exit_time_ms = int(_time.time() * 1000)
+
+        time_to_res = None
+        entry_fill_ms = trade.get("entry_fill_time")
+        if entry_fill_ms:
+            try:
+                time_to_res = max(0, (exit_time_ms - int(entry_fill_ms)) // 1000)
+            except (TypeError, ValueError):
+                time_to_res = None
+
         update_tokocrypto_by_order_id(entry_oid, {
             "exit_status":                "TP_HIT" if is_tp else "SL_HIT",
             "exit_reason":                "OCO_TRIGGERED",
             "exit_price":                 exit_price,
-            "exit_time":                  now_iso,
+            "exit_time":                  exit_time_ms,
+            "time_to_resolution_sec":     time_to_res,
             "realized_pnl_idr":           round(realized_pnl_idr, 2),
             "realized_pnl_pct":           round(realized_pnl_pct, 4),
             "exit_fill_slippage_pct":     round(slippage_pct, 4),

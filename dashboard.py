@@ -366,7 +366,7 @@ def _get_autorefresh_interval_ms(now_wib: datetime, is_vm_down: bool) -> int:
 
 
 STARTING_LAB_CAPITAL = 240.0
-MAX_TOKO_SLOTS = 10          # Tokocrypto real-money position limit
+MAX_TOKO_SLOTS = int(os.getenv("TOKO_MAX_POSITIONS", "5"))          # Tokocrypto real-money position limit
 TOKO_INITIAL_DEPOSIT_IDR = float(os.getenv("TOKO_INITIAL_DEPOSIT_IDR", "200000"))  # IDR baseline for growth/drawdown display
 
 

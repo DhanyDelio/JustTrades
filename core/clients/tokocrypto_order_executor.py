@@ -17,6 +17,7 @@ NEVER import from binance.* — all exchange calls go through TokocryptoClient.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 
@@ -81,7 +82,7 @@ class TokocryptoOrderExecutor:
     """
 
     MIN_NOTIONAL_IDR: float = 10_000.0   # Phase 2 hard floor
-    MAX_SLOTS: int = 10
+    MAX_SLOTS: int = int(os.environ.get("TOKO_MAX_POSITIONS", "5"))
 
     def __init__(
         self,
@@ -89,11 +90,14 @@ class TokocryptoOrderExecutor:
         supervised: bool = True,
         trading_phase: str = "PHASE_3",
         dry_run: bool = False,
+        max_slots: int | None = None,
     ) -> None:
         self.client         = client
         self.supervised     = supervised
         self._trading_phase = trading_phase   # written to DB at upsert — never rely on column default
         self.dry_run        = dry_run
+        if max_slots is not None:
+            self.MAX_SLOTS  = max_slots
 
     # ------------------------------------------------------------------
     # validate_and_size

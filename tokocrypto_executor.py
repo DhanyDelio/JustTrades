@@ -53,6 +53,14 @@ SL_BUFFER_TIERS = [
 ]
 
 
+def calculate_available_slots(open_count: int, max_positions: int = MAX_POSITIONS) -> int:
+    """
+    Calculate remaining slots available for new positions.
+    Guarantees non-negative result even if open_count exceeds max_positions.
+    """
+    return max(0, max_positions - max(0, open_count))
+
+
 def _sl_buffer_pct(entry_price_idr: float) -> float:
     """Return the appropriate SL limit buffer % for this entry price."""
     for threshold, buf in SL_BUFFER_TIERS:
@@ -75,6 +83,7 @@ def _build_executor(client):
         supervised=SUPERVISED,
         trading_phase=TRADING_PHASE,
         dry_run=False,
+        max_slots=MAX_POSITIONS,
     )
 
 
@@ -149,7 +158,7 @@ def cmd_propose() -> None:
         from services.supabase_client import fetch_all_tokocrypto
         open_trades = [t for t in fetch_all_tokocrypto() if t.get("exit_status") == "OPEN"]
         n_open = len(open_trades)
-        slots_available = max(0, MAX_POSITIONS - n_open)
+        slots_available = calculate_available_slots(n_open, MAX_POSITIONS)
 
         print(f"  Open positions: {n_open} / {MAX_POSITIONS}  |  Slots available: {slots_available}", flush=True)
 
