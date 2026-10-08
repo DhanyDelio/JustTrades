@@ -220,6 +220,7 @@ def cmd_propose() -> None:
         # How many open positions do we already have?
         from services.supabase_client import fetch_all_tokocrypto
         open_trades = [t for t in fetch_all_tokocrypto() if t.get("exit_status") == "OPEN"]
+        open_symbols = {t.get("symbol") for t in open_trades if t.get("symbol")}
         n_open = len(open_trades)
         slots_available = calculate_available_slots(n_open, MAX_POSITIONS)
 
@@ -274,6 +275,11 @@ def cmd_propose() -> None:
             if filled >= target_slots:
                 break
 
+            cand_sym = cand.get("symbol")
+            if cand_sym in open_symbols:
+                print(f"  ⏭ Symbol {cand_sym} already has an active OPEN position — skipping.", flush=True)
+                continue
+
             slot_budget = min(alloc_per_order, remaining_idr)
             if slot_budget <= 0:
                 print("  Remaining wallet IDR depleted — stopping.", flush=True)
@@ -311,6 +317,7 @@ def cmd_propose() -> None:
             result = executor.execute_entry(best, notional)
             if result is not None:
                 filled += 1
+                open_symbols.add(best["symbol"])
                 remaining_idr -= notional   # deduct actual order cost from available
                 print(f"  ✅ Entry placed: {best['symbol']}  orderId={result.get('orderId') or result.get('data',{}).get('orderId','?')}  remaining IDR: Rp {remaining_idr:,.0f}", flush=True)
             else:

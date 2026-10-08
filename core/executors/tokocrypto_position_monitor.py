@@ -320,9 +320,11 @@ class TokocryptoPositionMonitor:
                 )
 
             elif oco_state in ("CRITICAL_ANOMALY", "BOTH_CANCELED_ANOMALY"):
+                raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                raw_meta["requires_manual_review"] = True
                 update_tokocrypto_by_order_id(entry_oid, {
                     "oco_state":            oco_state,
-                    "requires_manual_review": True,
+                    "raw_entry_order":      raw_meta,
                     "updated_at":           now_iso,
                 })
                 raw_tp_s = str(state_dict.get("raw_tp", {}).get("status", "?"))
@@ -335,6 +337,10 @@ class TokocryptoPositionMonitor:
                 )
 
             elif oco_state in ("TP_EXPIRED_PENDING", "SL_EXPIRED_PENDING"):
+                is_recovery_done = bool(
+                    trade.get("recovery_attempted")
+                    or (isinstance(trade.get("raw_entry_order"), dict) and trade.get("raw_entry_order", {}).get("recovery_attempted"))
+                )
                 # Only set expired_leg_detected_at on first detection
                 if not trade.get("expired_leg_detected_at"):
                     update_tokocrypto_by_order_id(entry_oid, {
@@ -347,7 +353,7 @@ class TokocryptoPositionMonitor:
                         f"expired_leg_first_detected={now_iso}  "
                         f"awaiting fill or recovery on next cycle"
                     )
-                elif trade.get("recovery_attempted"):
+                elif is_recovery_done:
                     # Idempotency guard: Recovery was already attempted.
                     # Do NOT retry recovery repeatedly every cycle — await manual intervention.
                     if verbose:
@@ -365,10 +371,12 @@ class TokocryptoPositionMonitor:
                             f"Reason: {recovery_dict.get('exit_reason')}"
                         )
                     else:
+                        raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                        raw_meta["recovery_attempted"] = True
+                        raw_meta["requires_manual_review"] = True
                         update_tokocrypto_by_order_id(entry_oid, {
                             "oco_state":              "RECONCILIATION_REQUIRED",
-                            "recovery_attempted":     True,
-                            "requires_manual_review": True,
+                            "raw_entry_order":        raw_meta,
                             "updated_at":             now_iso,
                         })
                         _send_toko_telegram(
@@ -378,9 +386,11 @@ class TokocryptoPositionMonitor:
                         )
 
             elif oco_state == "RECONCILIATION_REQUIRED":
+                raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                raw_meta["requires_manual_review"] = True
                 update_tokocrypto_by_order_id(entry_oid, {
                     "oco_state":            "RECONCILIATION_REQUIRED",
-                    "requires_manual_review": True,
+                    "raw_entry_order":      raw_meta,
                     "updated_at":           now_iso,
                 })
                 _send_toko_telegram(

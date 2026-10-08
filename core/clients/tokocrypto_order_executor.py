@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from typing import Any
 
 from core.clients.tokocrypto_client import (
     TokocryptoClient,
@@ -65,6 +67,188 @@ def _confirm(prompt: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Decimal precision helpers & Pre-flight OCO eligibility
+# ---------------------------------------------------------------------------
+
+def decimal_round_step(value: Decimal, step: Decimal) -> Decimal:
+    """Floor value down to nearest multiple of step."""
+    if step <= Decimal("0"):
+        return value
+    steps = (value / step).to_integral_value(rounding=ROUND_FLOOR)
+    return steps * step
+
+
+def decimal_round_tick(value: Decimal, tick: Decimal) -> Decimal:
+    """Round price to nearest multiple of tick using ROUND_HALF_UP."""
+    if tick <= Decimal("0"):
+        return value
+    ticks = (value / tick).to_integral_value(rounding=ROUND_HALF_UP)
+    return ticks * tick
+
+
+def get_default_sl_buffer_pct(entry_price: Decimal | float | str) -> Decimal:
+    """
+    Compute stop-limit slippage buffer percentage based on entry price tier.
+      < Rp 1,000      → 0.35%  (micro/penny coins: wide spreads, fast drops)
+      Rp 1,000-10,000 → 0.25%  (mid-low tier)
+      > Rp 10,000     → 0.15%  (major coins: deep books, tight spreads)
+    """
+    ep = Decimal(str(entry_price))
+    if ep < Decimal("1000"):
+        return Decimal("0.0035")
+    elif ep <= Decimal("10000"):
+        return Decimal("0.0025")
+    else:
+        return Decimal("0.0015")
+
+
+def validate_protective_oco_eligibility(
+    entry_qty: Decimal | float | str,
+    entry_price: Decimal | float | str,
+    tp_price: Decimal | float | str,
+    sl_price: Decimal | float | str,
+    sym_info: Any,
+    fee_rate: Decimal | float | str = Decimal("0.0015"),
+    fee_deducted_from_base: bool = True,
+    sl_buffer_pct: Decimal | float | str | None = None,
+) -> tuple[bool, str, dict]:
+    """
+    Generic pre-flight protective OCO eligibility calculation.
+
+    Evaluates whether an entry BUY order will leave sufficient quantity
+    and notional to place a protective OCO sell order after:
+      1. Trading fee deduction
+      2. Step-size precision rounding (floor)
+      3. Minimum quantity constraint
+      4. Minimum notional constraint on TP leg
+      5. Minimum notional constraint on SL stop-limit leg
+      6. Tick-size price rounding on TP and SL legs
+      7. Price hierarchy validation: TP > Entry > SL Stop > SL Limit
+
+    Returns:
+        (is_eligible: bool, reason: str, details: dict)
+    """
+    d_entry_qty   = Decimal(str(entry_qty))
+    d_entry_price = Decimal(str(entry_price))
+    d_tp_price    = Decimal(str(tp_price))
+    d_sl_price    = Decimal(str(sl_price))
+    d_fee_rate    = Decimal(str(fee_rate))
+
+    # Extract symbol filter constraints
+    tick_size = getattr(sym_info, "tick_size", None)
+    if tick_size is None and isinstance(sym_info, dict):
+        tick_size = sym_info.get("tick_size")
+    d_tick = Decimal(str(tick_size or "0"))
+
+    step_size = getattr(sym_info, "step_size", None)
+    if step_size is None and isinstance(sym_info, dict):
+        step_size = sym_info.get("step_size")
+    d_step = Decimal(str(step_size or "0"))
+
+    min_qty = getattr(sym_info, "min_qty", None)
+    if min_qty is None and isinstance(sym_info, dict):
+        min_qty = sym_info.get("min_qty")
+    d_min_qty = Decimal(str(min_qty or "0"))
+
+    min_notional = getattr(sym_info, "min_notional", None)
+    if min_notional is None and isinstance(sym_info, dict):
+        min_notional = sym_info.get("min_notional")
+    d_min_notional = Decimal(str(min_notional or "0"))
+    if d_min_notional <= Decimal("0"):
+        d_min_notional = Decimal("20000.0")
+
+    # Protective order prices
+    if sl_buffer_pct is None:
+        d_buf_pct = get_default_sl_buffer_pct(d_entry_price)
+    else:
+        d_buf_pct = Decimal(str(sl_buffer_pct))
+
+    d_tp_rounded = decimal_round_tick(d_tp_price, d_tick)
+    d_sl_stop    = decimal_round_tick(d_sl_price, d_tick)
+    d_sl_limit_raw = d_sl_price * (Decimal("1") - d_buf_pct)
+    d_sl_limit   = decimal_round_tick(d_sl_limit_raw, d_tick)
+
+    # Guard: SL limit must be strictly below SL stop
+    if d_sl_limit >= d_sl_stop and d_tick > Decimal("0"):
+        d_sl_limit = decimal_round_tick(d_sl_stop - d_tick, d_tick)
+
+    # 1. Expected filled quantity
+    expected_fill_qty = d_entry_qty
+
+    # 2. Expected post-fee quantity
+    if fee_deducted_from_base:
+        expected_post_fee_qty = expected_fill_qty * (Decimal("1") - d_fee_rate)
+    else:
+        expected_post_fee_qty = expected_fill_qty
+
+    # 3. Usable OCO quantity after step-size rounding (floor down)
+    usable_oco_qty = decimal_round_step(expected_post_fee_qty, d_step)
+
+    # Notionals
+    tp_notional = usable_oco_qty * d_tp_rounded
+    sl_limit_notional = usable_oco_qty * d_sl_limit
+
+    details = {
+        "expected_fill_qty":      expected_fill_qty,
+        "expected_post_fee_qty":  expected_post_fee_qty,
+        "usable_oco_qty":         usable_oco_qty,
+        "tp_price_rounded":       d_tp_rounded,
+        "sl_stop_price":          d_sl_stop,
+        "sl_limit_price":         d_sl_limit,
+        "tp_notional":            tp_notional,
+        "sl_limit_notional":      sl_limit_notional,
+        "min_notional":           d_min_notional,
+        "min_qty":                d_min_qty,
+        "step_size":              d_step,
+        "tick_size":              d_tick,
+        "fee_rate":               d_fee_rate,
+        "fee_deducted_from_base": fee_deducted_from_base,
+    }
+
+    # Price hierarchy check: TP > entry > SL stop > SL limit
+    if not (d_tp_rounded > d_entry_price > d_sl_stop > d_sl_limit):
+        return (
+            False,
+            f"OCO_PRICE_HIERARCHY_INVALID: tp={d_tp_rounded} entry={d_entry_price} "
+            f"sl_stop={d_sl_stop} sl_limit={d_sl_limit}",
+            details,
+        )
+
+    # Usable quantity checks
+    if usable_oco_qty <= Decimal("0"):
+        return (
+            False,
+            f"OCO_INELIGIBLE_AFTER_FEE: usable quantity {usable_oco_qty} rounded to 0 "
+            f"(post_fee={expected_post_fee_qty}, step={d_step})",
+            details,
+        )
+
+    if usable_oco_qty < d_min_qty:
+        return (
+            False,
+            f"OCO_INELIGIBLE_AFTER_FEE: usable quantity {usable_oco_qty} < min_qty {d_min_qty}",
+            details,
+        )
+
+    # Leg notional checks
+    if tp_notional < d_min_notional:
+        return (
+            False,
+            f"OCO_INELIGIBLE_AFTER_FEE: TP notional Rp {tp_notional:,.2f} < min_notional Rp {d_min_notional:,.2f}",
+            details,
+        )
+
+    if sl_limit_notional < d_min_notional:
+        return (
+            False,
+            f"OCO_INELIGIBLE_AFTER_FEE: SL limit notional Rp {sl_limit_notional:,.2f} < min_notional Rp {d_min_notional:,.2f}",
+            details,
+        )
+
+    return True, "OK", details
+
+
+# ---------------------------------------------------------------------------
 # Main executor class
 # ---------------------------------------------------------------------------
 
@@ -84,6 +268,8 @@ class TokocryptoOrderExecutor:
     MIN_NOTIONAL_IDR: float = 10_000.0   # Phase 2 hard floor
     MAX_SLOTS: int = int(os.environ.get("TOKO_MAX_POSITIONS", "5"))
 
+    DEFAULT_FEE_RATE: Decimal = Decimal(os.environ.get("TOKO_DEFAULT_FEE_RATE", "0.0015"))  # 0.15% standard taker fee
+
     def __init__(
         self,
         client: TokocryptoClient,
@@ -96,8 +282,52 @@ class TokocryptoOrderExecutor:
         self.supervised     = supervised
         self._trading_phase = trading_phase   # written to DB at upsert — never rely on column default
         self.dry_run        = dry_run
+        self._cached_fee_rate: Decimal | None = None
         if max_slots is not None:
             self.MAX_SLOTS  = max_slots
+
+    def get_fee_config(self, symbol: str) -> tuple[Decimal, bool]:
+        """
+        Return (fee_rate, fee_deducted_from_base) for the given symbol.
+
+        Tokocrypto Spot IDR pairs:
+        - Trading fee on BUY is deducted from the received base asset (fee_deducted_from_base=True).
+        - Fee rate is dynamically resolved from account takerCommission if client is authenticated,
+          otherwise falls back to TOKO_DEFAULT_FEE_RATE env / DEFAULT_FEE_RATE (0.0015 / 0.15%).
+        """
+        fee_rate = self.DEFAULT_FEE_RATE
+        if hasattr(self.client, "authenticated") and self.client.authenticated:
+            if self._cached_fee_rate is None:
+                try:
+                    acc = self.client.get_account()
+                    comm = acc.get("takerCommission")
+                    if comm is not None:
+                        val = Decimal(str(comm))
+                        # Normalize basis points (e.g. 15.0 bps) vs decimal fraction (0.0015)
+                        if val > Decimal("0.01"):
+                            val = val / Decimal("10000")
+                        if val > Decimal("0"):
+                            self._cached_fee_rate = val
+                except Exception:
+                    self._cached_fee_rate = self.DEFAULT_FEE_RATE
+            if self._cached_fee_rate:
+                fee_rate = self._cached_fee_rate
+
+        fee_deducted_from_base = True
+        return fee_rate, fee_deducted_from_base
+
+    def has_active_position(self, symbol: str) -> bool:
+        """
+        Check if an active lifecycle already exists for this symbol in Supabase.
+        Only one active lifecycle (exit_status == 'OPEN') is allowed per symbol.
+        """
+        try:
+            from services.supabase_client import fetch_all_tokocrypto
+            trades = fetch_all_tokocrypto() or []
+            return any(t.get("symbol") == symbol and t.get("exit_status") == "OPEN" for t in trades)
+        except Exception as e:
+            print(f"  [WARN] Failed to query active Tokocrypto positions for {symbol}: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # validate_and_size
@@ -112,6 +342,7 @@ class TokocryptoOrderExecutor:
           - qty rounds to 0 after step rounding
           - qty < sym.min_qty
           - notional (qty × price) < min_notional
+          - pre-flight protective OCO eligibility fails
 
         On success, mutates cand in-place:
             cand["sizing"]["qty"]           — rounded quantity
@@ -146,6 +377,42 @@ class TokocryptoOrderExecutor:
         if notional < min_notional:
             print(f"  ✗ validate_and_size: notional={notional:.0f} < min_notional={min_notional:.0f}")
             return False
+
+        # --- PRE-FLIGHT OCO ELIGIBILITY CHECK ---
+        # Invariant: ENTRY_ALLOWED = OCO_CAN_BE_PLACED_AFTER_ENTRY
+        tp_cand = cand.get("tp_price") or cand.get("tp1")
+        sl_cand = cand.get("sl_price") or cand.get("sl")
+
+        if tp_cand is not None and sl_cand is not None:
+            buf_pct = None
+            if hasattr(self, "_sl_buffer_pct_fn") and callable(self._sl_buffer_pct_fn):
+                try:
+                    buf_pct = self._sl_buffer_pct_fn(entry_price)
+                except Exception:
+                    buf_pct = None
+
+            fee_rate, fee_from_base = self.get_fee_config(cand["symbol"])
+
+            is_eligible, reason, details = validate_protective_oco_eligibility(
+                entry_qty=qty,
+                entry_price=entry_price,
+                tp_price=float(tp_cand),
+                sl_price=float(sl_cand),
+                sym_info=sym,
+                fee_rate=fee_rate,
+                fee_deducted_from_base=fee_from_base,
+                sl_buffer_pct=buf_pct,
+            )
+
+            if not is_eligible:
+                sym_str = cand.get("symbol", "?")
+                print(f"  ✗ validate_and_size: {reason} (symbol={sym_str})")
+                _send_toko_telegram(
+                    f"⛔ [TOKO] Pre-flight OCO Ineligible: {sym_str}\n"
+                    f"Reason: {reason}\n"
+                    f"BUY aborted before submission."
+                )
+                return False
 
         # Success — mutate cand
         cand.setdefault("sizing", {})
@@ -189,6 +456,12 @@ class TokocryptoOrderExecutor:
 
         slot_size_idr is used to compute available_idr = slot_size_idr * MAX_SLOTS.
         """
+        # 0. Active position guard (one active lifecycle per symbol)
+        sym = cand["symbol"]
+        if self.has_active_position(sym):
+            print(f"  ✗ execute_entry: active position already exists for {sym} (duplicate entry rejected)")
+            return None
+
         # 1. Validate and size
         available_idr = slot_size_idr * self.MAX_SLOTS
         if not self.validate_and_size(cand, available_idr):
@@ -326,6 +599,27 @@ class TokocryptoOrderExecutor:
             return None
 
         qty_rounded = self.client.round_step(qty, step)
+
+        # Runtime safety invariants: check usable qty, min_qty, and notionals
+        min_notional = sym_info.min_notional if (sym_info and sym_info.min_notional > 0) else self.MIN_NOTIONAL_IDR
+        tp_notional = qty_rounded * tp_rounded
+        sl_notional = qty_rounded * sl_limit
+
+        if qty_rounded <= 0:
+            print(f"  ✗ place_oco: qty rounded to 0 (raw_qty={qty}, step={step})")
+            return None
+
+        if sym_info.min_qty > 0 and qty_rounded < sym_info.min_qty:
+            print(f"  ✗ place_oco: qty={qty_rounded} < min_qty={sym_info.min_qty}")
+            return None
+
+        if min_notional > 0 and tp_notional < min_notional:
+            print(f"  ✗ place_oco: TP notional Rp {tp_notional:,.2f} < min_notional Rp {min_notional:,.2f}")
+            return None
+
+        if min_notional > 0 and sl_notional < min_notional:
+            print(f"  ✗ place_oco: SL limit notional Rp {sl_notional:,.2f} < min_notional Rp {min_notional:,.2f}")
+            return None
 
         # Supervised gate
         if self.supervised:

@@ -81,9 +81,9 @@ def _base_trade(**kwargs):
         "entry_price":     1_000_000.0,
         "tp_price":        1_030_000.0,
         "sl_price":        970_000.0,
-        "entry_qty":       0.001,
+        "entry_qty":       0.02,
         "entry_fill_price": 1_000_000.0,
-        "entry_notional_idr": 1_000.0,
+        "entry_notional_idr": 20_000.0,
     }
     defaults.update(kwargs)
     return defaults
