@@ -54,20 +54,31 @@ SL_BUFFER_TIERS = [
 ]
 
 
-def calculate_new_order_allocation(wallet_balance: float, max_positions: int = MAX_POSITIONS) -> float:
+MIN_NOTIONAL_IDR = 20_000.0
+
+
+def calculate_available_slots(open_count: int, max_positions: int = MAX_POSITIONS) -> int:
     """
-    Calculate dynamic allocation per new order.
-    Formula: allocation_per_new_order = current_wallet_balance / MAX_OPEN_POSITIONS
+    Calculate remaining slots available for new positions.
+    Guarantees non-negative result even if open_count exceeds max_positions.
+    """
+    return max(0, max_positions - max(0, open_count))
+
+
+def calculate_new_order_allocation(wallet_balance: float, slots: int = MAX_POSITIONS) -> float:
+    """
+    Calculate dynamic allocation per new order given wallet balance and slot divisor.
+    Formula: allocation = wallet_balance / slots
 
     Guarantees:
-      - Returns 0.0 if wallet_balance <= 0 or max_positions <= 0
+      - Returns 0.0 if wallet_balance <= 0 or slots <= 0
       - Does not return negative, NaN, or Infinity
     """
-    if wallet_balance is None or max_positions is None:
+    if wallet_balance is None or slots is None:
         return 0.0
     try:
         w = float(wallet_balance)
-        m = int(max_positions)
+        m = int(slots)
     except (TypeError, ValueError):
         return 0.0
 
@@ -77,12 +88,42 @@ def calculate_new_order_allocation(wallet_balance: float, max_positions: int = M
     return w / m
 
 
-def calculate_available_slots(open_count: int, max_positions: int = MAX_POSITIONS) -> int:
+def calculate_adaptive_allocation(
+    wallet_balance: float,
+    available_slots: int,
+    min_notional: float = MIN_NOTIONAL_IDR,
+) -> tuple[int, float]:
     """
-    Calculate remaining slots available for new positions.
-    Guarantees non-negative result even if open_count exceeds max_positions.
+    Calculate adaptive (target_slots, allocation_per_slot) based on free balance,
+    available slots, and minimum notional.
+
+    Logic:
+      1. If wallet_balance <= 0 or available_slots <= 0, return (0, 0.0).
+      2. Step down target_slots from available_slots down to 1:
+         alloc = calculate_new_order_allocation(wallet_balance, target_slots)
+         If alloc >= min_notional:
+             return target_slots, alloc
+      3. If even 1 slot cannot meet min_notional (wallet_balance < min_notional):
+         return 0, 0.0 (NO ENTRY).
     """
-    return max(0, max_positions - max(0, open_count))
+    if wallet_balance is None or available_slots is None:
+        return 0, 0.0
+    try:
+        w = float(wallet_balance)
+        s = int(available_slots)
+        m = float(min_notional)
+    except (TypeError, ValueError):
+        return 0, 0.0
+
+    if w <= 0.0 or s <= 0 or math.isnan(w) or math.isinf(w):
+        return 0, 0.0
+
+    for target in range(s, 0, -1):
+        alloc = calculate_new_order_allocation(w, target)
+        if alloc >= m:
+            return target, alloc
+
+    return 0, 0.0
 
 
 def _sl_buffer_pct(entry_price_idr: float) -> float:
@@ -196,21 +237,26 @@ def cmd_propose() -> None:
             print(f"⚠️ [TOKO] Failed to fetch live IDR wallet balance from API: {e}. Skipping propose.", flush=True)
             return
 
-        alloc_per_order = calculate_new_order_allocation(idr_bal, MAX_POSITIONS)
+        target_slots, alloc_per_order = calculate_adaptive_allocation(
+            wallet_balance=idr_bal,
+            available_slots=slots_available,
+            min_notional=MIN_NOTIONAL_IDR,
+        )
 
         # Runtime verification log
         print(f"Wallet balance fetched: Rp {idr_bal:,.2f}", flush=True)
         print(f"MAX_OPEN_POSITIONS: {MAX_POSITIONS}", flush=True)
-        print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
         print(f"Open positions: {n_open} / {MAX_POSITIONS}", flush=True)
         print(f"Available slots: {slots_available}", flush=True)
+        print(f"Target slots to allocate: {target_slots}", flush=True)
+        print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
 
         if idr_bal <= 0:
             print(f"  Wallet IDR balance is Rp {idr_bal:,.2f} — no available funds. Skipping.", flush=True)
             return
 
-        if alloc_per_order <= 0:
-            print("  Calculated allocation per new order is 0. Skipping.", flush=True)
+        if target_slots <= 0 or alloc_per_order < MIN_NOTIONAL_IDR:
+            print(f"  Available balance (Rp {idr_bal:,.2f}) cannot meet minimum notional (Rp {MIN_NOTIONAL_IDR:,.2f}). Skipping.", flush=True)
             return
 
         # Scan — get ALL candidates (up to slots_available), sorted by score
@@ -225,7 +271,7 @@ def cmd_propose() -> None:
         remaining_idr = idr_bal
 
         for cand in candidates:
-            if filled >= slots_available:
+            if filled >= target_slots:
                 break
 
             slot_budget = min(alloc_per_order, remaining_idr)
@@ -234,7 +280,7 @@ def cmd_propose() -> None:
                 break
 
             print(f"  Slot budget: Rp {slot_budget:,.2f}  "
-                  f"({slots_available - filled} slot(s) left)", flush=True)
+                  f"({target_slots - filled} slot(s) left)", flush=True)
 
             best = scanner.pick_best_candidate([cand], available_idr=slot_budget)
             if best is None:
@@ -308,13 +354,18 @@ def cmd_diagnostic() -> None:
         print(f"⚠️ [TOKO] Failed to fetch live IDR wallet balance from API: {e}", flush=True)
         idr_bal = 0.0
 
-    alloc_per_order = calculate_new_order_allocation(idr_bal, MAX_POSITIONS)
+    target_slots, alloc_per_order = calculate_adaptive_allocation(
+        wallet_balance=idr_bal,
+        available_slots=slots_available,
+        min_notional=MIN_NOTIONAL_IDR,
+    )
 
     print(f"Wallet balance fetched: Rp {idr_bal:,.2f}", flush=True)
     print(f"MAX_OPEN_POSITIONS: {MAX_POSITIONS}", flush=True)
-    print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
     print(f"Open positions: {n_open} / {MAX_POSITIONS}", flush=True)
     print(f"Available slots: {slots_available}", flush=True)
+    print(f"Target slots to allocate: {target_slots}", flush=True)
+    print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
 
 
 # ---------------------------------------------------------------------------

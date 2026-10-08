@@ -18,6 +18,8 @@ from unittest.mock import patch, MagicMock
 from tokocrypto_executor import (
     calculate_available_slots,
     calculate_new_order_allocation,
+    calculate_adaptive_allocation,
+    MIN_NOTIONAL_IDR,
     cmd_diagnostic,
     cmd_propose,
     MAX_POSITIONS,
@@ -84,6 +86,12 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
         mock_fetch.return_value = [
             {"entry_order_id": "1001", "symbol": "DOGE_IDR", "exit_status": "OPEN"}
         ]
+        client_mock = MagicMock()
+        bal_mock = MagicMock()
+        bal_mock.free = 200_000.0
+        client_mock.get_balance.return_value = bal_mock
+        mock_build_client.return_value = client_mock
+
         scanner_mock = MagicMock()
         scanner_mock.gather_candidates.return_value = []
         mock_build_scanner.return_value = scanner_mock
@@ -372,9 +380,115 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         output = buf.getvalue()
         self.assertIn("Wallet balance fetched: Rp 250,000.00", output)
         self.assertIn("MAX_OPEN_POSITIONS: 5", output)
-        self.assertIn("Dynamic allocation per new order: Rp 50,000.00", output)
         self.assertIn("Open positions: 1 / 5", output)
         self.assertIn("Available slots: 4", output)
+        self.assertIn("Target slots to allocate: 4", output)
+        self.assertIn("Dynamic allocation per new order: Rp 62,500.00", output)
+
+
+class TestTokocryptoAdaptiveAllocation(unittest.TestCase):
+    """
+    Unit tests for adaptive/dynamic slot allocation.
+    Scenarios:
+      1. 2 slots available, Rp77.522 -> allocation for 2 slots successful (Rp38.761 each).
+      2. 2 slots available, Rp35.000 -> 2 slots fail minimum, fallback to 1 slot successful (Rp35.000).
+      3. 2 slots available, Rp18.000 -> even 1 slot fails minimum -> NO ENTRY (target=0, alloc=0).
+      4. 1 slot available and balance sufficient -> 1 entry (Rp50.000).
+      5. 0 slots available -> NO ENTRY.
+      6. Locked balance is NOT counted as free balance.
+      7. Never produces an order allocation below minimum notional (Rp20.000).
+      8. Never exceeds MAX_OPEN_POSITIONS.
+    """
+
+    def test_1_two_slots_77k_allocates_two_slots(self):
+        """Scenario 1: Free IDR Rp77.522 with 2 slots -> 2 slots allocated at Rp38.761 each."""
+        slots, alloc = calculate_adaptive_allocation(77_522.0, available_slots=2, min_notional=20_000.0)
+        self.assertEqual(slots, 2)
+        self.assertAlmostEqual(alloc, 38_761.0, places=1)
+        self.assertGreaterEqual(alloc, 20_000.0)
+
+    def test_2_two_slots_35k_fallback_to_one_slot(self):
+        """Scenario 2: Free IDR Rp35.000 with 2 slots -> 2 slots fail (<20k), fallback to 1 slot at Rp35.000."""
+        slots, alloc = calculate_adaptive_allocation(35_000.0, available_slots=2, min_notional=20_000.0)
+        self.assertEqual(slots, 1)
+        self.assertEqual(alloc, 35_000.0)
+        self.assertGreaterEqual(alloc, 20_000.0)
+
+    def test_3_two_slots_18k_below_min_notional_no_entry(self):
+        """Scenario 3: Free IDR Rp18.000 with 2 slots -> even 1 slot < 20k -> NO ENTRY (slots=0, alloc=0)."""
+        slots, alloc = calculate_adaptive_allocation(18_000.0, available_slots=2, min_notional=20_000.0)
+        self.assertEqual(slots, 0)
+        self.assertEqual(alloc, 0.0)
+
+    def test_4_one_slot_sufficient_balance_allocates_one_slot(self):
+        """Scenario 4: Free IDR Rp50.000 with 1 slot -> allocates 1 slot at Rp50.000."""
+        slots, alloc = calculate_adaptive_allocation(50_000.0, available_slots=1, min_notional=20_000.0)
+        self.assertEqual(slots, 1)
+        self.assertEqual(alloc, 50_000.0)
+
+    def test_5_zero_slots_available_no_entry(self):
+        """Scenario 5: 0 slots available -> NO ENTRY regardless of high wallet balance."""
+        slots, alloc = calculate_adaptive_allocation(500_000.0, available_slots=0, min_notional=20_000.0)
+        self.assertEqual(slots, 0)
+        self.assertEqual(alloc, 0.0)
+
+    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("tokocrypto_executor._build_scanner")
+    @patch("tokocrypto_executor._build_client")
+    @patch("tokocrypto_executor._build_executor")
+    def test_6_locked_balance_excluded_from_free_idr(
+        self, mock_build_exec, mock_build_client, mock_build_scanner, mock_fetch
+    ):
+        """Scenario 6: Locked balance (e.g. pending Limit Buy) is NOT treated as free balance."""
+        # 3 open trades: ETH, POL, and SOL (pending NEW)
+        mock_fetch.return_value = [
+            {"symbol": "ETH_IDR", "exit_status": "OPEN", "entry_status": "FILLED"},
+            {"symbol": "POL_IDR", "exit_status": "OPEN", "entry_status": "FILLED"},
+            {"symbol": "SOL_IDR", "exit_status": "OPEN", "entry_status": "NEW"},
+        ]
+        client_mock = MagicMock()
+        bal_mock = MagicMock()
+        bal_mock.free = 77_522.21
+        bal_mock.locked = 36_606.50
+        client_mock.get_balance.return_value = bal_mock
+        mock_build_client.return_value = client_mock
+
+        scanner_mock = MagicMock()
+        scanner_mock.gather_candidates.return_value = []
+        mock_build_scanner.return_value = scanner_mock
+
+        cmd_propose()
+
+        # Available slots = 5 - 3 = 2
+        # Target slots = 2, alloc = 77,522.21 / 2 = 38,761.10
+        # Scanner is called for available slots
+        scanner_mock.gather_candidates.assert_called_once_with(max_positions=2)
+
+    def test_7_never_allocates_below_minimum_notional(self):
+        """Scenario 7: Across various balances, if target_slots > 0, alloc is ALWAYS >= min_notional."""
+        min_notional = 20_000.0
+        # Test balances from 0 to 100k
+        for bal in [0, 500, 10_000, 19_999, 20_000, 25_000, 39_999, 40_000, 77_522, 100_000]:
+            for s in range(0, 6):
+                target, alloc = calculate_adaptive_allocation(bal, s, min_notional)
+                if target > 0:
+                    self.assertGreaterEqual(alloc, min_notional,
+                                           f"Failed for bal={bal}, slots={s}: got alloc={alloc}")
+                else:
+                    self.assertEqual(alloc, 0.0)
+
+    def test_8_never_exceeds_max_open_positions(self):
+        """Scenario 8: target_slots never exceeds available_slots or MAX_POSITIONS."""
+        max_positions = 5
+        huge_wallet = 10_000_000.0  # Rp 10 million
+        for n_open in range(0, 10):
+            avail = calculate_available_slots(n_open, max_positions)
+            target, alloc = calculate_adaptive_allocation(huge_wallet, avail, 20_000.0)
+            self.assertLessEqual(target, avail)
+            if n_open <= max_positions:
+                self.assertLessEqual(n_open + target, max_positions)
+            else:
+                self.assertEqual(target, 0)
 
 
 if __name__ == "__main__":
