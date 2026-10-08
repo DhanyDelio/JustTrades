@@ -352,9 +352,24 @@ class TokocryptoOrderExecutor:
             raise RuntimeError(f"place_oco: exchange call failed: {e}") from e
 
         # Parse order IDs from response
-        resp_data      = resp.get("data") or resp
-        b_order_list_id = str(resp_data.get("bOrderListId", ""))
-        orders         = resp_data.get("orders", [])
+        resp_data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        orders    = resp_data.get("orders") or resp.get("orders") or []
+
+        # Support bOrderListId/orderListId at root, resp_data, or inside child orders
+        raw_list_id = (
+            resp_data.get("bOrderListId")
+            or resp_data.get("orderListId")
+            or resp.get("bOrderListId")
+            or resp.get("orderListId")
+        )
+        if not raw_list_id and isinstance(orders, list):
+            for o in orders:
+                if isinstance(o, dict):
+                    cid = o.get("bOrderListId") or o.get("orderListId")
+                    if cid:
+                        raw_list_id = cid
+                        break
+        b_order_list_id = str(raw_list_id or "")
 
         tp_order_id = ""
         sl_order_id = ""

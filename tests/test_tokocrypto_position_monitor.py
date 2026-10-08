@@ -203,6 +203,83 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
         self.assertGreater(payload["exit_time"], 1_700_000_000_000)
         self.assertIsNone(payload["time_to_resolution_sec"])
 
+    @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
+    @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
+    def test_monitor_recognizes_legs_and_backfills_list_id(self, mock_tg, mock_update):
+        """
+        When b_order_list_id is empty in Supabase row, but tp_order_id and sl_order_id exist:
+        - Monitor recognizes it as has_oco (does NOT re-place OCO)
+        - Discovers bOrderListId from leg details and backfills it into Supabase
+        - Updates oco_state to EXECUTING
+        """
+        trade = {
+            "symbol": "ETH_IDR",
+            "entry_order_id": "917510981",
+            "entry_status": "FILLED",
+            "b_order_list_id": "",
+            "tp_order_id": "917549739",
+            "sl_order_id": "917549740",
+            "entry_price": 45503763.0,
+            "entry_fill_price": 45503757.0,
+            "tp_price": 47645461.0,
+            "sl_price": 44689248.0,
+            "exit_status": "OPEN",
+        }
+
+        raw_tp = {
+            "orderId": "917549739",
+            "bOrderListId": "25208289734",
+            "status": 0,  # NEW (active)
+            "price": "47645461",
+        }
+        raw_sl = {
+            "orderId": "917549740",
+            "bOrderListId": "25208289734",
+            "status": 0,  # NEW (active)
+            "price": "44622214",
+            "stopPrice": "44689248",
+        }
+
+        self.mock_client.get_order_detail.side_effect = lambda sym, oid: raw_tp if str(oid) == "917549739" else raw_sl
+        with patch.object(self.executor, "place_oco") as mock_place_oco:
+            self.monitor._check_one(trade, verbose=True)
+            mock_place_oco.assert_not_called()
+
+        # Check update was called with backfilled list id and EXECUTING state
+        self.assertTrue(mock_update.called)
+        # At least one call should have b_order_list_id backfilled
+        backfilled = any(
+            call.args[1].get("b_order_list_id") == "25208289734"
+            for call in mock_update.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        )
+        self.assertTrue(backfilled)
+
+    @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
+    @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
+    def test_monitor_unprotected_calls_place_oco(self, mock_tg, mock_update):
+        """
+        When filled position has NO b_order_list_id and NO leg order ids,
+        it is recognized as unprotected and triggers place_oco.
+        """
+        trade = {
+            "symbol": "SOL_IDR",
+            "entry_order_id": "917510994",
+            "entry_status": "FILLED",
+            "b_order_list_id": "",
+            "tp_order_id": "",
+            "sl_order_id": "",
+            "entry_price": 1926658.0,
+            "entry_fill_price": 1926658.0,
+            "tp_price": 2147050.0,
+            "sl_price": 1899240.0,
+            "exit_status": "OPEN",
+        }
+
+        with patch.object(self.executor, "place_oco", return_value={"bOrderListId": "999"}) as mock_place_oco:
+            self.monitor._check_one(trade, verbose=False)
+            mock_place_oco.assert_called_once_with(trade)
+
 
 if __name__ == "__main__":
     unittest.main()

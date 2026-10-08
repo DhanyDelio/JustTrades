@@ -96,10 +96,13 @@ class TokocryptoPositionMonitor:
         sym           = trade.get("symbol", "?")
         entry_oid     = str(trade.get("entry_order_id", ""))
         entry_status  = (trade.get("entry_status") or "").upper()
-        b_order_list  = trade.get("b_order_list_id")
+        b_order_list  = str(trade.get("b_order_list_id") or "").strip()
+        tp_oid        = str(trade.get("tp_order_id") or "").strip()
+        sl_oid        = str(trade.get("sl_order_id") or "").strip()
+        has_oco       = bool(b_order_list) or bool(tp_oid and sl_oid)
 
         if verbose:
-            print(f"  [{sym}] entry_status={entry_status}  OCO={b_order_list}")
+            print(f"  [{sym}] entry_status={entry_status}  OCO={b_order_list or ('legs:' + tp_oid)}")
 
         # ----------------------------------------------------------------
         # Phase A: Entry order not yet confirmed filled
@@ -150,7 +153,7 @@ class TokocryptoPositionMonitor:
         # ----------------------------------------------------------------
         # Phase B: Entry filled, OCO not yet placed
         # ----------------------------------------------------------------
-        if entry_status == "FILLED" and not b_order_list:
+        if entry_status == "FILLED" and not has_oco:
             # Retry guard — stop retrying after MAX_OCO_RETRIES to avoid
             # Telegram spam.  The counter persists in Supabase.
             MAX_OCO_RETRIES = 3
@@ -225,10 +228,28 @@ class TokocryptoPositionMonitor:
         # ----------------------------------------------------------------
         # Phase C: OCO placed — query its state
         # ----------------------------------------------------------------
-        if b_order_list:
+        if has_oco:
             state_dict = self.executor.query_oco_state(trade)
             oco_state  = state_dict["state"]
             now_iso    = datetime.now(timezone.utc).isoformat()
+
+            # Backfill b_order_list_id if it was missing locally
+            if not b_order_list:
+                raw_tp = state_dict.get("raw_tp") or {}
+                raw_sl = state_dict.get("raw_sl") or {}
+                discovered = (
+                    raw_tp.get("bOrderListId")
+                    or raw_tp.get("orderListId")
+                    or raw_sl.get("bOrderListId")
+                    or raw_sl.get("orderListId")
+                )
+                if discovered:
+                    b_order_list = str(discovered).strip()
+                    trade["b_order_list_id"] = b_order_list
+                    update_tokocrypto_by_order_id(entry_oid, {
+                        "b_order_list_id": b_order_list,
+                        "updated_at":      now_iso,
+                    })
 
             if verbose:
                 print(f"  [{sym}] OCO state: {oco_state}")

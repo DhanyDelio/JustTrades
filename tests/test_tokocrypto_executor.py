@@ -277,6 +277,96 @@ class TestPlaceOco(unittest.TestCase):
         self.assertIsNone(result)
         client._signed_post.assert_not_called()
 
+    def test_place_oco_borderlistid_at_root(self, mock_tg, mock_up, mock_upd):
+        """bOrderListId at root of response is parsed and saved as EXECUTING."""
+        executor, client, sym = _make_executor(supervised=False, dry_run=False)
+        client.get_ticker.return_value = 1_000_000.0
+        client._signed_post.return_value = {
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "bOrderListId": "25208289734",
+                "orders": [
+                    {"orderId": "917549739"},
+                    {"orderId": "917549740"},
+                ],
+            },
+        }
+        trade = _base_trade(entry_order_id="9999", tp_price=1_030_000.0, sl_price=970_000.0)
+        resp = executor.place_oco(trade)
+        self.assertIsNotNone(resp)
+        mock_upd.assert_called_once()
+        call_entry_oid, payload = mock_upd.call_args[0]
+        self.assertEqual(call_entry_oid, "9999")
+        self.assertEqual(payload["b_order_list_id"], "25208289734")
+        self.assertEqual(payload["tp_order_id"], "917549739")
+        self.assertEqual(payload["sl_order_id"], "917549740")
+        self.assertEqual(payload["oco_state"], "EXECUTING")
+        mock_tg.assert_called_once()
+
+    def test_place_oco_borderlistid_in_child_orders(self, mock_tg, mock_up, mock_upd):
+        """bOrderListId absent at root but present in orders[0] is successfully parsed."""
+        executor, client, sym = _make_executor(supervised=False, dry_run=False)
+        client.get_ticker.return_value = 1_000_000.0
+        client._signed_post.return_value = {
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "orders": [
+                    {"orderId": "917549756", "bOrderListId": "25208291196"},
+                    {"orderId": "917549757", "bOrderListId": "25208291196"},
+                ],
+            },
+        }
+        trade = _base_trade(entry_order_id="8888", tp_price=1_030_000.0, sl_price=970_000.0)
+        resp = executor.place_oco(trade)
+        self.assertIsNotNone(resp)
+        mock_upd.assert_called_once()
+        call_entry_oid, payload = mock_upd.call_args[0]
+        self.assertEqual(call_entry_oid, "8888")
+        self.assertEqual(payload["b_order_list_id"], "25208291196")
+        self.assertEqual(payload["tp_order_id"], "917549756")
+        self.assertEqual(payload["sl_order_id"], "917549757")
+        self.assertEqual(payload["oco_state"], "EXECUTING")
+        mock_tg.assert_called_once()
+
+    def test_place_oco_orderlistid_fallback(self, mock_tg, mock_up, mock_upd):
+        """orderListId naming fallback is supported both at root and inside orders."""
+        executor, client, sym = _make_executor(supervised=False, dry_run=False)
+        client.get_ticker.return_value = 1_000_000.0
+        client._signed_post.return_value = {
+            "orderListId": "777888",
+            "orders": [
+                {"orderId": "111"},
+                {"orderId": "222"},
+            ],
+        }
+        trade = _base_trade(entry_order_id="7777", tp_price=1_030_000.0, sl_price=970_000.0)
+        resp = executor.place_oco(trade)
+        self.assertIsNotNone(resp)
+        _, payload = mock_upd.call_args[0]
+        self.assertEqual(payload["b_order_list_id"], "777888")
+        self.assertEqual(payload["oco_state"], "EXECUTING")
+
+    def test_place_oco_missing_list_id_still_sets_executing(self, mock_tg, mock_up, mock_upd):
+        """Missing list id gracefully defaults to empty string without raising, state is EXECUTING."""
+        executor, client, sym = _make_executor(supervised=False, dry_run=False)
+        client.get_ticker.return_value = 1_000_000.0
+        client._signed_post.return_value = {
+            "orders": [
+                {"orderId": "111"},
+                {"orderId": "222"},
+            ],
+        }
+        trade = _base_trade(entry_order_id="6666", tp_price=1_030_000.0, sl_price=970_000.0)
+        resp = executor.place_oco(trade)
+        self.assertIsNotNone(resp)
+        _, payload = mock_upd.call_args[0]
+        self.assertEqual(payload["b_order_list_id"], "")
+        self.assertEqual(payload["tp_order_id"], "111")
+        self.assertEqual(payload["sl_order_id"], "222")
+        self.assertEqual(payload["oco_state"], "EXECUTING")
+
 
 # ===========================================================================
 # E. cancel_order

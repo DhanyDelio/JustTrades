@@ -2135,6 +2135,61 @@ def build_toko_rr_scatter(df: pd.DataFrame):
     return fig
 
 
+def compute_toko_oco_badge(trade: dict) -> str:
+    """
+    Compute conservative OCO badge HTML for a Tokocrypto position.
+
+    Conservative criteria:
+    - Anomaly state -> 🚨 ANOMALY badge
+    - Exchange-confirmed list (FULLY_PROTECTED or valid oco_list_id) -> OCO ✓
+    - EXECUTING state with verified TP/SL levels and leg order IDs -> OCO ✓
+    - Insufficient data or missing protection when FILLED -> ⚠ NO OCO
+    - Unfilled positions (NEW / PARTIALLY_FILLED) -> ""
+    """
+    entry_status = str(trade.get("entry_status", "NEW")).upper()
+    is_filled    = entry_status == "FILLED"
+    oco_state    = trade.get("oco_state", "")
+    oco_st_upper = str(oco_state).upper() if oco_state else ""
+    oco_list_id  = trade.get("b_order_list_id")
+    valid_oco_list = bool(oco_list_id and str(oco_list_id).strip() and str(oco_list_id).strip() != "0")
+
+    def _has_valid_tp_sl_protection(t: dict) -> bool:
+        try:
+            tp_oid = str(t.get("tp_order_id") or "").strip()
+            sl_oid = str(t.get("sl_order_id") or "").strip()
+            if not (tp_oid and sl_oid):
+                return False
+            tp_val = float(t.get("tp_price") or t.get("tp1") or 0)
+            sl_val = float(t.get("sl_price") or t.get("sl") or 0)
+            if tp_val <= 0 or sl_val <= 0:
+                return False
+            ref = float(t.get("entry_fill_price") or t.get("entry_price") or 0)
+            if ref > 0:
+                return tp_val > ref > sl_val
+            return tp_val > sl_val
+        except (ValueError, TypeError):
+            return False
+
+    is_protected = (
+        oco_st_upper == "FULLY_PROTECTED"
+        or valid_oco_list
+        or (oco_st_upper == "EXECUTING" and _has_valid_tp_sl_protection(trade))
+    )
+
+    if oco_st_upper in TOKO_ANOMALY_STATES:
+        return (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+                f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+                f"🚨 {oco_st_upper}</span>")
+    elif is_protected:
+        return ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+                "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
+    elif is_filled:
+        return ("<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+                "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
+    else:
+        return ""
+
+
 def render_toko_open_card(
     trade: dict,
     current_price: float | None,
@@ -2190,22 +2245,7 @@ def render_toko_open_card(
     status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
 
     # OCO badge
-    oco_st_upper = str(oco_state).upper() if oco_state else ""
-    if oco_st_upper in TOKO_ANOMALY_STATES:
-        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🚨 {oco_st_upper}</span>")
-    elif oco_st_upper == "FULLY_PROTECTED":
-        oco_badge = ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
-                     "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
-    elif oco_list_id:
-        oco_badge = ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
-                     "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
-    elif is_filled:
-        oco_badge = ("<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
-                     "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
-    else:
-        oco_badge = ""
+    oco_badge = compute_toko_oco_badge(trade)
 
     # PENDING FILL badge
     pending_badge = (
