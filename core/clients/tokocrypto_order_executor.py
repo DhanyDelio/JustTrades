@@ -479,6 +479,29 @@ class TokocryptoOrderExecutor:
                 "raw_sl":           raw_sl,
             }
 
+        # Tokocrypto can mark the OCO sibling as EXPIRED (6), rather than
+        # CANCELED (3), after the other leg fills.  Both combinations are a
+        # confirmed completed exit, not a pending expired order.
+        if tp_status == 2 and sl_status == 6:
+            exit_price = _exit_price_from(raw_tp)
+            return {
+                "state":            "TP_HIT",
+                "exit_price":       exit_price,
+                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("tp_price", 0)), is_tp=True),
+                "raw_tp":           raw_tp,
+                "raw_sl":           raw_sl,
+            }
+
+        if tp_status == 6 and sl_status == 2:
+            exit_price = _exit_price_from(raw_sl)
+            return {
+                "state":            "SL_HIT",
+                "exit_price":       exit_price,
+                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("sl_price", 0)), is_tp=False),
+                "raw_tp":           raw_tp,
+                "raw_sl":           raw_sl,
+            }
+
         # One filled, counterpart stuck — wait 1s and re-query
         if (tp_status == 2 and sl_status == 0) or (tp_status == 0 and sl_status == 2):
             time.sleep(1)

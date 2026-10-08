@@ -49,6 +49,9 @@ def _mock_client(tick=100.0, step=0.001, min_qty=0.001, min_notional=10_000.0):
     client.round_tick = TokocryptoClient.round_tick
     client.round_step = TokocryptoClient.round_step
     client.normalize_symbol = TokocryptoClient.normalize_symbol
+    balance = MagicMock()
+    balance.free = 0.0
+    client.get_balance.return_value = balance
     return client, sym
 
 
@@ -202,6 +205,19 @@ class TestQueryOcoState(unittest.TestCase):
     # (3, 2) → SL_HIT, exit_price from executedPrice
     def test_sl_hit_3_2(self, mock_tg, mock_up, mock_upd):
         executor, client = self._executor_with_orders(3, 2, sl_exec_price=968_000.0)
+        result = executor.query_oco_state(_base_trade())
+        self.assertEqual(result["state"], "SL_HIT")
+        self.assertAlmostEqual(result["exit_price"], 968_000.0)
+
+    # Tokocrypto expires the OCO sibling after the filled exit leg.
+    def test_tp_hit_2_6(self, mock_tg, mock_up, mock_upd):
+        executor, client = self._executor_with_orders(2, 6, tp_exec_price=1_032_000.0)
+        result = executor.query_oco_state(_base_trade())
+        self.assertEqual(result["state"], "TP_HIT")
+        self.assertAlmostEqual(result["exit_price"], 1_032_000.0)
+
+    def test_sl_hit_6_2(self, mock_tg, mock_up, mock_upd):
+        executor, client = self._executor_with_orders(6, 2, sl_exec_price=968_000.0)
         result = executor.query_oco_state(_base_trade())
         self.assertEqual(result["state"], "SL_HIT")
         self.assertAlmostEqual(result["exit_price"], 968_000.0)
