@@ -23,6 +23,7 @@ Configuration (env vars):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -51,6 +52,29 @@ SL_BUFFER_TIERS = [
     (1_000,   0.0030),   # Rp 1,000–100,000/unit → 0.30% (mid: XRP, ADA, AVAX...)
     (0,       0.0050),   # < Rp 1,000/unit → 0.50% (thin: DOGE, ZIL, HBAR, POL...)
 ]
+
+
+def calculate_new_order_allocation(wallet_balance: float, max_positions: int = MAX_POSITIONS) -> float:
+    """
+    Calculate dynamic allocation per new order.
+    Formula: allocation_per_new_order = current_wallet_balance / MAX_OPEN_POSITIONS
+
+    Guarantees:
+      - Returns 0.0 if wallet_balance <= 0 or max_positions <= 0
+      - Does not return negative, NaN, or Infinity
+    """
+    if wallet_balance is None or max_positions is None:
+        return 0.0
+    try:
+        w = float(wallet_balance)
+        m = int(max_positions)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if w <= 0.0 or m <= 0 or math.isnan(w) or math.isinf(w):
+        return 0.0
+
+    return w / m
 
 
 def calculate_available_slots(open_count: int, max_positions: int = MAX_POSITIONS) -> int:
@@ -133,17 +157,15 @@ def cmd_check_positions() -> None:
 
 def cmd_propose() -> None:
     """
-    Step 2: Scan all 29 IDR pairs, find T1 setups, propose/execute entries.
-    - Scans Binance kline data (same chart_analyzer as Binance testnet)
-    - Converts prices to IDR via live USDT_IDR rate
-    - Same T1/rr_clears/no_tp_in_range filtering as testnet
+    Step 2: Scan IDR pairs, find T1 setups, propose/execute entries.
+    - Sizing: dynamic based on live wallet balance from API (current_wallet_balance / MAX_OPEN_POSITIONS)
     - Orders up to (MAX_POSITIONS - open_positions) new slots
     - In PHASE_3 (default): fully automated, no y/n prompt
     - In PHASE_2: supervised mode, requires terminal confirmation
     """
     print(f"\n{'='*50}", flush=True)
     print("  TOKOCRYPTO — PROPOSE NEW TRADES", flush=True)
-    print(f"  Phase: {TRADING_PHASE}  Max slots: {MAX_POSITIONS}  Budget: Rp {BUDGET_IDR:,.0f}", flush=True)
+    print(f"  Phase: {TRADING_PHASE}  Max slots: {MAX_POSITIONS}", flush=True)
     print(f"{'='*50}", flush=True)
 
     try:
@@ -166,52 +188,55 @@ def cmd_propose() -> None:
             print("  All slots occupied — skipping scan.", flush=True)
             return
 
+        # Fetch live IDR balance from API (source of truth)
+        try:
+            balance_obj = client.get_balance("IDR")
+            idr_bal = float(balance_obj.free) if balance_obj else 0.0
+        except Exception as e:
+            print(f"⚠️ [TOKO] Failed to fetch live IDR wallet balance from API: {e}. Skipping propose.", flush=True)
+            return
+
+        alloc_per_order = calculate_new_order_allocation(idr_bal, MAX_POSITIONS)
+
+        # Runtime verification log
+        print(f"Wallet balance fetched: Rp {idr_bal:,.2f}", flush=True)
+        print(f"MAX_OPEN_POSITIONS: {MAX_POSITIONS}", flush=True)
+        print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
+        print(f"Open positions: {n_open} / {MAX_POSITIONS}", flush=True)
+        print(f"Available slots: {slots_available}", flush=True)
+
+        if idr_bal <= 0:
+            print(f"  Wallet IDR balance is Rp {idr_bal:,.2f} — no available funds. Skipping.", flush=True)
+            return
+
+        if alloc_per_order <= 0:
+            print("  Calculated allocation per new order is 0. Skipping.", flush=True)
+            return
+
         # Scan — get ALL candidates (up to slots_available), sorted by score
         candidates = scanner.gather_candidates(max_positions=slots_available)
         if not candidates:
             print("  No T1 candidates found this cycle.", flush=True)
             return
 
-        # Fetch live IDR balance — this is the actual budget we can spend
-        try:
-            bals = client.get_balances()
-            idr_bal = next((b.free for b in bals if b.asset == "IDR"), 0.0)
-        except Exception:
-            idr_bal = BUDGET_IDR  # fallback to configured budget
-
-        print(f"  Available IDR balance: Rp {idr_bal:,.0f}", flush=True)
-
-        if idr_bal < 20_000:
-            print(f"  Insufficient IDR balance (Rp {idr_bal:,.0f} < min Rp 20,000). Skipping.", flush=True)
-            return
-
         print(f"  Candidates found: {len(candidates)}", flush=True)
 
-        # Even slot sizing — divide remaining IDR across unfilled slots.
-        # Each candidate gets (remaining_idr / slots_remaining) so budget is
-        # spread across multiple coins instead of dumping everything into one.
-        # If per-slot budget < min notional (Rp 20,000), reduce effective
-        # slots until each slot meets the minimum.
         filled = 0
         remaining_idr = idr_bal
 
         for cand in candidates:
             if filled >= slots_available:
                 break
-            if remaining_idr < 20_000:
-                print(f"  Remaining IDR Rp {remaining_idr:,.0f} below min — stopping.", flush=True)
+
+            slot_budget = min(alloc_per_order, remaining_idr)
+            if slot_budget <= 0:
+                print("  Remaining wallet IDR depleted — stopping.", flush=True)
                 break
 
-            # Divide remaining IDR evenly across unfilled slots
-            slots_remaining = slots_available - filled
-            max_fillable = max(1, int(remaining_idr / 20_000))
-            effective_slots = min(slots_remaining, max_fillable)
-            per_slot_idr = remaining_idr / effective_slots
+            print(f"  Slot budget: Rp {slot_budget:,.2f}  "
+                  f"({slots_available - filled} slot(s) left)", flush=True)
 
-            print(f"  Slot budget: Rp {per_slot_idr:,.0f}  "
-                  f"({slots_remaining} slots left, {effective_slots} fillable)", flush=True)
-
-            best = scanner.pick_best_candidate([cand], available_idr=per_slot_idr)
+            best = scanner.pick_best_candidate([cand], available_idr=slot_budget)
             if best is None:
                 continue
 
@@ -225,6 +250,10 @@ def cmd_propose() -> None:
             best["sl_buffer_pct"]  = sl_buf * 100
 
             notional = best.get("sizing", {}).get("notional_idr", entry * best.get("sizing", {}).get("qty", 0))
+            if notional > remaining_idr:
+                print(f"  ⚠ Notional Rp {notional:,.2f} exceeds remaining IDR Rp {remaining_idr:,.2f} — skipping.", flush=True)
+                continue
+
             print(
                 f"\n  [{best['symbol']}]  Entry: Rp {entry:,.2f}  "
                 f"SL: Rp {sl_stop:,.2f} (buf {sl_buf*100:.2f}%)  "
@@ -253,6 +282,41 @@ def cmd_propose() -> None:
         sys.exit(1)
 
 
+def cmd_diagnostic() -> None:
+    """
+    Read-only diagnostic: displays wallet balance, MAX_OPEN_POSITIONS, dynamic allocation,
+    open positions, and available slots without scanning or placing any orders.
+    """
+    print(f"\n{'='*50}", flush=True)
+    print("  TOKOCRYPTO — ALLOCATION DIAGNOSTIC", flush=True)
+    print(f"{'='*50}", flush=True)
+    try:
+        from services.supabase_client import fetch_all_tokocrypto
+        open_trades = [t for t in (fetch_all_tokocrypto() or []) if t.get("exit_status") == "OPEN"]
+        n_open = len(open_trades)
+    except Exception as e:
+        print(f"  ⚠ Failed to query open positions from DB: {e}", flush=True)
+        n_open = 0
+
+    slots_available = calculate_available_slots(n_open, MAX_POSITIONS)
+
+    try:
+        client = _build_client()
+        balance_obj = client.get_balance("IDR")
+        idr_bal = float(getattr(balance_obj, "free", 0.0))
+    except Exception as e:
+        print(f"⚠️ [TOKO] Failed to fetch live IDR wallet balance from API: {e}", flush=True)
+        idr_bal = 0.0
+
+    alloc_per_order = calculate_new_order_allocation(idr_bal, MAX_POSITIONS)
+
+    print(f"Wallet balance fetched: Rp {idr_bal:,.2f}", flush=True)
+    print(f"MAX_OPEN_POSITIONS: {MAX_POSITIONS}", flush=True)
+    print(f"Dynamic allocation per new order: Rp {alloc_per_order:,.2f}", flush=True)
+    print(f"Open positions: {n_open} / {MAX_POSITIONS}", flush=True)
+    print(f"Available slots: {slots_available}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -264,12 +328,16 @@ def main() -> None:
                        help="Check and update all open Tokocrypto positions")
     group.add_argument("--propose", action="store_true",
                        help="Scan IDR pairs and propose/execute new entry orders")
+    group.add_argument("--diagnostic", action="store_true",
+                       help="Read-only diagnostic of wallet balance, slots, and allocation")
     args = parser.parse_args()
 
     if args.check_positions:
         cmd_check_positions()
     elif args.propose:
         cmd_propose()
+    elif args.diagnostic:
+        cmd_diagnostic()
 
 
 if __name__ == "__main__":
