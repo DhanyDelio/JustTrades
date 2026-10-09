@@ -17,19 +17,75 @@ NEVER import from binance.* — all exchange calls go through TokocryptoClient.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from core.clients.tokocrypto_client import (
     TokocryptoClient,
     TokocryptoError,
     TokocryptoMalformedResponseError,
+    TokocryptoSubmissionUnknownError,
 )
 from services.supabase_client import upsert_tokocrypto, update_tokocrypto_by_order_id
 from core.paper_trade_executor import _send_toko_telegram
+
+_LIFECYCLE_LOCKS: dict[str, threading.RLock] = {}
+_LIFECYCLE_LOCKS_GUARD = threading.Lock()
+_UNKNOWN_ENTRY_SUBMISSIONS: set[str] = set()
+_UNKNOWN_OCO_SUBMISSIONS: set[str] = set()
+_ACTIVE_ENTRY_SUBMISSIONS: set[str] = set()
+
+
+def lifecycle_lock(symbol: str) -> threading.RLock:
+    """Return a shared per-symbol lock; this coordinates threads in this process only."""
+    key = str(symbol).upper()
+    with _LIFECYCLE_LOCKS_GUARD:
+        return _LIFECYCLE_LOCKS.setdefault(key, threading.RLock())
+
+
+def entry_submission_unknown(symbol: str) -> bool:
+    with _LIFECYCLE_LOCKS_GUARD:
+        key = str(symbol).upper()
+        return key in _UNKNOWN_ENTRY_SUBMISSIONS or key in _ACTIVE_ENTRY_SUBMISSIONS
+
+
+def mark_entry_submission_unknown(symbol: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _UNKNOWN_ENTRY_SUBMISSIONS.add(str(symbol).upper())
+
+
+def mark_entry_submission_active(symbol: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _ACTIVE_ENTRY_SUBMISSIONS.add(str(symbol).upper())
+
+
+def release_entry_submission(symbol: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        key = str(symbol).upper()
+        _ACTIVE_ENTRY_SUBMISSIONS.discard(key)
+        _UNKNOWN_ENTRY_SUBMISSIONS.discard(key)
+
+
+def claim_oco_submission(entry_order_id: str) -> bool:
+    with _LIFECYCLE_LOCKS_GUARD:
+        if entry_order_id in _UNKNOWN_OCO_SUBMISSIONS:
+            return False
+        _UNKNOWN_OCO_SUBMISSIONS.add(entry_order_id)
+        return True
+
+
+def release_oco_submission(entry_order_id: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _UNKNOWN_OCO_SUBMISSIONS.discard(entry_order_id)
 
 
 # ---------------------------------------------------------------------------
@@ -37,19 +93,20 @@ from core.paper_trade_executor import _send_toko_telegram
 # ---------------------------------------------------------------------------
 _STATUS = {
     -2: "SYSTEM_PROCESSING",
-     0: "NEW",
-     1: "PARTIALLY_FILLED",
-     2: "FILLED",
-     3: "CANCELED",
-     4: "PENDING_CANCEL",
-     5: "REJECTED",
-     6: "EXPIRED",
+    0: "NEW",
+    1: "PARTIALLY_FILLED",
+    2: "FILLED",
+    3: "CANCELED",
+    4: "PENDING_CANCEL",
+    5: "REJECTED",
+    6: "EXPIRED",
 }
 
 
 # ---------------------------------------------------------------------------
 # Supervised gate — module-level so tests can patch it directly
 # ---------------------------------------------------------------------------
+
 
 def _confirm(prompt: str) -> bool:
     """
@@ -69,6 +126,7 @@ def _confirm(prompt: str) -> bool:
 # ---------------------------------------------------------------------------
 # Decimal precision helpers & Pre-flight OCO eligibility
 # ---------------------------------------------------------------------------
+
 
 def decimal_round_step(value: Decimal, step: Decimal) -> Decimal:
     """Floor value down to nearest multiple of step."""
@@ -128,11 +186,11 @@ def validate_protective_oco_eligibility(
     Returns:
         (is_eligible: bool, reason: str, details: dict)
     """
-    d_entry_qty   = Decimal(str(entry_qty))
+    d_entry_qty = Decimal(str(entry_qty))
     d_entry_price = Decimal(str(entry_price))
-    d_tp_price    = Decimal(str(tp_price))
-    d_sl_price    = Decimal(str(sl_price))
-    d_fee_rate    = Decimal(str(fee_rate))
+    d_tp_price = Decimal(str(tp_price))
+    d_sl_price = Decimal(str(sl_price))
+    d_fee_rate = Decimal(str(fee_rate))
 
     # Extract symbol filter constraints
     tick_size = getattr(sym_info, "tick_size", None)
@@ -164,9 +222,9 @@ def validate_protective_oco_eligibility(
         d_buf_pct = Decimal(str(sl_buffer_pct))
 
     d_tp_rounded = decimal_round_tick(d_tp_price, d_tick)
-    d_sl_stop    = decimal_round_tick(d_sl_price, d_tick)
+    d_sl_stop = decimal_round_tick(d_sl_price, d_tick)
     d_sl_limit_raw = d_sl_price * (Decimal("1") - d_buf_pct)
-    d_sl_limit   = decimal_round_tick(d_sl_limit_raw, d_tick)
+    d_sl_limit = decimal_round_tick(d_sl_limit_raw, d_tick)
 
     # Guard: SL limit must be strictly below SL stop
     if d_sl_limit >= d_sl_stop and d_tick > Decimal("0"):
@@ -189,19 +247,19 @@ def validate_protective_oco_eligibility(
     sl_limit_notional = usable_oco_qty * d_sl_limit
 
     details = {
-        "expected_fill_qty":      expected_fill_qty,
-        "expected_post_fee_qty":  expected_post_fee_qty,
-        "usable_oco_qty":         usable_oco_qty,
-        "tp_price_rounded":       d_tp_rounded,
-        "sl_stop_price":          d_sl_stop,
-        "sl_limit_price":         d_sl_limit,
-        "tp_notional":            tp_notional,
-        "sl_limit_notional":      sl_limit_notional,
-        "min_notional":           d_min_notional,
-        "min_qty":                d_min_qty,
-        "step_size":              d_step,
-        "tick_size":              d_tick,
-        "fee_rate":               d_fee_rate,
+        "expected_fill_qty": expected_fill_qty,
+        "expected_post_fee_qty": expected_post_fee_qty,
+        "usable_oco_qty": usable_oco_qty,
+        "tp_price_rounded": d_tp_rounded,
+        "sl_stop_price": d_sl_stop,
+        "sl_limit_price": d_sl_limit,
+        "tp_notional": tp_notional,
+        "sl_limit_notional": sl_limit_notional,
+        "min_notional": d_min_notional,
+        "min_qty": d_min_qty,
+        "step_size": d_step,
+        "tick_size": d_tick,
+        "fee_rate": d_fee_rate,
         "fee_deducted_from_base": fee_deducted_from_base,
     }
 
@@ -248,9 +306,83 @@ def validate_protective_oco_eligibility(
     return True, "OK", details
 
 
+def _parse_stop_price(val: Any) -> float | None:
+    """
+    Parse stopPrice defensively.
+    Returns:
+        float >= 0 if valid and finite.
+        None if missing, empty, malformed, non-finite (NaN/Inf), or negative.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        f = float(val)
+        return f if f >= 0.0 else None
+
+    if isinstance(val, str):
+        s = val.strip()
+        if not s or s.lower() in (
+            "null",
+            "none",
+            "n/a",
+            "nan",
+            "inf",
+            "+inf",
+            "-inf",
+            "infinity",
+            "-infinity",
+        ):
+            return None
+        try:
+            f = float(s)
+        except (ValueError, TypeError):
+            return None
+        if not math.isfinite(f) or f < 0.0:
+            return None
+        return f
+
+    return None
+
+
+def _classify_order_leg(order: dict) -> str | None:
+    """
+    Determine whether an exchange order record is a verified 'TP' or 'SL'.
+    Returns 'TP', 'SL', or None if ambiguous, malformed, or contradictory.
+    """
+    if not isinstance(order, dict):
+        return None
+
+    stop_p = _parse_stop_price(order.get("stopPrice"))
+    if stop_p is None:
+        return None
+
+    raw_type = order.get("type")
+    if raw_type is None:
+        return None
+    otype = str(raw_type).strip().upper()
+
+    is_tp_type = otype in ("1", "7", "LIMIT", "LIMIT_MAKER")
+    is_sl_type = otype in ("3", "4", "STOP_LOSS", "STOP_LOSS_LIMIT")
+
+    # Take-Profit: zero stopPrice AND explicit LIMIT type AND NOT a STOP_LOSS type
+    if stop_p == 0.0 and is_tp_type and not is_sl_type:
+        return "TP"
+
+    # Stop-Loss: positive finite stopPrice AND explicit STOP_LOSS type AND NOT a LIMIT type
+    if stop_p > 0.0 and is_sl_type and not is_tp_type:
+        return "SL"
+
+    # Contradictory (e.g. stopPrice > 0 with LIMIT, or stopPrice == 0 with STOP_LOSS),
+    # or unsupported/unknown type
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main executor class
 # ---------------------------------------------------------------------------
+
 
 class TokocryptoOrderExecutor:
     """
@@ -265,10 +397,12 @@ class TokocryptoOrderExecutor:
                   lines instead.  Safe to use in all test/staging contexts.
     """
 
-    MIN_NOTIONAL_IDR: float = 10_000.0   # Phase 2 hard floor
+    MIN_NOTIONAL_IDR: float = 20_000.0  # Tokocrypto IDR exchange filter floor
     MAX_SLOTS: int = int(os.environ.get("TOKO_MAX_POSITIONS", "5"))
 
-    DEFAULT_FEE_RATE: Decimal = Decimal(os.environ.get("TOKO_DEFAULT_FEE_RATE", "0.0015"))  # 0.15% standard taker fee
+    DEFAULT_FEE_RATE: Decimal = Decimal(
+        os.environ.get("TOKO_DEFAULT_FEE_RATE", "0.0015")
+    )  # 0.15% standard taker fee
 
     def __init__(
         self,
@@ -278,13 +412,15 @@ class TokocryptoOrderExecutor:
         dry_run: bool = False,
         max_slots: int | None = None,
     ) -> None:
-        self.client         = client
-        self.supervised     = supervised
-        self._trading_phase = trading_phase   # written to DB at upsert — never rely on column default
-        self.dry_run        = dry_run
+        self.client = client
+        self.supervised = supervised
+        self._trading_phase = (
+            trading_phase  # written to DB at upsert — never rely on column default
+        )
+        self.dry_run = dry_run
         self._cached_fee_rate: Decimal | None = None
         if max_slots is not None:
-            self.MAX_SLOTS  = max_slots
+            self.MAX_SLOTS = max_slots
 
     def get_fee_config(self, symbol: str) -> tuple[Decimal, bool]:
         """
@@ -318,16 +454,110 @@ class TokocryptoOrderExecutor:
 
     def has_active_position(self, symbol: str) -> bool:
         """
-        Check if an active lifecycle already exists for this symbol in Supabase.
-        Only one active lifecycle (exit_status == 'OPEN') is allowed per symbol.
+        Check if an active lifecycle or working order already exists for this symbol.
+        Combines live exchange open orders and database state to enforce one-symbol-one-position.
+
+        Fail-closed: Returns True (blocking entry) if exchange state is ambiguous or unqueryable.
         """
+        norm_sym = (
+            self.client.normalize_symbol(symbol)
+            if hasattr(self.client, "normalize_symbol")
+            else symbol
+        )
+        if entry_submission_unknown(norm_sym):
+            print(
+                f"  [GUARD] Previous entry submission for {symbol} is unresolved — failing closed."
+            )
+            return True
+
+        # 1. Query live open orders from exchange (source of truth for working orders)
         try:
-            from services.supabase_client import fetch_all_tokocrypto
-            trades = fetch_all_tokocrypto() or []
-            return any(t.get("symbol") == symbol and t.get("exit_status") == "OPEN" for t in trades)
-        except Exception as e:
-            print(f"  [WARN] Failed to query active Tokocrypto positions for {symbol}: {e}")
+            open_orders = self.client.get_open_orders(norm_sym)
+            if open_orders:
+                # Any active order (BUY entry or SELL OCO/TP/SL leg) means symbol is active
+                active_working = [
+                    o
+                    for o in open_orders
+                    if str(o.get("status")) in ("0", "1", "NEW", "PARTIALLY_FILLED")
+                ]
+                if active_working:
+                    print(
+                        f"  [GUARD] Live open orders exist on exchange for {symbol} ({len(active_working)} order(s))."
+                    )
+                    return True
+        except Exception as exc:
+            # Fail closed: cannot verify exchange state -> do NOT risk duplicate entry!
+            print(
+                f"  [WARN] Failed to query exchange open orders for {symbol}: {exc} — failing closed."
+            )
+            return True
+
+        # 2. Query Supabase database state
+        try:
+            from services.supabase_client import fetch_all_tokocrypto_strict
+
+            trades = fetch_all_tokocrypto_strict() or []
+        except Exception as exc:
+            # Fail closed: cannot verify database state -> do NOT risk duplicate entry!
+            print(
+                f"  [WARN] Failed to query Supabase trades for {symbol}: {exc} — failing closed."
+            )
+            return True
+
+        # Find any matching open lifecycles in database
+        open_trades = [
+            t
+            for t in trades
+            if t.get("symbol") == symbol and t.get("exit_status") == "OPEN"
+        ]
+        if not open_trades:
             return False
+
+        # 3. Evaluate matching open DB lifecycles against exchange reality
+        for t in open_trades:
+            entry_st = str(t.get("entry_status", "")).upper()
+            if entry_st == "FILLED":
+                # Real position holding asset in wallet
+                return True
+
+            if entry_st in ("NEW", "PARTIALLY_FILLED", ""):
+                # DB indicates pending entry, but exchange reported 0 open orders in step 1!
+                # Verify specific entry order status from exchange to avoid blocking on stale canceled DB records.
+                entry_oid = str(t.get("entry_order_id") or "").strip()
+                if not entry_oid:
+                    # Malformed record with no order ID: fail closed
+                    return True
+                try:
+                    detail = self.client.get_order_detail(symbol, entry_oid)
+                    d_status = int(detail.get("status", -99))
+                    exec_qty = float(detail.get("executedQty") or 0)
+
+                    if d_status == 2 or exec_qty > 0:
+                        # Actually filled or partially filled on exchange -> active!
+                        return True
+                    if d_status in (3, 5, 6) and exec_qty == 0:
+                        # Confirmed CANCELED/REJECTED/EXPIRED with 0 fill on exchange!
+                        # Do NOT treat this stale DB record as proof that an exchange order is active.
+                        continue
+                    # Any other active or unknown status -> treat as active
+                    return True
+                except Exception as exc:
+                    err_s = str(exc).lower()
+                    if "-2013" in err_s or "order does not exist" in err_s:
+                        # Order does not exist on exchange
+                        continue
+                    # Network / transient error: fail closed
+                    print(
+                        f"  [WARN] Could not verify pending entry {entry_oid} on exchange ({exc}) — failing closed."
+                    )
+                    return True
+
+            if entry_st not in ("CANCELED", "REJECTED", "EXPIRED"):
+                # Unknown, submission-pending, and reconciliation states occupy
+                # the symbol until exchange state is explicitly resolved.
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # validate_and_size
@@ -356,7 +586,7 @@ class TokocryptoOrderExecutor:
             return False
 
         slot_size_idr = available_idr / self.MAX_SLOTS
-        entry_price   = float(cand["entry_price"])
+        entry_price = float(cand["entry_price"])
 
         if entry_price <= 0:
             print("  ✗ validate_and_size: entry_price must be > 0")
@@ -365,17 +595,23 @@ class TokocryptoOrderExecutor:
         qty = self.client.round_step(slot_size_idr / entry_price, sym.step_size)
 
         if qty <= 0:
-            print(f"  ✗ validate_and_size: qty rounded to 0 (slot={slot_size_idr:.0f} IDR, price={entry_price})")
+            print(
+                f"  ✗ validate_and_size: qty rounded to 0 (slot={slot_size_idr:.0f} IDR, price={entry_price})"
+            )
             return False
 
         if qty < sym.min_qty:
             print(f"  ✗ validate_and_size: qty={qty} < min_qty={sym.min_qty}")
             return False
 
-        min_notional = sym.min_notional if sym.min_notional > 0 else self.MIN_NOTIONAL_IDR
-        notional     = qty * entry_price
+        min_notional = (
+            sym.min_notional if sym.min_notional > 0 else self.MIN_NOTIONAL_IDR
+        )
+        notional = qty * entry_price
         if notional < min_notional:
-            print(f"  ✗ validate_and_size: notional={notional:.0f} < min_notional={min_notional:.0f}")
+            print(
+                f"  ✗ validate_and_size: notional={notional:.0f} < min_notional={min_notional:.0f}"
+            )
             return False
 
         # --- PRE-FLIGHT OCO ELIGIBILITY CHECK ---
@@ -416,9 +652,9 @@ class TokocryptoOrderExecutor:
 
         # Success — mutate cand
         cand.setdefault("sizing", {})
-        cand["sizing"]["qty"]           = qty
+        cand["sizing"]["qty"] = qty
         cand["sizing"]["slot_size_idr"] = slot_size_idr
-        cand["constraints"]             = sym.constraints
+        cand["constraints"] = sym.constraints
         return True
 
     # ------------------------------------------------------------------
@@ -431,17 +667,17 @@ class TokocryptoOrderExecutor:
 
         Returns numeric types (not strings) — _signed_post handles urlencode.
         """
-        tick  = cand["constraints"]["tick_size"]
-        step  = cand["constraints"]["step_size"]
+        tick = cand["constraints"]["tick_size"]
+        step = cand["constraints"]["step_size"]
 
         return {
-            "symbol":      cand["symbol"],
-            "side":        0,            # 0 = BUY
-            "type":        1,            # 1 = LIMIT
-            "timeInForce": 1,            # 1 = GTC
-            "quantity":    self.client.round_step(cand["sizing"]["qty"], step),
-            "price":       self.client.round_tick(cand["entry_price"], tick),
-            "timestamp":   int(time.time() * 1000),
+            "symbol": cand["symbol"],
+            "side": 0,  # 0 = BUY
+            "type": 1,  # 1 = LIMIT
+            "timeInForce": 1,  # 1 = GTC
+            "quantity": self.client.round_step(cand["sizing"]["qty"], step),
+            "price": self.client.round_tick(cand["entry_price"], tick),
+            "timestamp": int(time.time() * 1000),
         }
 
     # ------------------------------------------------------------------
@@ -449,6 +685,10 @@ class TokocryptoOrderExecutor:
     # ------------------------------------------------------------------
 
     def execute_entry(self, cand: dict, slot_size_idr: float) -> dict | None:
+        with lifecycle_lock(cand["symbol"]):
+            return self._execute_entry_locked(cand, slot_size_idr)
+
+    def _execute_entry_locked(self, cand: dict, slot_size_idr: float) -> dict | None:
         """
         Full entry flow: validate → confirm → post → persist → notify.
 
@@ -459,7 +699,9 @@ class TokocryptoOrderExecutor:
         # 0. Active position guard (one active lifecycle per symbol)
         sym = cand["symbol"]
         if self.has_active_position(sym):
-            print(f"  ✗ execute_entry: active position already exists for {sym} (duplicate entry rejected)")
+            print(
+                f"  ✗ execute_entry: active position already exists for {sym} (duplicate entry rejected)"
+            )
             return None
 
         # 1. Validate and size
@@ -469,9 +711,9 @@ class TokocryptoOrderExecutor:
 
         # 2. Build payload
         payload = self.build_entry_payload(cand)
-        sym      = cand["symbol"]
-        qty      = payload["quantity"]
-        price    = payload["price"]
+        sym = cand["symbol"]
+        qty = payload["quantity"]
+        price = payload["price"]
 
         # 3. Supervised gate
         if self.supervised:
@@ -488,37 +730,84 @@ class TokocryptoOrderExecutor:
                 "_dry_run": True,
             }
 
+        # Persist an intent before the non-idempotent POST. A restart must not
+        # treat an uncertain submission as permission to place another entry.
+        reservation_id = f"SUBMITTING_{uuid.uuid4().hex}"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        upsert_tokocrypto(
+            {
+                "symbol": sym,
+                "entry_order_id": reservation_id,
+                "entry_price": float(cand["entry_price"]),
+                "tp_price": float(cand.get("tp_price") or cand.get("tp1") or 0),
+                "sl_price": float(cand.get("sl_price") or cand.get("sl") or 0),
+                "entry_qty": float(qty),
+                "entry_status": "ENTRY_SUBMISSION_PENDING",
+                "exit_status": "OPEN",
+                "oco_state": "ENTRY_SUBMISSION_PENDING",
+                "entry_notional_idr": float(qty) * float(cand["entry_price"]),
+                "supervised": self.supervised,
+                "trading_phase": self._trading_phase,
+                "planned_rr": cand.get("rr"),
+                "risk_pct": cand.get("risk_pct"),
+                "slot_size_idr": slot_size_idr,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+        )
+
         # 5. Exchange call
         try:
             resp = self.client._signed_post("/open/v1/orders", payload)
-        except TokocryptoError as e:
-            raise RuntimeError(f"execute_entry: exchange call failed: {e}") from e
+        except Exception as exc:
+            mark_entry_submission_unknown(sym)
+            try:
+                update_tokocrypto_by_order_id(
+                    reservation_id,
+                    {
+                        "entry_status": "RECONCILIATION_REQUIRED",
+                        "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist unknown entry submission for %s", sym
+                )
+            raise TokocryptoSubmissionUnknownError(
+                f"execute_entry: POST outcome unknown for {sym}; automatic retry blocked"
+            ) from exc
 
         # 6. Persist to Supabase
-        order_data  = resp.get("data") or resp
-        entry_oid   = str(order_data.get("orderId", ""))
-        now_iso     = datetime.now(timezone.utc).isoformat()
+        order_data = resp.get("data") or resp
+        entry_oid = str(order_data.get("orderId", ""))
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-        upsert_tokocrypto({
-            "symbol":             sym,
-            "entry_order_id":     entry_oid,
-            "entry_price":        float(cand["entry_price"]),
-            "tp_price":           float(cand.get("tp_price") or cand.get("tp1") or 0),
-            "sl_price":           float(cand.get("sl_price") or cand.get("sl") or 0),
-            "entry_qty":          float(qty),
-            "entry_status":       "NEW",
-            "exit_status":        "OPEN",
-            "entry_notional_idr": float(qty) * float(cand["entry_price"]),
-            # Provenance — always write actual runtime values, never rely on column defaults
-            "supervised":         self.supervised,
-            "trading_phase":      self._trading_phase,
-            # Strategy metadata
-            "planned_rr":         cand.get("rr"),
-            "risk_pct":           cand.get("risk_pct"),
-            "slot_size_idr":      slot_size_idr,
-            "created_at":         now_iso,
-            "updated_at":         now_iso,
-        })
+        if not entry_oid.strip():
+            mark_entry_submission_unknown(sym)
+            update_tokocrypto_by_order_id(
+                reservation_id,
+                {
+                    "entry_status": "RECONCILIATION_REQUIRED",
+                    "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
+                    "updated_at": now_iso,
+                },
+            )
+            raise TokocryptoSubmissionUnknownError(
+                f"execute_entry: exchange response omitted orderId for {sym}; automatic retry blocked"
+            )
+
+        mark_entry_submission_active(sym)
+
+        update_tokocrypto_by_order_id(
+            reservation_id,
+            {
+                "entry_order_id": entry_oid,
+                "entry_status": "NEW",
+                "oco_state": "",
+                "updated_at": now_iso,
+            },
+        )
 
         # 7. Telegram
         _send_toko_telegram(
@@ -533,6 +822,10 @@ class TokocryptoOrderExecutor:
     # ------------------------------------------------------------------
 
     def place_oco(self, trade: dict) -> dict | None:
+        with lifecycle_lock(trade["symbol"]):
+            return self._place_oco_locked(trade)
+
+    def _place_oco_locked(self, trade: dict) -> dict | None:
         """
         Place an OCO (One-Cancels-Other) SELL order for an open position.
 
@@ -541,10 +834,10 @@ class TokocryptoOrderExecutor:
 
         Returns the exchange response dict on success, None on abort/constraint fail.
         """
-        sym   = trade["symbol"]
-        tp    = float(trade["tp_price"])
-        sl    = float(trade["sl_price"])
-        qty   = float(trade.get("entry_qty", 0))
+        sym = trade["symbol"]
+        tp = float(trade["tp_price"])
+        sl = float(trade["sl_price"])
+        qty = float(trade.get("entry_qty", 0))
 
         # Fetch constraints if not already in trade
         try:
@@ -563,8 +856,10 @@ class TokocryptoOrderExecutor:
             bal = self.client.get_balance(base_asset)
             available = bal.free if bal else 0.0
             if available > 0 and available < qty:
-                print(f"  ℹ place_oco: adjusting qty from {qty} to {available} "
-                      f"(fee-adjusted balance)")
+                print(
+                    f"  ℹ place_oco: adjusting qty from {qty} to {available} "
+                    f"(fee-adjusted balance)"
+                )
                 qty = available
         except TokocryptoError:
             pass  # fall through with original qty
@@ -579,13 +874,15 @@ class TokocryptoOrderExecutor:
         buf_pct = 0.0015
         if hasattr(self, "_sl_buffer_pct_fn") and callable(self._sl_buffer_pct_fn):
             try:
-                buf_pct = float(self._sl_buffer_pct_fn(float(trade.get("entry_price") or sl)))
+                buf_pct = float(
+                    self._sl_buffer_pct_fn(float(trade.get("entry_price") or sl))
+                )
             except Exception:
                 buf_pct = 0.0015
 
-        tp_rounded   = self.client.round_tick(tp, tick)
-        sl_stop      = self.client.round_tick(sl, tick)
-        sl_limit     = self.client.round_tick(sl * (1.0 - buf_pct), tick)
+        tp_rounded = self.client.round_tick(tp, tick)
+        sl_stop = self.client.round_tick(sl, tick)
+        sl_limit = self.client.round_tick(sl * (1.0 - buf_pct), tick)
 
         # Guard: sl_limit must be strictly below sl_stop
         if sl_limit >= sl_stop:
@@ -601,7 +898,11 @@ class TokocryptoOrderExecutor:
         qty_rounded = self.client.round_step(qty, step)
 
         # Runtime safety invariants: check usable qty, min_qty, and notionals
-        min_notional = sym_info.min_notional if (sym_info and sym_info.min_notional > 0) else self.MIN_NOTIONAL_IDR
+        min_notional = (
+            sym_info.min_notional
+            if (sym_info and sym_info.min_notional > 0)
+            else self.MIN_NOTIONAL_IDR
+        )
         tp_notional = qty_rounded * tp_rounded
         sl_notional = qty_rounded * sl_limit
 
@@ -614,11 +915,15 @@ class TokocryptoOrderExecutor:
             return None
 
         if min_notional > 0 and tp_notional < min_notional:
-            print(f"  ✗ place_oco: TP notional Rp {tp_notional:,.2f} < min_notional Rp {min_notional:,.2f}")
+            print(
+                f"  ✗ place_oco: TP notional Rp {tp_notional:,.2f} < min_notional Rp {min_notional:,.2f}"
+            )
             return None
 
         if min_notional > 0 and sl_notional < min_notional:
-            print(f"  ✗ place_oco: SL limit notional Rp {sl_notional:,.2f} < min_notional Rp {min_notional:,.2f}")
+            print(
+                f"  ✗ place_oco: SL limit notional Rp {sl_notional:,.2f} < min_notional Rp {min_notional:,.2f}"
+            )
             return None
 
         # Supervised gate
@@ -632,29 +937,49 @@ class TokocryptoOrderExecutor:
 
         # Dry-run bypass
         if self.dry_run:
-            print(f"[DRY RUN] place_oco: SELL {sym} qty={qty_rounded} tp={tp_rounded} sl={sl_stop}")
-            return {"bOrderListId": "DRY_OCO", "orders": []}
+            print(
+                f"[DRY RUN] place_oco: SELL {sym} qty={qty_rounded} tp={tp_rounded} sl={sl_stop}"
+            )
+            return {
+                "bOrderListId": "DRY_OCO",
+                "orders": [
+                    {
+                        "orderId": "DRY_TP",
+                        "type": 1,
+                        "price": tp_rounded,
+                        "stopPrice": 0,
+                    },
+                    {
+                        "orderId": "DRY_SL",
+                        "type": 4,
+                        "price": sl_limit,
+                        "stopPrice": sl_stop,
+                    },
+                ],
+            }
 
         # Exchange call (old Tokocrypto OCO format)
         payload = {
-            "symbol":               sym,
-            "side":                 1,           # 1 = SELL
-            "quantity":             qty_rounded,
-            "price":                tp_rounded,
-            "stopPrice":            sl_stop,
-            "stopLimitPrice":       sl_limit,
+            "symbol": sym,
+            "side": 1,  # 1 = SELL
+            "quantity": qty_rounded,
+            "price": tp_rounded,
+            "stopPrice": sl_stop,
+            "stopLimitPrice": sl_limit,
             "stopLimitTimeInForce": "GTC",
-            "timestamp":            int(time.time() * 1000),
+            "timestamp": int(time.time() * 1000),
         }
 
         try:
             resp = self.client._signed_post("/open/v1/orders/oco", payload)
-        except TokocryptoError as e:
-            raise RuntimeError(f"place_oco: exchange call failed: {e}") from e
+        except Exception as exc:
+            raise TokocryptoSubmissionUnknownError(
+                f"place_oco: POST outcome unknown for {sym}; automatic retry blocked"
+            ) from exc
 
         # Parse order IDs from response
         resp_data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
-        orders    = resp_data.get("orders") or resp.get("orders") or []
+        orders = resp_data.get("orders") or resp.get("orders") or []
 
         # Support bOrderListId/orderListId at root, resp_data, or inside child orders
         raw_list_id = (
@@ -672,35 +997,170 @@ class TokocryptoOrderExecutor:
                         break
         b_order_list_id = str(raw_list_id or "")
 
-        tp_order_id = ""
-        sl_order_id = ""
-        if len(orders) >= 2:
-            # Convention: first order = limit (TP), second = stop-limit (SL)
-            tp_order_id = str(orders[0].get("orderId", ""))
-            sl_order_id = str(orders[1].get("orderId", ""))
+        # Deterministically identify TP and SL child legs without relying on array sequence
+        entry_fill_p = float(
+            trade.get("entry_fill_price") or trade.get("entry_price") or 0
+        )
+        tp_target = float(trade.get("tp_price") or tp_rounded)
+        sl_target = float(trade.get("sl_price") or sl_stop)
+
+        tp_order_id, sl_order_id, leg_reason = self._identify_oco_legs(
+            orders, sym, entry_fill_p, tp_target, sl_target
+        )
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        update_tokocrypto_by_order_id(
-            str(trade.get("entry_order_id", "")),
-            {
-                "b_order_list_id": b_order_list_id,
-                "tp_order_id":     tp_order_id,
-                "sl_order_id":     sl_order_id,
-                "oco_state":       "EXECUTING",
-                "updated_at":      now_iso,
-            },
-        )
+        entry_oid_str = str(trade.get("entry_order_id", ""))
 
-        _send_toko_telegram(
-            f"🛡 OCO placed: {sym}\n"
-            f"Fill price:  Rp {float(trade.get('entry_fill_price', 0)):,.2f}\n"
-            f"TP:          Rp {tp_rounded:,.2f}  (orderId={tp_order_id})\n"
-            f"SL trigger:  Rp {sl_stop:,.2f}  limit={sl_limit:,.2f}  (orderId={sl_order_id})\n"
-            f"OCO listId:  {b_order_list_id}\n"
-            f"Qty:         {trade.get('entry_qty', '?')} {sym.replace('_IDR', '')}"
-        )
+        if tp_order_id and sl_order_id:
+            update_tokocrypto_by_order_id(
+                entry_oid_str,
+                {
+                    "b_order_list_id": b_order_list_id,
+                    "tp_order_id": tp_order_id,
+                    "sl_order_id": sl_order_id,
+                    "oco_state": "EXECUTING",
+                    "updated_at": now_iso,
+                },
+            )
+            _send_toko_telegram(
+                f"🛡 OCO placed: {sym}\n"
+                f"Fill price:  Rp {float(trade.get('entry_fill_price', 0)):,.2f}\n"
+                f"TP:          Rp {tp_rounded:,.2f}  (orderId={tp_order_id})\n"
+                f"SL trigger:  Rp {sl_stop:,.2f}  limit={sl_limit:,.2f}  (orderId={sl_order_id})\n"
+                f"OCO listId:  {b_order_list_id}\n"
+                f"Qty:         {trade.get('entry_qty', '?')} {sym.replace('_IDR', '')}"
+            )
+        else:
+            # Ambiguous or failed identification: DO NOT GUESS!
+            # Persist b_order_list_id and mark RECONCILIATION_REQUIRED
+            raw_meta = (
+                dict(trade.get("raw_entry_order") or {})
+                if isinstance(trade.get("raw_entry_order"), dict)
+                else {}
+            )
+            raw_meta["requires_manual_review"] = True
+            raw_meta["unidentified_oco_orders"] = orders
+            raw_meta["leg_identification_error"] = leg_reason
+
+            update_tokocrypto_by_order_id(
+                entry_oid_str,
+                {
+                    "b_order_list_id": b_order_list_id,
+                    "tp_order_id": "",
+                    "sl_order_id": "",
+                    "oco_state": "RECONCILIATION_REQUIRED",
+                    "raw_entry_order": raw_meta,
+                    "updated_at": now_iso,
+                },
+            )
+            _send_toko_telegram(
+                f"🚨 OCO LEG IDENTIFICATION FAILED: {sym}\n"
+                f"OCO was placed on exchange (listId={b_order_list_id}), but TP/SL legs "
+                f"could not be deterministically identified ({leg_reason}).\n"
+                f"Position marked RECONCILIATION_REQUIRED — manual review required!"
+            )
 
         return resp
+
+    def _identify_oco_legs(
+        self,
+        orders: list[dict],
+        symbol: str,
+        entry_price: float = 0.0,
+        req_tp: float = 0.0,
+        req_sl: float = 0.0,
+    ) -> tuple[str | None, str | None, str]:
+        """
+        Disambiguate TP (LIMIT) and SL (STOP_LOSS_LIMIT) leg orders without relying
+        on array order [orders[0], orders[1]].
+
+        Returns:
+            (tp_order_id, sl_order_id, reason_str)
+            If ambiguous or failed, returns (None, None, error_reason).
+        """
+        if not orders or len(orders) < 2:
+            return None, None, "INSUFFICIENT_ORDERS_RETURNED"
+
+        order_ids = [
+            str(o.get("orderId", "")).strip() for o in orders if o.get("orderId")
+        ]
+        if len(order_ids) < 2 or order_ids[0] == order_ids[1]:
+            return None, None, "MISSING_OR_DUPLICATE_ORDER_IDS_IN_CHILDREN"
+
+        # Step 1: Check if child orders in response already have verified attributes
+        c0 = _classify_order_leg(orders[0])
+        c1 = _classify_order_leg(orders[1])
+
+        if c0 == "TP" and c1 == "SL":
+            return order_ids[0], order_ids[1], "IDENTIFIED_FROM_RESPONSE_ATTRIBUTES"
+        if c0 == "SL" and c1 == "TP":
+            return (
+                order_ids[1],
+                order_ids[0],
+                "IDENTIFIED_FROM_RESPONSE_ATTRIBUTES_REVERSED",
+            )
+
+        # Step 2: Query exchange order details if attributes are absent, bare, or ambiguous
+        try:
+            d0 = self.client.get_order_detail(symbol, order_ids[0])
+            d1 = self.client.get_order_detail(symbol, order_ids[1])
+        except Exception as exc:
+            return None, None, f"QUERY_ORDER_DETAIL_FAILED: {exc}"
+
+        if not isinstance(d0, dict) or not isinstance(d1, dict):
+            return None, None, "MALFORMED_ORDER_DETAIL_RESPONSE"
+
+        # Classify from verified exchange details
+        cd0 = _classify_order_leg(d0)
+        cd1 = _classify_order_leg(d1)
+
+        if cd0 == "TP" and cd1 == "SL":
+            return order_ids[0], order_ids[1], "IDENTIFIED_FROM_EXCHANGE_DETAILS"
+        if cd0 == "SL" and cd1 == "TP":
+            return (
+                order_ids[1],
+                order_ids[0],
+                "IDENTIFIED_FROM_EXCHANGE_DETAILS_REVERSED",
+            )
+
+        return None, None, "AMBIGUOUS_OR_UNVERIFIED_LEG_ATTRIBUTES"
+
+    def inspect_open_oco_legs(
+        self, symbol: str, expected_list_id: str = ""
+    ) -> tuple[tuple[str, str] | None, bool]:
+        """Return (verified pair, safe_to_start_new) from a successful open-order snapshot."""
+        open_orders = self.client.get_open_orders(symbol)
+        if not open_orders:
+            return None, True
+
+        groups: dict[str, dict[str, str]] = {}
+        ambiguous_protection = False
+        for order in open_orders or []:
+            if not isinstance(order, dict):
+                ambiguous_protection = True
+                continue
+            list_id = str(
+                order.get("bOrderListId") or order.get("orderListId") or ""
+            ).strip()
+            role = _classify_order_leg(order)
+            if role in ("TP", "SL") or (
+                expected_list_id and list_id == expected_list_id
+            ):
+                ambiguous_protection = True
+            if not list_id or (expected_list_id and list_id != expected_list_id):
+                continue
+            order_id = str(order.get("orderId") or "").strip()
+            if not order_id or role not in ("TP", "SL"):
+                continue
+            role_ids = groups.setdefault(list_id, {})
+            if role in role_ids:
+                return None, False
+            role_ids[role] = order_id
+
+        complete = [roles for roles in groups.values() if set(roles) == {"TP", "SL"}]
+        if len(complete) == 1:
+            return (complete[0]["TP"], complete[0]["SL"]), False
+        return None, not ambiguous_protection and not open_orders
 
     # ------------------------------------------------------------------
     # query_oco_state
@@ -730,34 +1190,202 @@ class TokocryptoOrderExecutor:
             SL_EXPIRED_PENDING      — SL leg expired, awaiting confirmation
             RECONCILIATION_REQUIRED — query failed or unrecognized combination
         """
-        sym       = trade["symbol"]
-        tp_oid    = str(trade.get("tp_order_id", ""))
-        sl_oid    = str(trade.get("sl_order_id", ""))
+        sym = trade["symbol"]
+        tp_oid = str(trade.get("tp_order_id", ""))
+        sl_oid = str(trade.get("sl_order_id", ""))
 
-        _empty    = {"state": "RECONCILIATION_REQUIRED",
-                     "exit_price": None, "slippage_flagged": False,
-                     "raw_tp": {}, "raw_sl": {}}
+        _empty = {
+            "state": "RECONCILIATION_REQUIRED",
+            "exit_price": None,
+            "slippage_flagged": False,
+            "raw_tp": {},
+            "raw_sl": {},
+        }
 
-        # Query both legs — a single failure → RECONCILIATION_REQUIRED
+        # Guard: missing or invalid leg IDs cannot be verified -> RECONCILIATION_REQUIRED
+        if (
+            not tp_oid
+            or not sl_oid
+            or tp_oid in ("None", "0")
+            or sl_oid in ("None", "0")
+        ):
+            return {**_empty, "state": "RECONCILIATION_REQUIRED"}
+
+        # Query both legs — a single failure -> RECONCILIATION_REQUIRED
         try:
             raw_tp = self.client.get_order_detail(sym, tp_oid)
             raw_sl = self.client.get_order_detail(sym, sl_oid)
-        except TokocryptoError:
+        except Exception as exc:
+            logger.warning(
+                f"[{sym}] Failed to query OCO leg details (tp={tp_oid}, sl={sl_oid}): {exc}"
+            )
             return {**_empty, "state": "RECONCILIATION_REQUIRED"}
 
-        tp_status = int(raw_tp.get("status", -99))
-        sl_status = int(raw_sl.get("status", -99))
+        if not isinstance(raw_tp, dict) or not isinstance(raw_sl, dict):
+            return {**_empty, "state": "RECONCILIATION_REQUIRED"}
+
+        # Verify leg identity from actual exchange order attributes defensively.
+        # Do not infer TP/SL from status alone or pointer ordering: a valid pair
+        # must contain exactly one verified TP and one verified SL.
+        role_tp = _classify_order_leg(raw_tp)
+        role_sl = _classify_order_leg(raw_sl)
+
+        try:
+            tp_status = int(raw_tp.get("status", -99))
+            sl_status = int(raw_sl.get("status", -99))
+        except (ValueError, TypeError):
+            return {
+                **_empty,
+                "state": "RECONCILIATION_REQUIRED",
+                "raw_tp": raw_tp,
+                "raw_sl": raw_sl,
+            }
+
+        persisted_to_db: bool | None = None
+        db_persist_error: str | None = None
+
+        if role_tp == "SL" and role_sl == "TP":
+            # Swapped legacy pointers detected! Exactly one verified TP and one verified SL exist.
+            # Swap in-memory so exit evaluation is 100% accurate.
+            raw_tp, raw_sl = raw_sl, raw_tp
+            tp_oid, sl_oid = sl_oid, tp_oid
+            tp_status, sl_status = sl_status, tp_status
+            now_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                update_tokocrypto_by_order_id(
+                    str(trade.get("entry_order_id", "")),
+                    {
+                        "tp_order_id": tp_oid,
+                        "sl_order_id": sl_oid,
+                        "updated_at": now_iso,
+                    },
+                )
+                persisted_to_db = True
+                logger.info(
+                    f"[{sym}] Auto-healed swapped OCO leg pointers persisted: "
+                    f"tp_order_id={tp_oid}, sl_order_id={sl_oid}"
+                )
+            except Exception as exc:
+                persisted_to_db = False
+                db_persist_error = str(exc)
+                logger.warning(
+                    f"[{sym}] Failed to persist auto-healed OCO leg pointers "
+                    f"(tp={tp_oid}, sl={sl_oid}) to database: {exc}"
+                )
+        elif role_tp == "TP" and role_sl == "SL":
+            # Normal: correct verified pointers
+            pass
+        else:
+            # Narrow fallback: when the exchange payload omits TP/SL markers,
+            # we may still classify a valid OCO state from the status pattern.
+            # We do not allow contradictory or unsupported leg metadata to
+            # override the fail-closed rule.
+            def _has_untrusted_leg_identity(order: dict) -> bool:
+                if not isinstance(order, dict):
+                    return True
+                raw_type = order.get("type")
+                stop_p = _parse_stop_price(order.get("stopPrice"))
+                if raw_type is None:
+                    return False
+                otype = str(raw_type).strip().upper()
+                supported = otype in (
+                    "1",
+                    "7",
+                    "LIMIT",
+                    "LIMIT_MAKER",
+                    "3",
+                    "4",
+                    "STOP_LOSS",
+                    "STOP_LOSS_LIMIT",
+                )
+                if not supported:
+                    return True
+                if stop_p is None:
+                    return True
+                is_tp_type = otype in ("1", "7", "LIMIT", "LIMIT_MAKER")
+                is_sl_type = otype in ("3", "4", "STOP_LOSS", "STOP_LOSS_LIMIT")
+                if stop_p == 0.0 and is_sl_type:
+                    return True
+                if stop_p > 0.0 and is_tp_type:
+                    return True
+                return False
+
+            if _has_untrusted_leg_identity(raw_tp) or _has_untrusted_leg_identity(
+                raw_sl
+            ):
+                logger.warning(
+                    f"[{sym}] Ambiguous or unverified OCO legs (role_tp={role_tp}, role_sl={role_sl}, "
+                    f"tp_status={tp_status}, sl_status={sl_status}). Failing closed to RECONCILIATION_REQUIRED."
+                )
+                return {
+                    **_empty,
+                    "state": "RECONCILIATION_REQUIRED",
+                    "raw_tp": raw_tp,
+                    "raw_sl": raw_sl,
+                }
+
+            status_pattern_ok = (
+                (tp_status == sl_status and tp_status in (-2, 0, 1))
+                or (tp_status == 3 and sl_status == 3)
+                or (
+                    tp_status != sl_status
+                    and tp_status in (-2, 0, 1, 2, 3, 6)
+                    and sl_status in (-2, 0, 1, 2, 3, 6)
+                )
+            )
+
+            if not status_pattern_ok or (
+                role_tp in ("TP", "SL") and role_sl == role_tp
+            ):
+                logger.warning(
+                    f"[{sym}] Ambiguous or unverified OCO legs (role_tp={role_tp}, role_sl={role_sl}, "
+                    f"tp_status={tp_status}, sl_status={sl_status}). Failing closed to RECONCILIATION_REQUIRED."
+                )
+                return {
+                    **_empty,
+                    "state": "RECONCILIATION_REQUIRED",
+                    "raw_tp": raw_tp,
+                    "raw_sl": raw_sl,
+                }
 
         def _exit_price_from(raw: dict) -> float:
             """Always use executedPrice, never price (limit) or ticker."""
-            return float(raw.get("executedPrice", 0) or 0)
+            try:
+                return float(raw.get("executedPrice", 0) or 0)
+            except (ValueError, TypeError):
+                return 0.0
 
         def _slippage_flag(exit_price: float, ref_price: float, is_tp: bool) -> bool:
-            if ref_price <= 0:
+            try:
+                ref = float(ref_price or 0)
+                exit_p = float(exit_price or 0)
+            except (ValueError, TypeError):
                 return False
-            slip = abs(exit_price - ref_price) / ref_price
-            threshold = 0.001 if is_tp else 0.003   # 0.1% TP, 0.3% SL
+            if ref <= 0 or exit_p <= 0:
+                return False
+            slip = abs(exit_p - ref) / ref
+            threshold = 0.001 if is_tp else 0.003  # 0.1% TP, 0.3% SL
             return slip > threshold
+
+        def _make_res(
+            state: str,
+            exit_price: float | None = None,
+            slippage: bool = False,
+            rtp: dict | None = None,
+            rsl: dict | None = None,
+        ) -> dict:
+            res = {
+                "state": state,
+                "exit_price": exit_price,
+                "slippage_flagged": slippage,
+                "raw_tp": rtp if rtp is not None else raw_tp,
+                "raw_sl": rsl if rsl is not None else raw_sl,
+            }
+            if persisted_to_db is not None:
+                res["auto_heal_persisted"] = persisted_to_db
+                if db_persist_error:
+                    res["auto_heal_error"] = db_persist_error
+            return res
 
         # -----------------------------------------------------------------
         # State machine — evaluate in priority order
@@ -765,62 +1393,59 @@ class TokocryptoOrderExecutor:
 
         # System processing — transient, treat as EXECUTING
         if tp_status == -2 or sl_status == -2:
-            return {"state": "EXECUTING", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("EXECUTING")
 
         # Partial fill — wait
         if tp_status == 1 or sl_status == 1:
-            return {"state": "EXECUTING", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("EXECUTING")
 
         # Both NEW — waiting for market to move
         if tp_status == 0 and sl_status == 0:
-            return {"state": "EXECUTING", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("EXECUTING")
 
         # Clean exits
         if tp_status == 2 and sl_status == 3:
             exit_price = _exit_price_from(raw_tp)
-            return {
-                "state":            "TP_HIT",
-                "exit_price":       exit_price,
-                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("tp_price", 0)), is_tp=True),
-                "raw_tp":           raw_tp,
-                "raw_sl":           raw_sl,
-            }
+            return _make_res(
+                "TP_HIT",
+                exit_price=exit_price,
+                slippage=_slippage_flag(
+                    exit_price, float(trade.get("tp_price", 0)), is_tp=True
+                ),
+            )
 
         if tp_status == 3 and sl_status == 2:
             exit_price = _exit_price_from(raw_sl)
-            return {
-                "state":            "SL_HIT",
-                "exit_price":       exit_price,
-                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("sl_price", 0)), is_tp=False),
-                "raw_tp":           raw_tp,
-                "raw_sl":           raw_sl,
-            }
+            return _make_res(
+                "SL_HIT",
+                exit_price=exit_price,
+                slippage=_slippage_flag(
+                    exit_price, float(trade.get("sl_price", 0)), is_tp=False
+                ),
+            )
 
         # Tokocrypto can mark the OCO sibling as EXPIRED (6), rather than
-        # CANCELED (3), after the other leg fills.  Both combinations are a
+        # CANCELED (3), after the other leg fills. Both combinations are a
         # confirmed completed exit, not a pending expired order.
         if tp_status == 2 and sl_status == 6:
             exit_price = _exit_price_from(raw_tp)
-            return {
-                "state":            "TP_HIT",
-                "exit_price":       exit_price,
-                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("tp_price", 0)), is_tp=True),
-                "raw_tp":           raw_tp,
-                "raw_sl":           raw_sl,
-            }
+            return _make_res(
+                "TP_HIT",
+                exit_price=exit_price,
+                slippage=_slippage_flag(
+                    exit_price, float(trade.get("tp_price", 0)), is_tp=True
+                ),
+            )
 
         if tp_status == 6 and sl_status == 2:
             exit_price = _exit_price_from(raw_sl)
-            return {
-                "state":            "SL_HIT",
-                "exit_price":       exit_price,
-                "slippage_flagged": _slippage_flag(exit_price, float(trade.get("sl_price", 0)), is_tp=False),
-                "raw_tp":           raw_tp,
-                "raw_sl":           raw_sl,
-            }
+            return _make_res(
+                "SL_HIT",
+                exit_price=exit_price,
+                slippage=_slippage_flag(
+                    exit_price, float(trade.get("sl_price", 0)), is_tp=False
+                ),
+            )
 
         # One filled, counterpart stuck — wait 1s and re-query
         if (tp_status == 2 and sl_status == 0) or (tp_status == 0 and sl_status == 2):
@@ -828,58 +1453,56 @@ class TokocryptoOrderExecutor:
             try:
                 raw_tp2 = self.client.get_order_detail(sym, tp_oid)
                 raw_sl2 = self.client.get_order_detail(sym, sl_oid)
-            except TokocryptoError:
-                return {**_empty, "state": "RECONCILIATION_REQUIRED"}
+            except Exception:
+                return _make_res("RECONCILIATION_REQUIRED")
             tp2 = int(raw_tp2.get("status", -99))
             sl2 = int(raw_sl2.get("status", -99))
             if (tp2 == 2 and sl2 == 0) or (tp2 == 0 and sl2 == 2):
-                return {"state": "STUCK_COUNTERPART", "exit_price": None,
-                        "slippage_flagged": False, "raw_tp": raw_tp2, "raw_sl": raw_sl2}
+                return _make_res("STUCK_COUNTERPART", rtp=raw_tp2, rsl=raw_sl2)
             # Clean exits resolved during the 1-second window — evaluate before anomaly checks
             if tp2 == 2 and sl2 == 3:
                 exit_price = _exit_price_from(raw_tp2)
-                return {
-                    "state":            "TP_HIT",
-                    "exit_price":       exit_price,
-                    "slippage_flagged": _slippage_flag(exit_price, float(trade.get("tp_price", 0)), is_tp=True),
-                    "raw_tp":           raw_tp2,
-                    "raw_sl":           raw_sl2,
-                }
+                return _make_res(
+                    "TP_HIT",
+                    exit_price=exit_price,
+                    slippage=_slippage_flag(
+                        exit_price, float(trade.get("tp_price", 0)), is_tp=True
+                    ),
+                    rtp=raw_tp2,
+                    rsl=raw_sl2,
+                )
             if tp2 == 3 and sl2 == 2:
                 exit_price = _exit_price_from(raw_sl2)
-                return {
-                    "state":            "SL_HIT",
-                    "exit_price":       exit_price,
-                    "slippage_flagged": _slippage_flag(exit_price, float(trade.get("sl_price", 0)), is_tp=False),
-                    "raw_tp":           raw_tp2,
-                    "raw_sl":           raw_sl2,
-                }
+                return _make_res(
+                    "SL_HIT",
+                    exit_price=exit_price,
+                    slippage=_slippage_flag(
+                        exit_price, float(trade.get("sl_price", 0)), is_tp=False
+                    ),
+                    rtp=raw_tp2,
+                    rsl=raw_sl2,
+                )
             # Re-evaluate with refreshed status for remaining anomaly checks
-            raw_tp, raw_sl   = raw_tp2, raw_sl2
+            raw_tp, raw_sl = raw_tp2, raw_sl2
             tp_status, sl_status = tp2, sl2
 
         # Both filled — critical anomaly
         if tp_status == 2 and sl_status == 2:
-            return {"state": "CRITICAL_ANOMALY", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("CRITICAL_ANOMALY")
 
         # Both canceled
         if tp_status == 3 and sl_status == 3:
-            return {"state": "BOTH_CANCELED_ANOMALY", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("BOTH_CANCELED_ANOMALY")
 
         # Expired legs
         if tp_status == 6:
-            return {"state": "TP_EXPIRED_PENDING", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("TP_EXPIRED_PENDING")
 
         if sl_status == 6:
-            return {"state": "SL_EXPIRED_PENDING", "exit_price": None,
-                    "slippage_flagged": False, "raw_tp": raw_tp, "raw_sl": raw_sl}
+            return _make_res("SL_EXPIRED_PENDING")
 
         # Catch-all — unknown combination
-        return {**_empty, "state": "RECONCILIATION_REQUIRED",
-                "raw_tp": raw_tp, "raw_sl": raw_sl}
+        return _make_res("RECONCILIATION_REQUIRED")
 
     # ------------------------------------------------------------------
     # cancel_order
@@ -907,8 +1530,8 @@ class TokocryptoOrderExecutor:
             resp = self.client._signed_post(
                 "/open/v1/orders/cancel",
                 {
-                    "symbol":    self.client.normalize_symbol(symbol),
-                    "orderId":   str(order_id),
+                    "symbol": self.client.normalize_symbol(symbol),
+                    "orderId": str(order_id),
                     "timestamp": int(time.time() * 1000),
                 },
             )
@@ -917,7 +1540,7 @@ class TokocryptoOrderExecutor:
             return False
 
         # Confirm cancellation
-        data   = resp.get("data") or {}
+        data = resp.get("data") or {}
         status = data.get("status") if isinstance(data, dict) else resp.get("status")
         # Tokocrypto returns status as int (3) or string "CANCELED"
         if status in (3, "CANCELED", "3"):
@@ -951,7 +1574,9 @@ class TokocryptoOrderExecutor:
 
         qty_rounded = self.client.round_step(quantity, sym_info.step_size)
         if qty_rounded <= 0 or qty_rounded < sym_info.min_qty:
-            print(f"  ✗ execute_market_sell: qty {qty_rounded} < min_qty {sym_info.min_qty}")
+            print(
+                f"  ✗ execute_market_sell: qty {qty_rounded} < min_qty {sym_info.min_qty}"
+            )
             return None
 
         if self.supervised:
@@ -960,7 +1585,9 @@ class TokocryptoOrderExecutor:
                 return None
 
         if self.dry_run:
-            print(f"[DRY RUN] execute_market_sell: SELL {symbol} qty={qty_rounded} MARKET")
+            print(
+                f"[DRY RUN] execute_market_sell: SELL {symbol} qty={qty_rounded} MARKET"
+            )
             ticker_p = 0.0
             try:
                 ticker_p = float(self.client.get_ticker(symbol))
@@ -975,10 +1602,10 @@ class TokocryptoOrderExecutor:
             }
 
         payload = {
-            "symbol":    self.client.normalize_symbol(symbol),
-            "side":      1,            # 1 = SELL
-            "type":      2,            # 2 = MARKET
-            "quantity":  qty_rounded,
+            "symbol": self.client.normalize_symbol(symbol),
+            "side": 1,  # 1 = SELL
+            "type": 2,  # 2 = MARKET
+            "quantity": qty_rounded,
             "timestamp": int(time.time() * 1000),
         }
 
@@ -1019,7 +1646,7 @@ class TokocryptoOrderExecutor:
         6. Execute MARKET SELL for remaining unfilled quantity.
         7. Compute blended exit price if partial fill occurred.
         """
-        sym    = trade.get("symbol", "")
+        sym = trade.get("symbol", "")
         sl_oid = str(trade.get("sl_order_id", ""))
         entry_qty = float(trade.get("entry_qty") or 0)
 
@@ -1053,7 +1680,9 @@ class TokocryptoOrderExecutor:
         # Step 3: Atomic Cancel
         canceled = self.cancel_order(sym, sl_oid)
         if not canceled:
-            print(f"  ✗ recover_stuck_sl({sym}): cancel_order({sl_oid}) failed. Aborting recovery to prevent duplicate sell.")
+            print(
+                f"  ✗ recover_stuck_sl({sym}): cancel_order({sl_oid}) failed. Aborting recovery to prevent duplicate sell."
+            )
             return None
 
         # Step 4: Re-query post-cancel
@@ -1093,7 +1722,9 @@ class TokocryptoOrderExecutor:
             return None
 
         if free_bal <= 0:
-            print(f"  ✗ recover_stuck_sl({sym}): zero available balance for {base_asset} (free={free_bal})")
+            print(
+                f"  ✗ recover_stuck_sl({sym}): zero available balance for {base_asset} (free={free_bal})"
+            )
             return None
 
         sell_qty = min(remaining_qty, free_bal)
@@ -1110,7 +1741,9 @@ class TokocryptoOrderExecutor:
         # Step 7: Blended price calculation
         total_exit_qty = sl_exec_qty + mkt_exec_qty
         if total_exit_qty > 0:
-            blended_price = (sl_exec_qty * sl_exec_price + mkt_exec_qty * mkt_exec_price) / total_exit_qty
+            blended_price = (
+                sl_exec_qty * sl_exec_price + mkt_exec_qty * mkt_exec_price
+            ) / total_exit_qty
         else:
             blended_price = mkt_exec_price
 

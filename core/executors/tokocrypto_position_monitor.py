@@ -22,9 +22,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from core.clients.tokocrypto_client import TokocryptoClient, TokocryptoError
-from core.clients.tokocrypto_order_executor import TokocryptoOrderExecutor
+from core.clients.tokocrypto_order_executor import (
+    TokocryptoOrderExecutor,
+    claim_oco_submission,
+    lifecycle_lock,
+    release_entry_submission,
+    release_oco_submission,
+)
 from services.supabase_client import (
-    fetch_all_tokocrypto,
+    fetch_all_tokocrypto_strict,
     update_tokocrypto_by_order_id,
     TABLE_TOKOCRYPTO,
 )
@@ -46,7 +52,7 @@ class TokocryptoPositionMonitor:
         client: TokocryptoClient,
         executor: TokocryptoOrderExecutor,
     ) -> None:
-        self.client   = client
+        self.client = client
         self.executor = executor
 
     # ------------------------------------------------------------------
@@ -60,22 +66,29 @@ class TokocryptoPositionMonitor:
         Fetches all rows from Toko_Crypto_Spot and processes each open trade.
         Prints a summary of the last 5 closed trades if no open positions exist.
         """
-        trades      = fetch_all_tokocrypto()
+        try:
+            trades = fetch_all_tokocrypto_strict()
+        except Exception as exc:
+            print(
+                f"[Toko Monitor] Could not load lifecycle state: {exc}; no automated actions taken."
+            )
+            return
         open_trades = [
-            t for t in trades
-            if (t.get("exit_status") or "").upper() == "OPEN"
+            t for t in trades if (t.get("exit_status") or "").upper() == "OPEN"
         ]
 
         if not open_trades:
             print("[Toko Monitor] No open positions.")
-            closed = [t for t in trades if (t.get("exit_status") or "").upper() != "OPEN"]
+            closed = [
+                t for t in trades if (t.get("exit_status") or "").upper() != "OPEN"
+            ]
             if closed:
                 print("[Toko Monitor] Last 5 closed trades:")
                 for row in closed[-5:]:
-                    sym    = row.get("symbol", "?")
+                    sym = row.get("symbol", "?")
                     exit_s = row.get("exit_status", "?")
-                    pnl    = row.get("realized_pnl_idr")
-                    pnl_s  = f"Rp {pnl:+,.0f}" if pnl is not None else "?"
+                    pnl = row.get("realized_pnl_idr")
+                    pnl_s = f"Rp {pnl:+,.0f}" if pnl is not None else "?"
                     print(f"  {sym}  {exit_s}  {pnl_s}")
             return
 
@@ -92,59 +105,173 @@ class TokocryptoPositionMonitor:
     # ------------------------------------------------------------------
 
     def _check_one(self, trade: dict, verbose: bool) -> None:
+        with lifecycle_lock(str(trade.get("symbol", "?"))):
+            self._check_one_locked(trade, verbose)
+
+    def _check_one_locked(self, trade: dict, verbose: bool) -> None:
         """Process one open trade through the full entry → OCO → exit flow."""
-        sym           = trade.get("symbol", "?")
-        entry_oid     = str(trade.get("entry_order_id", ""))
-        entry_status  = (trade.get("entry_status") or "").upper()
-        b_order_list  = str(trade.get("b_order_list_id") or "").strip()
-        tp_oid        = str(trade.get("tp_order_id") or "").strip()
-        sl_oid        = str(trade.get("sl_order_id") or "").strip()
-        has_oco       = bool(b_order_list) or bool(tp_oid and sl_oid)
+        sym = trade.get("symbol", "?")
+        entry_oid = str(trade.get("entry_order_id", ""))
+        entry_status = (trade.get("entry_status") or "").upper()
+        b_order_list = str(trade.get("b_order_list_id") or "").strip()
+        tp_oid = str(trade.get("tp_order_id") or "").strip()
+        sl_oid = str(trade.get("sl_order_id") or "").strip()
+        has_oco = bool(tp_oid and sl_oid)
 
         if verbose:
-            print(f"  [{sym}] entry_status={entry_status}  OCO={b_order_list or ('legs:' + tp_oid)}")
+            print(
+                f"  [{sym}] entry_status={entry_status}  OCO={b_order_list or ('legs:' + tp_oid)}"
+            )
 
         # ----------------------------------------------------------------
         # Phase A: Entry order not yet confirmed filled
         # ----------------------------------------------------------------
-        if entry_status in ("NEW", ""):
+        if entry_status in ("NEW", "PARTIALLY_FILLED", ""):
             try:
                 detail = self.client.get_order_detail(sym, entry_oid)
             except TokocryptoError as e:
-                print(f"  ✗ [{sym}] get_order_detail(entry) failed: {e}")
+                err_str = str(e)
+                if "-2013" in err_str or "order does not exist" in err_str.lower():
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "entry_status": "RECONCILIATION_REQUIRED",
+                            "exit_status": "RECONCILIATION_REQUIRED",
+                            "exit_reason": "ENTRY_ORDER_NOT_FOUND_ON_EXCHANGE",
+                            "updated_at": now_iso,
+                        },
+                    )
+                    print(
+                        f"  ✗ [{sym}] entry order {entry_oid} not found on exchange (-2013) -> RECONCILIATION_REQUIRED"
+                    )
+                else:
+                    print(f"  ✗ [{sym}] get_order_detail(entry) failed: {e}")
                 return
 
             d_status = int(detail.get("status", -99))
-            if d_status == 2:   # FILLED
-                fill_price = float(detail.get("executedPrice") or detail.get("price") or 0)
-                fill_qty   = float(detail.get("executedQty") or detail.get("origQty") or 0)
-                now_iso    = datetime.now(timezone.utc).isoformat()
+            exec_qty = float(detail.get("executedQty") or 0)
+            fill_price = float(detail.get("executedPrice") or detail.get("price") or 0)
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-                # entry_fill_time is bigint (epoch ms) in Supabase — use exchange time
-                fill_time_ms = int(detail.get("createTime") or detail.get("time") or 0)
-                if fill_time_ms == 0:
-                    import time as _time
-                    fill_time_ms = int(_time.time() * 1000)
+            # entry_fill_time is bigint (epoch ms) in Supabase — use exchange time
+            fill_time_ms = int(detail.get("createTime") or detail.get("time") or 0)
+            if fill_time_ms == 0:
+                import time as _time
 
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "entry_fill_price":   fill_price,
-                    "entry_fill_time":    fill_time_ms,
-                    "entry_qty":          fill_qty,
-                    "entry_status":       "FILLED",
-                    "updated_at":         now_iso,
-                })
+                fill_time_ms = int(_time.time() * 1000)
+
+            if d_status == 2:  # FILLED
+                fill_qty = (
+                    exec_qty if exec_qty > 0 else float(detail.get("origQty") or 0)
+                )
+
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "entry_fill_price": fill_price,
+                        "entry_fill_time": fill_time_ms,
+                        "entry_qty": fill_qty,
+                        "entry_status": "FILLED",
+                        "oco_state": (
+                            "OCO_NOT_ATTEMPTED"
+                            if not has_oco
+                            else trade.get("oco_state")
+                        ),
+                        "updated_at": now_iso,
+                    },
+                )
 
                 # Refresh local trade dict for OCO placement below
-                trade = {**trade,
-                         "entry_fill_price": fill_price,
-                         "entry_qty":        fill_qty,
-                         "entry_status":     "FILLED"}
+                trade = {
+                    **trade,
+                    "entry_fill_price": fill_price,
+                    "entry_qty": fill_qty,
+                    "entry_status": "FILLED",
+                    "oco_state": (
+                        "OCO_NOT_ATTEMPTED" if not has_oco else trade.get("oco_state")
+                    ),
+                }
 
                 _send_toko_telegram(
                     f"✅ Entry FILLED: {sym}  qty={fill_qty}  "
                     f"fill_price={fill_price:,.0f} IDR"
                 )
                 entry_status = "FILLED"
+
+            elif d_status in (3, 5, 6) and exec_qty == 0:
+                # Terminal unfilled: CANCELED (3), REJECTED (5), EXPIRED (6)
+                status_names = {3: "CANCELED", 5: "REJECTED", 6: "EXPIRED"}
+                terminal_name = status_names.get(d_status, "CANCELED")
+
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "entry_status": terminal_name,
+                        "exit_status": terminal_name,
+                        "exit_reason": f"ENTRY_{terminal_name}",
+                        "updated_at": now_iso,
+                    },
+                )
+                release_entry_submission(sym)
+
+                _send_toko_telegram(
+                    f"ℹ️ Entry {terminal_name}: {sym}  orderId={entry_oid}  (0 fill, slot released)"
+                )
+                if verbose:
+                    print(
+                        f"  [{sym}] entry {terminal_name} (0 fill) — synchronized to Supabase."
+                    )
+                return
+
+            elif d_status in (1, 3, 6) and exec_qty > 0:
+                # Partially filled terminal or active partial fill:
+                # Reconcile actual fills first — do NOT treat as zero-fill cancellation!
+                is_terminal = d_status in (3, 6)
+                new_entry_status = "PARTIALLY_FILLED" if not is_terminal else "FILLED"
+
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "entry_fill_price": fill_price,
+                        "entry_fill_time": fill_time_ms,
+                        "entry_qty": exec_qty,
+                        "entry_status": new_entry_status,
+                        "oco_state": (
+                            "OCO_NOT_ATTEMPTED"
+                            if is_terminal and not has_oco
+                            else trade.get("oco_state")
+                        ),
+                        "updated_at": now_iso,
+                    },
+                )
+
+                trade = {
+                    **trade,
+                    "entry_fill_price": fill_price,
+                    "entry_qty": exec_qty,
+                    "entry_status": new_entry_status,
+                    "oco_state": (
+                        "OCO_NOT_ATTEMPTED"
+                        if is_terminal and not has_oco
+                        else trade.get("oco_state")
+                    ),
+                }
+
+                term_label = " (CANCELED remainder)" if is_terminal else " (Working)"
+                _send_toko_telegram(
+                    f"⚠️ Entry PARTIAL FILL{term_label}: {sym}  qty={exec_qty}  "
+                    f"fill_price={fill_price:,.0f} IDR"
+                )
+                if is_terminal:
+                    # Entry order is terminal with partial fill; position is open and needs OCO sizing for exec_qty
+                    entry_status = "FILLED"
+                else:
+                    if verbose:
+                        print(
+                            f"  [{sym}] entry partially filled (qty={exec_qty}), still working."
+                        )
+                    return
             else:
                 if verbose:
                     print(f"  [{sym}] entry not yet filled (status={d_status})")
@@ -160,78 +287,127 @@ class TokocryptoPositionMonitor:
             attempts = int(trade.get("oco_placement_attempts") or 0)
             oco_state_cur = (trade.get("oco_state") or "").upper()
 
-            if oco_state_cur == "OCO_PLACEMENT_FAILED" and attempts >= MAX_OCO_RETRIES:
+            if oco_state_cur != "OCO_NOT_ATTEMPTED" or b_order_list or not has_oco:
+                try:
+                    discovered, safe_to_start = self.executor.inspect_open_oco_legs(
+                        sym, b_order_list
+                    )
+                except Exception as exc:
+                    discovered = None
+                    safe_to_start = False
+                    print(
+                        f"  [{sym}] OCO open-order reconciliation failed: {exc}",
+                        flush=True,
+                    )
+                if discovered:
+                    tp_oid, sl_oid = discovered
+                    trade = {**trade, "tp_order_id": tp_oid, "sl_order_id": sl_oid}
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "tp_order_id": tp_oid,
+                            "sl_order_id": sl_oid,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    has_oco = True
+                elif (
+                    not safe_to_start
+                    or oco_state_cur != "OCO_NOT_ATTEMPTED"
+                    or b_order_list
+                ):
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "oco_state": "RECONCILIATION_REQUIRED",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    _send_toko_telegram(
+                        f"🚨 OCO STATE UNKNOWN: {sym}\n"
+                        "Stored state and exchange open orders do not prove a complete TP/SL pair; "
+                        "automatic OCO placement stopped for manual reconciliation."
+                    )
+                    return
+
+            if not has_oco and not claim_oco_submission(entry_oid):
+                if verbose:
+                    print(
+                        f"  [{sym}] OCO submission is already claimed or unresolved; skipping."
+                    )
+                return
+
+            if (
+                not has_oco
+                and oco_state_cur == "OCO_PLACEMENT_FAILED"
+                and attempts >= MAX_OCO_RETRIES
+            ):
                 # Already exhausted retries — do NOT retry or re-alert.
                 # One-time escalation was sent on the last attempt.
                 if verbose:
-                    print(f"  [{sym}] OCO retries exhausted ({attempts}/{MAX_OCO_RETRIES}), "
-                          f"awaiting manual intervention.")
+                    print(
+                        f"  [{sym}] OCO retries exhausted ({attempts}/{MAX_OCO_RETRIES}), "
+                        f"awaiting manual intervention."
+                    )
                 return
 
-            try:
-                oco_result = self.executor.place_oco(trade)
-                if oco_result is None:
-                    # place_oco returned None — constraint check failed or supervised abort
-                    attempts += 1
-                    now_fail = datetime.now(timezone.utc).isoformat()
-                    update_tokocrypto_by_order_id(entry_oid, {
-                        "oco_state":               "OCO_PLACEMENT_FAILED",
-                        "oco_placement_attempts":  attempts,
-                        "updated_at":              now_fail,
-                    })
-                    if attempts >= MAX_OCO_RETRIES:
-                        _send_toko_telegram(
-                            f"🚨 OCO PLACEMENT EXHAUSTED: {sym}\n"
-                            f"Failed {attempts}x (constraint/abort).\n"
-                            f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
-                            f"qty={trade.get('entry_qty', '?')}\n"
-                            f"Position is UNPROTECTED — MANUAL ACTION REQUIRED.\n"
-                            f"Bot will NOT retry until you reset oco_state."
-                        )
-                    else:
-                        _send_toko_telegram(
-                            f"⚠️ OCO NOT PLACED: {sym} (attempt {attempts}/{MAX_OCO_RETRIES})\n"
-                            f"place_oco returned None (constraint check or abort).\n"
-                            f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
-                            f"qty={trade.get('entry_qty', '?')}\n"
-                            f"Will retry next cycle."
-                        )
-            except Exception as oco_exc:
-                # Hard OCO failure — exchange error, network issue, etc.
-                attempts += 1
-                now_fail = datetime.now(timezone.utc).isoformat()
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "oco_state":               "OCO_PLACEMENT_FAILED",
-                    "oco_placement_attempts":  attempts,
-                    "updated_at":              now_fail,
-                })
-                if attempts >= MAX_OCO_RETRIES:
+            if not has_oco:
+                try:
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "oco_state": "OCO_SUBMISSION_PENDING",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                except Exception:
+                    release_oco_submission(entry_oid)
+                    raise
+
+                try:
+                    oco_result = self.executor.place_oco(trade)
+                except Exception as oco_exc:
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "oco_state": "RECONCILIATION_REQUIRED",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
                     _send_toko_telegram(
-                        f"🚨 OCO PLACEMENT EXHAUSTED: {sym}\n"
-                        f"Failed {attempts}x — last error: {str(oco_exc)[:120]}\n"
-                        f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
-                        f"qty={trade.get('entry_qty', '?')}\n"
-                        f"Position is FILLED and UNPROTECTED.\n"
-                        f"Bot will NOT retry — MANUAL ACTION REQUIRED NOW."
+                        f"🚨 OCO SUBMISSION UNKNOWN: {sym}\n"
+                        f"{str(oco_exc)[:160]}\n"
+                        "No automatic retry; verify exchange orders manually."
+                    )
+                    print(
+                        f"  [{sym}] 🚨 OCO outcome unknown; automatic retry blocked: {oco_exc}",
+                        flush=True,
                     )
                 else:
-                    _send_toko_telegram(
-                        f"🚨 OCO PLACEMENT FAILED: {sym} (attempt {attempts}/{MAX_OCO_RETRIES})\n"
-                        f"Error: {str(oco_exc)[:120]}\n"
-                        f"Entry fill: Rp {float(trade.get('entry_fill_price', 0)):,.2f}  "
-                        f"qty={trade.get('entry_qty', '?')}\n"
-                        f"Position is UNPROTECTED — will retry next cycle."
-                    )
-                print(f"  [{sym}] 🚨 OCO placement failed (attempt {attempts}): {oco_exc}", flush=True)
-            return   # next cycle will retry (if attempts < MAX) or skip
+                    if oco_result is None:
+                        release_oco_submission(entry_oid)
+                        attempts += 1
+                        update_tokocrypto_by_order_id(
+                            entry_oid,
+                            {
+                                "oco_state": "OCO_PLACEMENT_FAILED",
+                                "oco_placement_attempts": attempts,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        _send_toko_telegram(
+                            f"⚠️ OCO NOT PLACED: {sym} (known pre-submit rejection/abort). "
+                            "No exchange POST was made; manual review required before retry."
+                        )
+                return
 
         # ----------------------------------------------------------------
         # Phase C: OCO placed — query its state
         # ----------------------------------------------------------------
         if has_oco:
             state_dict = self.executor.query_oco_state(trade)
-            oco_state  = state_dict["state"]
-            now_iso    = datetime.now(timezone.utc).isoformat()
+            oco_state = state_dict["state"]
+            now_iso = datetime.now(timezone.utc).isoformat()
 
             # Backfill b_order_list_id if it was missing locally
             if not b_order_list:
@@ -246,19 +422,25 @@ class TokocryptoPositionMonitor:
                 if discovered:
                     b_order_list = str(discovered).strip()
                     trade["b_order_list_id"] = b_order_list
-                    update_tokocrypto_by_order_id(entry_oid, {
-                        "b_order_list_id": b_order_list,
-                        "updated_at":      now_iso,
-                    })
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "b_order_list_id": b_order_list,
+                            "updated_at": now_iso,
+                        },
+                    )
 
             if verbose:
                 print(f"  [{sym}] OCO state: {oco_state}")
 
             if oco_state == "EXECUTING":
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "oco_state":  "EXECUTING",
-                    "updated_at": now_iso,
-                })
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "oco_state": "EXECUTING",
+                        "updated_at": now_iso,
+                    },
+                )
                 # ── Stuck-OCO shadow detection ────────────────────────────
                 # If OCO shows EXECUTING but price has already breached SL,
                 # the SL leg may be stuck (same 2ZUSDT pattern from Binance).
@@ -281,10 +463,13 @@ class TokocryptoPositionMonitor:
                             # Cycle N — first detection
                             detection["suspected_at"] = now_iso
                             raw["stuck_oco_detection"] = detection
-                            update_tokocrypto_by_order_id(entry_oid, {
-                                "raw_entry_order": raw,
-                                "updated_at": now_iso,
-                            })
+                            update_tokocrypto_by_order_id(
+                                entry_oid,
+                                {
+                                    "raw_entry_order": raw,
+                                    "updated_at": now_iso,
+                                },
+                            )
                             _send_toko_telegram(
                                 f"⚠️ STUCK-OCO SUSPECTED: {sym}\n"
                                 f"Price {current:,.2f} ≤ SL {sl_level:,.2f} "
@@ -292,8 +477,11 @@ class TokocryptoPositionMonitor:
                                 f"First detected: {now_iso}\n"
                                 f"Monitoring next cycle — no action yet."
                             )
-                            print(f"  [{sym}] ⚠ Stuck-OCO suspected: "
-                                  f"price {current:,.2f} ≤ SL {sl_level:,.2f}", flush=True)
+                            print(
+                                f"  [{sym}] ⚠ Stuck-OCO suspected: "
+                                f"price {current:,.2f} ≤ SL {sl_level:,.2f}",
+                                flush=True,
+                            )
                         else:
                             # Cycle N+1 — confirmed stuck, escalate
                             _send_toko_telegram(
@@ -303,30 +491,43 @@ class TokocryptoPositionMonitor:
                                 f"First detected: {suspected_at}\n"
                                 f"Manual intervention required — check OCO legs."
                             )
-                            print(f"  [{sym}] 🚨 Stuck-OCO confirmed — "
-                                  f"escalated alert sent.", flush=True)
+                            print(
+                                f"  [{sym}] 🚨 Stuck-OCO confirmed — "
+                                f"escalated alert sent.",
+                                flush=True,
+                            )
 
             elif oco_state in ("TP_HIT", "SL_HIT"):
                 self._resolve_exit(trade, state_dict)
 
             elif oco_state == "STUCK_COUNTERPART":
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "oco_state":  "STUCK_COUNTERPART",
-                    "updated_at": now_iso,
-                })
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "oco_state": "STUCK_COUNTERPART",
+                        "updated_at": now_iso,
+                    },
+                )
                 _send_toko_telegram(
                     f"⚠️ STUCK_COUNTERPART: {sym}  "
                     f"one OCO leg filled but counterpart unresolved — manual check needed"
                 )
 
             elif oco_state in ("CRITICAL_ANOMALY", "BOTH_CANCELED_ANOMALY"):
-                raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                raw_meta = (
+                    dict(trade.get("raw_entry_order") or {})
+                    if isinstance(trade.get("raw_entry_order"), dict)
+                    else {}
+                )
                 raw_meta["requires_manual_review"] = True
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "oco_state":            oco_state,
-                    "raw_entry_order":      raw_meta,
-                    "updated_at":           now_iso,
-                })
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "oco_state": oco_state,
+                        "raw_entry_order": raw_meta,
+                        "updated_at": now_iso,
+                    },
+                )
                 raw_tp_s = str(state_dict.get("raw_tp", {}).get("status", "?"))
                 raw_sl_s = str(state_dict.get("raw_sl", {}).get("status", "?"))
                 _send_toko_telegram(
@@ -339,15 +540,21 @@ class TokocryptoPositionMonitor:
             elif oco_state in ("TP_EXPIRED_PENDING", "SL_EXPIRED_PENDING"):
                 is_recovery_done = bool(
                     trade.get("recovery_attempted")
-                    or (isinstance(trade.get("raw_entry_order"), dict) and trade.get("raw_entry_order", {}).get("recovery_attempted"))
+                    or (
+                        isinstance(trade.get("raw_entry_order"), dict)
+                        and trade.get("raw_entry_order", {}).get("recovery_attempted")
+                    )
                 )
                 # Only set expired_leg_detected_at on first detection
                 if not trade.get("expired_leg_detected_at"):
-                    update_tokocrypto_by_order_id(entry_oid, {
-                        "oco_state":               oco_state,
-                        "expired_leg_detected_at": now_iso,
-                        "updated_at":              now_iso,
-                    })
+                    update_tokocrypto_by_order_id(
+                        entry_oid,
+                        {
+                            "oco_state": oco_state,
+                            "expired_leg_detected_at": now_iso,
+                            "updated_at": now_iso,
+                        },
+                    )
                     _send_toko_telegram(
                         f"⏰ {oco_state}: {sym}  "
                         f"expired_leg_first_detected={now_iso}  "
@@ -357,7 +564,9 @@ class TokocryptoPositionMonitor:
                     # Idempotency guard: Recovery was already attempted.
                     # Do NOT retry recovery repeatedly every cycle — await manual intervention.
                     if verbose:
-                        print(f"  [{sym}] Recovery already attempted previously, awaiting manual resolution.")
+                        print(
+                            f"  [{sym}] Recovery already attempted previously, awaiting manual resolution."
+                        )
                 else:
                     # Second+ cycle: SL leg is stuck unfilled!
                     # Attempt safe recovery via executor once
@@ -371,14 +580,21 @@ class TokocryptoPositionMonitor:
                             f"Reason: {recovery_dict.get('exit_reason')}"
                         )
                     else:
-                        raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                        raw_meta = (
+                            dict(trade.get("raw_entry_order") or {})
+                            if isinstance(trade.get("raw_entry_order"), dict)
+                            else {}
+                        )
                         raw_meta["recovery_attempted"] = True
                         raw_meta["requires_manual_review"] = True
-                        update_tokocrypto_by_order_id(entry_oid, {
-                            "oco_state":              "RECONCILIATION_REQUIRED",
-                            "raw_entry_order":        raw_meta,
-                            "updated_at":             now_iso,
-                        })
+                        update_tokocrypto_by_order_id(
+                            entry_oid,
+                            {
+                                "oco_state": "RECONCILIATION_REQUIRED",
+                                "raw_entry_order": raw_meta,
+                                "updated_at": now_iso,
+                            },
+                        )
                         _send_toko_telegram(
                             f"🚨 STUCK-SL RECOVERY FAILED: {sym}\n"
                             f"Order remains OPEN and UNRESOLVED.\n"
@@ -386,13 +602,20 @@ class TokocryptoPositionMonitor:
                         )
 
             elif oco_state == "RECONCILIATION_REQUIRED":
-                raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+                raw_meta = (
+                    dict(trade.get("raw_entry_order") or {})
+                    if isinstance(trade.get("raw_entry_order"), dict)
+                    else {}
+                )
                 raw_meta["requires_manual_review"] = True
-                update_tokocrypto_by_order_id(entry_oid, {
-                    "oco_state":            "RECONCILIATION_REQUIRED",
-                    "raw_entry_order":      raw_meta,
-                    "updated_at":           now_iso,
-                })
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "oco_state": "RECONCILIATION_REQUIRED",
+                        "raw_entry_order": raw_meta,
+                        "updated_at": now_iso,
+                    },
+                )
                 _send_toko_telegram(
                     f"⚠️ RECONCILIATION_REQUIRED: {sym}  "
                     f"OCO query failed or unrecognized state  "
@@ -410,30 +633,43 @@ class TokocryptoPositionMonitor:
         exit_price ALWAYS from state_dict["exit_price"], which was populated
         from executedPrice in the order detail — never from get_ticker().
         """
-        is_tp        = state_dict["state"] == "TP_HIT"
-        exit_price   = float(state_dict["exit_price"] or 0)
-        entry_oid    = str(trade.get("entry_order_id", ""))
-        sym          = trade.get("symbol", "?")
-        now_iso      = datetime.now(timezone.utc).isoformat()
+        is_tp = state_dict["state"] == "TP_HIT"
+        exit_price = float(state_dict["exit_price"] or 0)
+        entry_oid = str(trade.get("entry_order_id", ""))
+        sym = trade.get("symbol", "?")
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-        entry_fill_price    = float(trade.get("entry_fill_price") or trade.get("entry_price") or 0)
-        qty                 = float(trade.get("entry_qty") or 0)
-        entry_notional_idr  = float(trade.get("entry_notional_idr") or (entry_fill_price * qty))
+        entry_fill_price = float(
+            trade.get("entry_fill_price") or trade.get("entry_price") or 0
+        )
+        qty = float(trade.get("entry_qty") or 0)
+        entry_notional_idr = float(
+            trade.get("entry_notional_idr") or (entry_fill_price * qty)
+        )
 
-        realized_pnl_idr    = (exit_price - entry_fill_price) * qty
-        realized_pnl_pct    = (realized_pnl_idr / entry_notional_idr * 100) if entry_notional_idr else 0.0
+        realized_pnl_idr = (exit_price - entry_fill_price) * qty
+        realized_pnl_pct = (
+            (realized_pnl_idr / entry_notional_idr * 100) if entry_notional_idr else 0.0
+        )
 
-        ref_price      = float(trade.get("tp_price") if is_tp else trade.get("sl_price") or 0)
-        slippage_pct   = ((exit_price - ref_price) / ref_price * 100) if ref_price else 0.0
-        slip_flagged   = state_dict.get("slippage_flagged", False)
+        ref_price = float(
+            trade.get("tp_price") if is_tp else trade.get("sl_price") or 0
+        )
+        slippage_pct = (
+            ((exit_price - ref_price) / ref_price * 100) if ref_price else 0.0
+        )
+        slip_flagged = state_dict.get("slippage_flagged", False)
 
-        raw_exit_key   = "raw_tp" if is_tp else "raw_sl"
+        raw_exit_key = "raw_tp" if is_tp else "raw_sl"
         raw_exit_detail = state_dict.get(raw_exit_key, {})
 
         # exit_time is bigint (epoch ms) in Supabase — match entry_fill_time pattern
-        exit_time_ms = int(raw_exit_detail.get("createTime") or raw_exit_detail.get("time") or 0)
+        exit_time_ms = int(
+            raw_exit_detail.get("createTime") or raw_exit_detail.get("time") or 0
+        )
         if exit_time_ms == 0:
             import time as _time
+
             exit_time_ms = int(_time.time() * 1000)
 
         time_to_res = None
@@ -445,20 +681,24 @@ class TokocryptoPositionMonitor:
                 time_to_res = None
 
         exit_reason = state_dict.get("exit_reason") or "OCO_TRIGGERED"
-        update_tokocrypto_by_order_id(entry_oid, {
-            "exit_status":                "TP_HIT" if is_tp else "SL_HIT",
-            "exit_reason":                exit_reason,
-            "exit_price":                 exit_price,
-            "exit_time":                  exit_time_ms,
-            "time_to_resolution_sec":     time_to_res,
-            "realized_pnl_idr":           round(realized_pnl_idr, 2),
-            "realized_pnl_pct":           round(realized_pnl_pct, 4),
-            "exit_fill_slippage_pct":     round(slippage_pct, 4),
-            "exit_fill_slippage_flagged": slip_flagged,
-            "raw_exit_detail":            raw_exit_detail,
-            "oco_state":                  "TP_HIT" if is_tp else "SL_HIT",
-            "updated_at":                 now_iso,
-        })
+        update_tokocrypto_by_order_id(
+            entry_oid,
+            {
+                "exit_status": "TP_HIT" if is_tp else "SL_HIT",
+                "exit_reason": exit_reason,
+                "exit_price": exit_price,
+                "exit_time": exit_time_ms,
+                "time_to_resolution_sec": time_to_res,
+                "realized_pnl_idr": round(realized_pnl_idr, 2),
+                "realized_pnl_pct": round(realized_pnl_pct, 4),
+                "exit_fill_slippage_pct": round(slippage_pct, 4),
+                "exit_fill_slippage_flagged": slip_flagged,
+                "raw_exit_detail": raw_exit_detail,
+                "oco_state": "TP_HIT" if is_tp else "SL_HIT",
+                "updated_at": now_iso,
+            },
+        )
+        release_entry_submission(sym)
 
         if is_tp:
             label = "✅ TP"

@@ -56,7 +56,7 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
         self.assertEqual(calculate_available_slots(3, max_positions=3), 0)
         self.assertEqual(calculate_available_slots(4, max_positions=3), 0)
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -65,9 +65,16 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
     ):
         """When 5 open trades exist, available slots = 0 and scanner.gather_candidates is skipped."""
         mock_fetch.return_value = [
-            {"entry_order_id": f"100{i}", "symbol": f"COIN{i}_IDR", "exit_status": "OPEN"}
+            {
+                "entry_order_id": f"100{i}",
+                "symbol": f"COIN{i}_IDR",
+                "exit_status": "OPEN",
+            }
             for i in range(5)
         ]
+        client_mock = MagicMock()
+        client_mock.get_open_orders.return_value = []
+        mock_build_client.return_value = client_mock
         scanner_mock = MagicMock()
         mock_build_scanner.return_value = scanner_mock
 
@@ -75,7 +82,7 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
 
         scanner_mock.gather_candidates.assert_not_called()
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -87,6 +94,7 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
             {"entry_order_id": "1001", "symbol": "DOGE_IDR", "exit_status": "OPEN"}
         ]
         client_mock = MagicMock()
+        client_mock.get_open_orders.return_value = []
         bal_mock = MagicMock()
         bal_mock.free = 200_000.0
         client_mock.get_balance.return_value = bal_mock
@@ -100,7 +108,7 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
 
         scanner_mock.gather_candidates.assert_called_once_with(max_positions=4)
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -109,9 +117,16 @@ class TestTokocryptoSlotCalculation(unittest.TestCase):
     ):
         """When open trades > 5 (e.g. 6), slots_available = 0, no exception, scan skipped."""
         mock_fetch.return_value = [
-            {"entry_order_id": f"100{i}", "symbol": f"COIN{i}_IDR", "exit_status": "OPEN"}
+            {
+                "entry_order_id": f"100{i}",
+                "symbol": f"COIN{i}_IDR",
+                "exit_status": "OPEN",
+            }
             for i in range(6)
         ]
+        client_mock = MagicMock()
+        client_mock.get_open_orders.return_value = []
+        mock_build_client.return_value = client_mock
         scanner_mock = MagicMock()
         mock_build_scanner.return_value = scanner_mock
 
@@ -125,6 +140,7 @@ class TestDashboardConfig(unittest.TestCase):
     def test_dashboard_max_toko_slots_is_5(self):
         """Dashboard MAX_TOKO_SLOTS must default to 5."""
         from dashboard import MAX_TOKO_SLOTS
+
         self.assertEqual(MAX_TOKO_SLOTS, 5)
 
 
@@ -167,6 +183,7 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
     def test_math_safety_edge_cases(self):
         """Negative, None, NaN, and Inf safely return 0.0 without raising."""
         import math
+
         self.assertEqual(calculate_new_order_allocation(-100_000, 5), 0.0)
         self.assertEqual(calculate_new_order_allocation(None, 5), 0.0)
         self.assertEqual(calculate_new_order_allocation(float("nan"), 5), 0.0)
@@ -180,9 +197,24 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         retain their historical entry size/nominal. No rebalancing/repricing occurs.
         """
         existing_positions = [
-            {"symbol": "BTC_IDR", "entry_price": 1_000_000_000, "nominal": 100_000, "exit_status": "OPEN"},
-            {"symbol": "ETH_IDR", "entry_price": 50_000_000, "nominal": 100_000, "exit_status": "OPEN"},
-            {"symbol": "SOL_IDR", "entry_price": 2_500_000, "nominal": 100_000, "exit_status": "OPEN"},
+            {
+                "symbol": "BTC_IDR",
+                "entry_price": 1_000_000_000,
+                "nominal": 100_000,
+                "exit_status": "OPEN",
+            },
+            {
+                "symbol": "ETH_IDR",
+                "entry_price": 50_000_000,
+                "nominal": 100_000,
+                "exit_status": "OPEN",
+            },
+            {
+                "symbol": "SOL_IDR",
+                "entry_price": 2_500_000,
+                "nominal": 100_000,
+                "exit_status": "OPEN",
+            },
         ]
 
         # Simulate wallet drop:
@@ -195,7 +227,7 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
             self.assertEqual(pos["nominal"], 100_000)
             self.assertEqual(pos["exit_status"], "OPEN")
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -210,6 +242,7 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         client_mock = MagicMock()
         balance_mock = MagicMock()
         balance_mock.free = 500_000.0
+        client_mock.get_open_orders.return_value = []
         client_mock.get_balance.return_value = balance_mock
         mock_build_client.return_value = client_mock
 
@@ -241,10 +274,12 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         cmd_propose()
 
         # Sizing must have received 100,000 (500k / 5)
-        scanner_mock.pick_best_candidate.assert_called_once_with([candidate], available_idr=100_000.0)
+        scanner_mock.pick_best_candidate.assert_called_once_with(
+            [candidate], available_idr=100_000.0
+        )
         exec_mock.execute_entry.assert_called_once()
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -273,7 +308,9 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         """
         8. Sizing rejects candidate if allocation budget is below minimum notional (Rp 20,000).
         """
-        from core.scanners.tokocrypto_candidate_scanner import TokocryptoCandidateScanner
+        from core.scanners.tokocrypto_candidate_scanner import (
+            TokocryptoCandidateScanner,
+        )
 
         client_mock = MagicMock()
         scanner = TokocryptoCandidateScanner(client_mock)
@@ -302,13 +339,15 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         """
         9. Sizing strictly adheres to tick_size and step_size rounding.
         """
-        from core.scanners.tokocrypto_candidate_scanner import TokocryptoCandidateScanner
+        from core.scanners.tokocrypto_candidate_scanner import (
+            TokocryptoCandidateScanner,
+        )
 
         client_mock = MagicMock()
         scanner = TokocryptoCandidateScanner(client_mock)
         scanner._sym_constraints["DOGE_IDR"] = {
-            "tick_size": 1.0,      # IDR price must be whole number
-            "step_size": 0.1,      # Qty step size
+            "tick_size": 1.0,  # IDR price must be whole number
+            "step_size": 0.1,  # Qty step size
             "min_notional": 20_000.0,
         }
 
@@ -331,7 +370,7 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         self.assertAlmostEqual(qty, round(qty, 1), places=6)
         self.assertGreaterEqual(result["sizing"]["notional_idr"], 20_000.0)
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -344,7 +383,9 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         """
         mock_fetch.return_value = []
         client_mock = MagicMock()
-        client_mock.get_balance.side_effect = RuntimeError("Tokocrypto API 503 Service Unavailable")
+        client_mock.get_balance.side_effect = RuntimeError(
+            "Tokocrypto API 503 Service Unavailable"
+        )
         mock_build_client.return_value = client_mock
 
         scanner_mock = MagicMock()
@@ -357,7 +398,7 @@ class TestTokocryptoDynamicAllocation(unittest.TestCase):
         scanner_mock.gather_candidates.assert_not_called()
         exec_mock.execute_entry.assert_not_called()
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_client")
     def test_diagnostic_output_format(self, mock_build_client, mock_fetch):
         """
@@ -402,37 +443,47 @@ class TestTokocryptoAdaptiveAllocation(unittest.TestCase):
 
     def test_1_two_slots_77k_allocates_two_slots(self):
         """Scenario 1: Free IDR Rp77.522 with 2 slots -> 2 slots allocated at Rp38.761 each."""
-        slots, alloc = calculate_adaptive_allocation(77_522.0, available_slots=2, min_notional=20_000.0)
+        slots, alloc = calculate_adaptive_allocation(
+            77_522.0, available_slots=2, min_notional=20_000.0
+        )
         self.assertEqual(slots, 2)
         self.assertAlmostEqual(alloc, 38_761.0, places=1)
         self.assertGreaterEqual(alloc, 20_000.0)
 
     def test_2_two_slots_35k_fallback_to_one_slot(self):
         """Scenario 2: Free IDR Rp35.000 with 2 slots -> 2 slots fail (<20k), fallback to 1 slot at Rp35.000."""
-        slots, alloc = calculate_adaptive_allocation(35_000.0, available_slots=2, min_notional=20_000.0)
+        slots, alloc = calculate_adaptive_allocation(
+            35_000.0, available_slots=2, min_notional=20_000.0
+        )
         self.assertEqual(slots, 1)
         self.assertEqual(alloc, 35_000.0)
         self.assertGreaterEqual(alloc, 20_000.0)
 
     def test_3_two_slots_18k_below_min_notional_no_entry(self):
         """Scenario 3: Free IDR Rp18.000 with 2 slots -> even 1 slot < 20k -> NO ENTRY (slots=0, alloc=0)."""
-        slots, alloc = calculate_adaptive_allocation(18_000.0, available_slots=2, min_notional=20_000.0)
+        slots, alloc = calculate_adaptive_allocation(
+            18_000.0, available_slots=2, min_notional=20_000.0
+        )
         self.assertEqual(slots, 0)
         self.assertEqual(alloc, 0.0)
 
     def test_4_one_slot_sufficient_balance_allocates_one_slot(self):
         """Scenario 4: Free IDR Rp50.000 with 1 slot -> allocates 1 slot at Rp50.000."""
-        slots, alloc = calculate_adaptive_allocation(50_000.0, available_slots=1, min_notional=20_000.0)
+        slots, alloc = calculate_adaptive_allocation(
+            50_000.0, available_slots=1, min_notional=20_000.0
+        )
         self.assertEqual(slots, 1)
         self.assertEqual(alloc, 50_000.0)
 
     def test_5_zero_slots_available_no_entry(self):
         """Scenario 5: 0 slots available -> NO ENTRY regardless of high wallet balance."""
-        slots, alloc = calculate_adaptive_allocation(500_000.0, available_slots=0, min_notional=20_000.0)
+        slots, alloc = calculate_adaptive_allocation(
+            500_000.0, available_slots=0, min_notional=20_000.0
+        )
         self.assertEqual(slots, 0)
         self.assertEqual(alloc, 0.0)
 
-    @patch("services.supabase_client.fetch_all_tokocrypto")
+    @patch("services.supabase_client.fetch_all_tokocrypto_strict")
     @patch("tokocrypto_executor._build_scanner")
     @patch("tokocrypto_executor._build_client")
     @patch("tokocrypto_executor._build_executor")
@@ -447,6 +498,7 @@ class TestTokocryptoAdaptiveAllocation(unittest.TestCase):
             {"symbol": "SOL_IDR", "exit_status": "OPEN", "entry_status": "NEW"},
         ]
         client_mock = MagicMock()
+        client_mock.get_open_orders.return_value = []
         bal_mock = MagicMock()
         bal_mock.free = 77_522.21
         bal_mock.locked = 36_606.50
@@ -468,12 +520,26 @@ class TestTokocryptoAdaptiveAllocation(unittest.TestCase):
         """Scenario 7: Across various balances, if target_slots > 0, alloc is ALWAYS >= min_notional."""
         min_notional = 20_000.0
         # Test balances from 0 to 100k
-        for bal in [0, 500, 10_000, 19_999, 20_000, 25_000, 39_999, 40_000, 77_522, 100_000]:
+        for bal in [
+            0,
+            500,
+            10_000,
+            19_999,
+            20_000,
+            25_000,
+            39_999,
+            40_000,
+            77_522,
+            100_000,
+        ]:
             for s in range(0, 6):
                 target, alloc = calculate_adaptive_allocation(bal, s, min_notional)
                 if target > 0:
-                    self.assertGreaterEqual(alloc, min_notional,
-                                           f"Failed for bal={bal}, slots={s}: got alloc={alloc}")
+                    self.assertGreaterEqual(
+                        alloc,
+                        min_notional,
+                        f"Failed for bal={bal}, slots={s}: got alloc={alloc}",
+                    )
                 else:
                     self.assertEqual(alloc, 0.0)
 

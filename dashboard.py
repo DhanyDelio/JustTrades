@@ -2139,19 +2139,32 @@ def compute_toko_oco_badge(trade: dict) -> str:
     """
     Compute conservative OCO badge HTML for a Tokocrypto position.
 
-    Conservative criteria:
-    - Anomaly state -> 🚨 ANOMALY badge
-    - Exchange-confirmed list (FULLY_PROTECTED or valid oco_list_id) -> OCO ✓
-    - EXECUTING state with verified TP/SL levels and leg order IDs -> OCO ✓
-    - Insufficient data or missing protection when FILLED -> ⚠ NO OCO
-    - Unfilled positions (NEW / PARTIALLY_FILLED) -> ""
+    Authoritative protection states:
+    1. ANOMALY: oco_state in TOKO_ANOMALY_STATES -> 🚨 ANOMALY badge
+    2. UNPROTECTED:
+       - oco_state in ("OCO_PLACEMENT_FAILED", "UNPROTECTED", "FAILED") -> ⚠ OCO FAILED
+       - Filled but missing verified protection -> ⚠ NO OCO
+    3. UNKNOWN / RECONCILING:
+       - oco_state in ("TP_EXPIRED_PENDING", "SL_EXPIRED_PENDING", "RECONCILING") -> ⏳ RECONCILING
+       - b_order_list_id present but oco_state empty/unverified -> ⏳ OCO UNVERIFIED
+    4. PROTECTED (Positively verified):
+       - oco_state in ("FULLY_PROTECTED", "EXECUTING") with valid leg IDs & price brackets -> OCO ✓
+    5. Unfilled (NEW / PARTIALLY_FILLED) -> ""
     """
     entry_status = str(trade.get("entry_status", "NEW")).upper()
-    is_filled    = entry_status == "FILLED"
-    oco_state    = trade.get("oco_state", "")
+    is_filled = entry_status == "FILLED"
+    oco_state = trade.get("oco_state", "")
     oco_st_upper = str(oco_state).upper() if oco_state else ""
-    oco_list_id  = trade.get("b_order_list_id")
-    valid_oco_list = bool(oco_list_id and str(oco_list_id).strip() and str(oco_list_id).strip() != "0")
+    oco_list_id = trade.get("b_order_list_id")
+    has_list_id = bool(
+        oco_list_id
+        and str(oco_list_id).strip()
+        and str(oco_list_id).strip() not in ("0", "None")
+    )
+
+    # Unfilled positions do not expect OCO protection yet
+    if not is_filled:
+        return ""
 
     def _has_valid_tp_sl_protection(t: dict) -> bool:
         try:
@@ -2170,24 +2183,56 @@ def compute_toko_oco_badge(trade: dict) -> str:
         except (ValueError, TypeError):
             return False
 
-    is_protected = (
-        oco_st_upper == "FULLY_PROTECTED"
-        or valid_oco_list
-        or (oco_st_upper == "EXECUTING" and _has_valid_tp_sl_protection(trade))
-    )
-
+    # Priority 1: High-severity Anomaly alerts
     if oco_st_upper in TOKO_ANOMALY_STATES:
-        return (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
-                f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                f"🚨 {oco_st_upper}</span>")
-    elif is_protected:
-        return ("<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
-                "padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
-    elif is_filled:
-        return ("<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
-                "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
-    else:
-        return ""
+        return (
+            f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🚨 {oco_st_upper}</span>"
+        )
+
+    # Priority 2: Confirmed failed or unprotected
+    if oco_st_upper in ("OCO_PLACEMENT_FAILED", "UNPROTECTED", "FAILED"):
+        return (
+            "<span style='background:#8b0000;color:#fff;border-radius:4px;"
+            "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ OCO FAILED</span>"
+        )
+
+    # Priority 3: Reconciling / Pending counterpart fill
+    if oco_st_upper in ("TP_EXPIRED_PENDING", "SL_EXPIRED_PENDING", "RECONCILING"):
+        return (
+            "<span style='background:#b8860b;color:#fff;border-radius:4px;"
+            "padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            "⏳ RECONCILING</span>"
+        )
+
+    # The dashboard only has a database snapshot, not live exchange evidence.
+    # Historical EXECUTING/IDs therefore cannot certify current protection.
+    if oco_st_upper in ("FULLY_PROTECTED", "EXECUTING") and _has_valid_tp_sl_protection(
+        trade
+    ):
+        last_state = "PROTECTED" if oco_st_upper == "FULLY_PROTECTED" else "EXECUTING"
+        return (
+            "<span style='background:#b8860b;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>⏳ LAST CHECK {last_state}</span>"
+        )
+
+    # Priority 5: UNKNOWN / UNVERIFIED — explicit unknown state, or order list ID present without verified state
+    # (Do NOT assume presence of list ID or historical status alone proves active protection!)
+    if oco_st_upper in ("UNKNOWN", "UNVERIFIED") or (
+        not oco_st_upper
+        and (has_list_id or (trade.get("tp_order_id") and trade.get("sl_order_id")))
+    ):
+        return (
+            "<span style='background:#b8860b;color:#fff;border-radius:4px;"
+            "padding:1px 7px;font-size:0.78em;font-weight:700'>⏳ OCO UNVERIFIED</span>"
+        )
+
+    # Priority 6: Default for filled positions without valid protection
+    return (
+        "<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+        "padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>"
+    )
 
 
 def render_toko_open_card(

@@ -216,6 +216,7 @@ class TokocryptoUnknownOrderStatus(TokocryptoError):
 
     This class intentionally carries no retry logic.
     """
+
     def __init__(self, status_code: int, body: dict | None = None):
         self.status_code = status_code
         self.body = body or {}
@@ -225,9 +226,14 @@ class TokocryptoUnknownOrderStatus(TokocryptoError):
         )
 
 
+class TokocryptoSubmissionUnknownError(TokocryptoError):
+    """An order POST started but its outcome could not be confirmed."""
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
+
 
 class TokocryptoClient:
     """

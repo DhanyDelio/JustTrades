@@ -197,7 +197,17 @@ def fetch_all_tokocrypto() -> list[dict]:
         log_timing(f"[TIMING] query_fetch_all_tokocrypto: {_elapsed_ms:.0f}ms")
         return result.data or []
     except Exception:
-        return []   # graceful: table may not exist yet
+        return []  # graceful: table may not exist yet
+
+
+def fetch_all_tokocrypto_strict() -> list[dict]:
+    """Fetch Tokocrypto rows without masking storage errors for safety-critical decisions."""
+    _t0 = time.perf_counter()
+    client = get_client()
+    result = client.table(TABLE_TOKOCRYPTO).select("*").order("id").execute()
+    _elapsed_ms = (time.perf_counter() - _t0) * 1000
+    log_timing(f"[TIMING] query_fetch_all_tokocrypto_strict: {_elapsed_ms:.0f}ms")
+    return result.data or []
 
 
 def upsert_tokocrypto(record: dict) -> None:

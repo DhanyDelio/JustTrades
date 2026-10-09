@@ -17,6 +17,7 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
     def setUp(self):
         self.mock_client = MagicMock(spec=TokocryptoClient)
         self.mock_client.normalize_symbol = lambda s: s
+        self.mock_client.get_open_orders.return_value = []
         self.executor = TokocryptoOrderExecutor(
             self.mock_client,
             supervised=False,
@@ -98,11 +99,15 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
         self.assertEqual(payload["time_to_resolution_sec"], expected_ttr)
 
         # PnL calculations
-        self.assertAlmostEqual(payload["realized_pnl_idr"], (1552.0 - 1639.0) * 119.0, places=2)
+        self.assertAlmostEqual(
+            payload["realized_pnl_idr"], (1552.0 - 1639.0) * 119.0, places=2
+        )
 
         # Telegram notification
         mock_tg.assert_called()
-        self.assertTrue(any("SL HIT: DOGE_IDR" in str(arg) for arg in mock_tg.call_args[0]))
+        self.assertTrue(
+            any("SL HIT: DOGE_IDR" in str(arg) for arg in mock_tg.call_args[0])
+        )
 
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
@@ -167,11 +172,15 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
         self.assertIsInstance(payload["exit_time"], int)
         self.assertEqual(payload["exit_time"], 1791335000000)
         self.assertIsInstance(payload["time_to_resolution_sec"], int)
-        self.assertEqual(payload["time_to_resolution_sec"], (1791335000000 - 1791330000000) // 1000)
+        self.assertEqual(
+            payload["time_to_resolution_sec"], (1791335000000 - 1791330000000) // 1000
+        )
 
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
-    def test_fallback_timestamp_when_order_detail_lacks_epoch(self, mock_tg, mock_update):
+    def test_fallback_timestamp_when_order_detail_lacks_epoch(
+        self, mock_tg, mock_update
+    ):
         """
         When raw_exit_detail does not have createTime or time, exit_time must fallback
         to current epoch ms integer (never ISO string).
@@ -193,7 +202,9 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
         raw_tp = {"status": 6, "executedPrice": "0"}
         raw_sl = {"status": 2, "executedPrice": "1552"}  # missing time and createTime
 
-        self.mock_client.get_order_detail.side_effect = lambda sym, oid: raw_tp if str(oid) == "917242376" else raw_sl
+        self.mock_client.get_order_detail.side_effect = lambda sym, oid: (
+            raw_tp if str(oid) == "917242376" else raw_sl
+        )
 
         self.monitor._check_one(trade, verbose=False)
 
@@ -240,7 +251,9 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
             "stopPrice": "44689248",
         }
 
-        self.mock_client.get_order_detail.side_effect = lambda sym, oid: raw_tp if str(oid) == "917549739" else raw_sl
+        self.mock_client.get_order_detail.side_effect = lambda sym, oid: (
+            raw_tp if str(oid) == "917549739" else raw_sl
+        )
         with patch.object(self.executor, "place_oco") as mock_place_oco:
             self.monitor._check_one(trade, verbose=True)
             mock_place_oco.assert_not_called()
@@ -257,10 +270,12 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
 
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
-    def test_monitor_unprotected_calls_place_oco(self, mock_tg, mock_update):
+    def test_legacy_filled_position_without_lifecycle_marker_requires_reconciliation(
+        self, mock_tg, mock_update
+    ):
         """
-        When filled position has NO b_order_list_id and NO leg order ids,
-        it is recognized as unprotected and triggers place_oco.
+        A legacy row without a durable pre-submit marker is ambiguous after restart
+        and must not trigger a potentially duplicate OCO placement.
         """
         trade = {
             "symbol": "SOL_IDR",
@@ -276,9 +291,17 @@ class TestTokocryptoPositionMonitor(unittest.TestCase):
             "exit_status": "OPEN",
         }
 
-        with patch.object(self.executor, "place_oco", return_value={"bOrderListId": "999"}) as mock_place_oco:
+        with patch.object(
+            self.executor, "place_oco", return_value={"bOrderListId": "999"}
+        ) as mock_place_oco:
             self.monitor._check_one(trade, verbose=False)
-            mock_place_oco.assert_called_once_with(trade)
+            mock_place_oco.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args[1].get("oco_state") == "RECONCILIATION_REQUIRED"
+                for call in mock_update.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":
