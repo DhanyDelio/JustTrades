@@ -56,10 +56,10 @@ from urllib.parse import urlencode
 
 import requests
 
-
 # ---------------------------------------------------------------------------
 # Typed domain models
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ExchangeSymbol:
@@ -69,32 +69,33 @@ class ExchangeSymbol:
     All filter fields default to 0.0 / False when not present in the API
     response — callers should check before using.
     """
-    symbol:           str
-    base_asset:       str
-    quote_asset:      str
-    status:           str        # "TRADING" inferred from spotTradingEnable flag
-    tick_size:        float      # price precision (PRICE_FILTER tickSize)
-    step_size:        float      # quantity precision (LOT_SIZE stepSize)
-    min_qty:          float      # LOT_SIZE minQty
-    min_notional:     float      # NOTIONAL minNotional
-    spot_enabled:     bool       # spotTradingEnable == 1
-    oco_enabled:      bool       # ocoEnable == 1
+
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    status: str  # "TRADING" inferred from spotTradingEnable flag
+    tick_size: float  # price precision (PRICE_FILTER tickSize)
+    step_size: float  # quantity precision (LOT_SIZE stepSize)
+    min_qty: float  # LOT_SIZE minQty
+    min_notional: float  # NOTIONAL minNotional
+    spot_enabled: bool  # spotTradingEnable == 1
+    oco_enabled: bool  # ocoEnable == 1
     # Self-Trade Prevention metadata (added 2026-06-05 in API changelog)
     # Values are string names (e.g. "EXPIRE_MAKER"), not integer codes.
     # None means the field was absent in the API response — do NOT assume any default.
     # Future order placement MUST read allowed_stp_modes and pick a valid mode.
-    default_stp_mode:  str | None = None
+    default_stp_mode: str | None = None
     allowed_stp_modes: list[str] = field(default_factory=list)
-    raw:              dict = field(default_factory=dict, repr=False)
+    raw: dict = field(default_factory=dict, repr=False)
 
     # Derived convenience — same shape as FuturesClient / binance_math helpers
     @property
     def constraints(self) -> dict:
         """Return a constraints dict compatible with binance_math helpers."""
         return {
-            "tick_size":    self.tick_size,
-            "step_size":    self.step_size,
-            "min_qty":      self.min_qty,
+            "tick_size": self.tick_size,
+            "step_size": self.step_size,
+            "min_qty": self.min_qty,
             "min_notional": self.min_notional,
         }
 
@@ -102,8 +103,9 @@ class ExchangeSymbol:
 @dataclass
 class ExchangeBalance:
     """Normalized single-asset balance entry."""
-    asset:  str
-    free:   float
+
+    asset: str
+    free: float
     locked: float
 
     @property
@@ -124,12 +126,13 @@ class ExecutionRulesRule:
     Tokocrypto applies these limits at execution time (taker phase), not
     at order submission time. See API docs FAQs for exact semantics.
     """
-    rule_type:           str           # e.g. "PRICE_RANGE"
-    bid_limit_mult_up:   float | None = None  # max price = ref * bidLimitMultUp
+
+    rule_type: str  # e.g. "PRICE_RANGE"
+    bid_limit_mult_up: float | None = None  # max price = ref * bidLimitMultUp
     bid_limit_mult_down: float | None = None  # min price = ref * bidLimitMultDown
-    ask_limit_mult_up:   float | None = None
+    ask_limit_mult_up: float | None = None
     ask_limit_mult_down: float | None = None
-    raw:                 dict = field(default_factory=dict, repr=False)
+    raw: dict = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -146,14 +149,16 @@ class ExecutionRules:
 
     raw: the full symbolRules entry for this symbol, for forward compatibility.
     """
+
     symbol: str
-    rules:  list[ExecutionRulesRule] = field(default_factory=list)
-    raw:    dict = field(default_factory=dict, repr=False)
+    rules: list[ExecutionRulesRule] = field(default_factory=list)
+    raw: dict = field(default_factory=dict, repr=False)
 
 
 # ---------------------------------------------------------------------------
 # Typed error hierarchy
 # ---------------------------------------------------------------------------
+
 
 class TokocryptoError(RuntimeError):
     """Base for all Tokocrypto client errors."""
@@ -176,10 +181,11 @@ class TokocryptoAPIError(TokocryptoError):
         msg     — raw message from exchange
         raw     — full parsed response body
     """
+
     def __init__(self, code: int, msg: str, raw: dict | None = None):
         self.code = code
-        self.msg  = msg
-        self.raw  = raw or {}
+        self.msg = msg
+        self.raw = raw or {}
         super().__init__(f"[Tokocrypto API {code}] {msg}")
 
 
@@ -261,7 +267,7 @@ class TokocryptoClient:
     """
 
     # Primary base URL (type=1 MBX symbols use tokocrypto.site for market data)
-    BASE_URL        = "https://www.tokocrypto.com"
+    BASE_URL = "https://www.tokocrypto.com"
     MARKET_BASE_URL = "https://www.tokocrypto.site"
 
     # Default network timeout (seconds)
@@ -269,9 +275,9 @@ class TokocryptoClient:
 
     def __init__(
         self,
-        api_key:    str | None = None,
+        api_key: str | None = None,
         api_secret: str | None = None,
-        timeout:    int = _TIMEOUT,
+        timeout: int = _TIMEOUT,
     ):
         """
         Construct a TokocryptoClient.
@@ -280,11 +286,13 @@ class TokocryptoClient:
         Do NOT pass literal credential strings in production code; use build().
         """
         # Credentials are stored but never logged or included in repr.
-        self._api_key    = api_key
+        self._api_key = api_key
         self._api_secret = api_secret
-        self._timeout    = timeout
-        self._session    = requests.Session()
-        self._session.headers.update({"Content-Type": "application/x-www-form-urlencoded"})
+        self._timeout = timeout
+        self._session = requests.Session()
+        self._session.headers.update(
+            {"Content-Type": "application/x-www-form-urlencoded"}
+        )
 
     # ------------------------------------------------------------------
     # Factory
@@ -303,7 +311,7 @@ class TokocryptoClient:
         Public endpoints will work; authenticated endpoints will raise
         TokocryptoAuthError.
         """
-        api_key    = os.getenv("TOKOCRYPTO_API_KEY", "").strip() or None
+        api_key = os.getenv("TOKOCRYPTO_API_KEY", "").strip() or None
         api_secret = os.getenv("TOKOCRYPTO_API_SECRET", "").strip() or None
         return cls(api_key=api_key, api_secret=api_secret, timeout=timeout)
 
@@ -401,8 +409,14 @@ class TokocryptoClient:
             )
 
         # Response may be Binance-style ({"price": "..."}) or wrapped
-        price = resp.get("price") or resp.get("lastPrice") or (
-            resp.get("data", {}).get("price") if isinstance(resp.get("data"), dict) else None
+        price = (
+            resp.get("price")
+            or resp.get("lastPrice")
+            or (
+                resp.get("data", {}).get("price")
+                if isinstance(resp.get("data"), dict)
+                else None
+            )
         )
         if price is None:
             raise TokocryptoMalformedResponseError(
@@ -444,8 +458,8 @@ class TokocryptoClient:
             )
 
         return {
-            "bids":         data.get("bids", []),
-            "asks":         data.get("asks", []),
+            "bids": data.get("bids", []),
+            "asks": data.get("asks", []),
             "lastUpdateId": data.get("lastUpdateId"),
         }
 
@@ -547,7 +561,7 @@ class TokocryptoClient:
             )
 
         if ref_price_raw is None:
-            return None   # null reference price → rule not enforced
+            return None  # null reference price → rule not enforced
         return float(ref_price_raw)
 
     # reference price: use get_reference_price() — separate confirmed endpoint on Tokocrypto
@@ -834,8 +848,7 @@ class TokocryptoClient:
             if isinstance(lst, list):
                 return lst
         raise TokocryptoMalformedResponseError(
-            f"{context}: expected list in 'data' or 'data.list', "
-            f"got: {type(data)}"
+            f"{context}: expected list in 'data' or 'data.list', " f"got: {type(data)}"
         )
 
     @staticmethod
@@ -861,6 +874,7 @@ class TokocryptoClient:
         Do NOT default to 1.0 or any other fallback value.
         Do NOT assume semantics identical to Binance PERCENT_PRICE_BY_SIDE.
         """
+
         def _to_float_or_none(val: Any) -> "float | None":
             if val is None:
                 return None
@@ -871,19 +885,21 @@ class TokocryptoClient:
 
         parsed_rules: list[ExecutionRulesRule] = []
         for r in raw.get("rules", []):
-            parsed_rules.append(ExecutionRulesRule(
-                rule_type           = r.get("ruleType", ""),
-                bid_limit_mult_up   = _to_float_or_none(r.get("bidLimitMultUp")),
-                bid_limit_mult_down = _to_float_or_none(r.get("bidLimitMultDown")),
-                ask_limit_mult_up   = _to_float_or_none(r.get("askLimitMultUp")),
-                ask_limit_mult_down = _to_float_or_none(r.get("askLimitMultDown")),
-                raw                 = r,
-            ))
+            parsed_rules.append(
+                ExecutionRulesRule(
+                    rule_type=r.get("ruleType", ""),
+                    bid_limit_mult_up=_to_float_or_none(r.get("bidLimitMultUp")),
+                    bid_limit_mult_down=_to_float_or_none(r.get("bidLimitMultDown")),
+                    ask_limit_mult_up=_to_float_or_none(r.get("askLimitMultUp")),
+                    ask_limit_mult_down=_to_float_or_none(r.get("askLimitMultDown")),
+                    raw=r,
+                )
+            )
 
         return ExecutionRules(
-            symbol = raw.get("symbol", ""),
-            rules  = parsed_rules,
-            raw    = raw,
+            symbol=raw.get("symbol", ""),
+            rules=parsed_rules,
+            raw=raw,
         )
 
     @staticmethod
@@ -900,9 +916,9 @@ class TokocryptoClient:
             NOTIONAL      → minNotional (preferred)
             MIN_NOTIONAL  → minNotional (legacy fallback)
         """
-        tick_size    = 0.0
-        step_size    = 0.0
-        min_qty      = 0.0
+        tick_size = 0.0
+        step_size = 0.0
+        min_qty = 0.0
         min_notional = 0.0
 
         for f in raw.get("filters", []):
@@ -911,33 +927,37 @@ class TokocryptoClient:
                 tick_size = float(f.get("tickSize", 0) or 0)
             elif ft == "LOT_SIZE":
                 step_size = float(f.get("stepSize", 0) or 0)
-                min_qty   = float(f.get("minQty", 0) or 0)
+                min_qty = float(f.get("minQty", 0) or 0)
             elif ft in ("NOTIONAL", "MIN_NOTIONAL"):
                 # NOTIONAL is the current filter; MIN_NOTIONAL is legacy
-                mn = (f.get("minNotional") or f.get("minVal") or 0)
+                mn = f.get("minNotional") or f.get("minVal") or 0
                 min_notional = float(mn) if mn else min_notional
 
         # STP fields are top-level symbol properties, not inside filters (2026-06-05)
-        default_stp_mode      = raw.get("defaultSelfTradePreventionMode")   # str or None
+        default_stp_mode = raw.get("defaultSelfTradePreventionMode")  # str or None
         allowed_stp_modes_raw = raw.get("allowedSelfTradePreventionModes", [])
-        allowed_stp_modes     = list(allowed_stp_modes_raw) if isinstance(allowed_stp_modes_raw, list) else []
+        allowed_stp_modes = (
+            list(allowed_stp_modes_raw)
+            if isinstance(allowed_stp_modes_raw, list)
+            else []
+        )
 
         return ExchangeSymbol(
-            symbol            = raw.get("symbol", ""),
-            base_asset        = raw.get("baseAsset", ""),
-            quote_asset       = raw.get("quoteAsset", ""),
+            symbol=raw.get("symbol", ""),
+            base_asset=raw.get("baseAsset", ""),
+            quote_asset=raw.get("quoteAsset", ""),
             # Tokocrypto doesn't expose a 'status' string directly;
             # spotTradingEnable==1 is the tradeable flag
-            status            = "TRADING" if raw.get("spotTradingEnable") == 1 else "HALTED",
-            tick_size         = tick_size,
-            step_size         = step_size,
-            min_qty           = min_qty,
-            min_notional      = min_notional,
-            spot_enabled      = raw.get("spotTradingEnable") == 1,
-            oco_enabled       = raw.get("ocoEnable") == 1,
-            default_stp_mode  = default_stp_mode,
-            allowed_stp_modes = allowed_stp_modes,
-            raw               = raw,
+            status="TRADING" if raw.get("spotTradingEnable") == 1 else "HALTED",
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            spot_enabled=raw.get("spotTradingEnable") == 1,
+            oco_enabled=raw.get("ocoEnable") == 1,
+            default_stp_mode=default_stp_mode,
+            allowed_stp_modes=allowed_stp_modes,
+            raw=raw,
         )
 
     # ------------------------------------------------------------------
@@ -1025,7 +1045,6 @@ class TokocryptoClient:
     # confirmed working in Stage 2. OCO is Stage 3 at the earliest.
     # ---------------------------------------------------------------------------
 
-
     def _signed_post(self, path: str, params: dict) -> dict:
         """
         Perform a SIGNED POST against BASE_URL.
@@ -1039,7 +1058,7 @@ class TokocryptoClient:
         try:
             r = self._session.post(
                 url,
-                data=signed_params,   # x-www-form-urlencoded body
+                data=signed_params,  # x-www-form-urlencoded body
                 headers={"X-MBX-APIKEY": self._api_key},  # type: ignore[arg-type]
                 timeout=self._timeout,
             )
@@ -1060,10 +1079,13 @@ class TokocryptoClient:
         Raises TokocryptoAPIError (code -2013) if orderId not found.
         Raises TokocryptoMalformedResponseError if 'data' is absent.
         """
-        resp = self._signed_get("/open/v1/orders/detail", {
-            "symbol":  self.normalize_symbol(symbol),
-            "orderId": str(order_id),
-        })
+        resp = self._signed_get(
+            "/open/v1/orders/detail",
+            {
+                "symbol": self.normalize_symbol(symbol),
+                "orderId": str(order_id),
+            },
+        )
         data = resp.get("data")
         if data is None:
             raise TokocryptoMalformedResponseError(
@@ -1071,10 +1093,32 @@ class TokocryptoClient:
             )
         return data
 
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        """
+        Query currently open orders (SIGNED GET /open/v1/orders with type=1).
+        If symbol is provided, filters for that symbol.
+        Returns list of open order dicts.
+
+        Fail-closed:
+        - Raises TokocryptoMalformedResponseError if response envelope or list format is invalid.
+        - Raises TokocryptoMalformedResponseError if items inside the list are not dicts.
+        """
+        params: dict[str, str | int] = {"type": 1}
+        if symbol:
+            params["symbol"] = self.normalize_symbol(symbol)
+        resp = self._signed_get("/open/v1/orders", params)
+        orders = self._extract_data_list(resp, context="get_open_orders")
+        for idx, item in enumerate(orders):
+            if not isinstance(item, dict):
+                raise TokocryptoMalformedResponseError(
+                    f"get_open_orders: expected order dict at index {idx}, got {type(item).__name__}"
+                )
+        return orders
+
 
 # ---------------------------------------------------------------------------
 # Convenience re-exports for callers that only need normalization helpers
 # ---------------------------------------------------------------------------
 
-round_tick  = TokocryptoClient.round_tick   # noqa: E305
-round_step  = TokocryptoClient.round_step
+round_tick = TokocryptoClient.round_tick  # noqa: E305
+round_step = TokocryptoClient.round_step

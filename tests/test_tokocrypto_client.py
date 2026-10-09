@@ -1125,6 +1125,148 @@ class TestHTTP5XXSemantics(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Test: get_open_orders (Fail-Closed & Contract Verification)
+# ---------------------------------------------------------------------------
+
+class TestGetOpenOrders(unittest.TestCase):
+    """Regression tests for get_open_orders: valid envelopes, empty responses, malformed payloads, and API errors."""
+
+    def test_get_open_orders_nested_list_success(self):
+        """Valid nested list format: {"code": 0, "msg": "success", "data": {"list": [...]}}."""
+        client = _make_client()
+        orders_data = [
+            {"orderId": "1001", "symbol": "BTC_USDT", "side": 0, "type": 1, "price": "60000"},
+            {"orderId": "1002", "symbol": "BTC_USDT", "side": 1, "type": 1, "price": "65000"},
+        ]
+        body = {"code": 0, "msg": "success", "data": {"list": orders_data}}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        result = client.get_open_orders("BTC_USDT")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["orderId"], "1001")
+        self.assertEqual(result[1]["orderId"], "1002")
+
+        # Verify parameters passed to GET request
+        call_kwargs = client._session.get.call_args[1]
+        params = call_kwargs["params"]
+        self.assertEqual(params["type"], 1)
+        self.assertEqual(params["symbol"], "BTC_USDT")
+
+    def test_get_open_orders_direct_list_success(self):
+        """Valid direct list format: {"code": 0, "msg": "success", "data": [...]}}."""
+        client = _make_client()
+        orders_data = [
+            {"orderId": "2001", "symbol": "ETH_IDR", "side": 0, "type": 1, "price": "50000000"}
+        ]
+        body = {"code": 0, "msg": "success", "data": orders_data}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        result = client.get_open_orders("eth_idr")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["orderId"], "2001")
+
+        call_kwargs = client._session.get.call_args[1]
+        params = call_kwargs["params"]
+        self.assertEqual(params["symbol"], "ETH_IDR")
+
+    def test_get_open_orders_empty_list_valid(self):
+        """Valid empty response: zero open orders returns empty list []."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success", "data": {"list": []}}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        result = client.get_open_orders()
+        self.assertEqual(result, [])
+
+    def test_get_open_orders_without_symbol_filter(self):
+        """Calling without symbol parameter does not include 'symbol' in params."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success", "data": {"list": []}}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        result = client.get_open_orders()
+        self.assertEqual(result, [])
+        call_kwargs = client._session.get.call_args[1]
+        params = call_kwargs["params"]
+        self.assertNotIn("symbol", params)
+        self.assertEqual(params["type"], 1)
+
+    def test_get_open_orders_missing_data_field_raises_malformed(self):
+        """Missing 'data' field raises TokocryptoMalformedResponseError (fail-closed)."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success"}  # data key missing
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        with self.assertRaises(TokocryptoMalformedResponseError):
+            client.get_open_orders("BTC_USDT")
+
+    def test_get_open_orders_data_none_raises_malformed(self):
+        """'data': None raises TokocryptoMalformedResponseError (fail-closed)."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success", "data": None}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        with self.assertRaises(TokocryptoMalformedResponseError):
+            client.get_open_orders()
+
+    def test_get_open_orders_data_unexpected_type_raises_malformed(self):
+        """'data' as integer, string, or boolean raises TokocryptoMalformedResponseError."""
+        client = _make_client()
+        for invalid_data in [123, "not_a_list", False]:
+            body = {"code": 0, "msg": "success", "data": invalid_data}
+            resp = _make_response(body)
+            client._session.get = MagicMock(return_value=resp)
+
+            with self.assertRaises(TokocryptoMalformedResponseError):
+                client.get_open_orders()
+
+    def test_get_open_orders_nested_list_not_a_list_raises_malformed(self):
+        """'data': {'list': 'string'} raises TokocryptoMalformedResponseError."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success", "data": {"list": "malformed"}}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        with self.assertRaises(TokocryptoMalformedResponseError):
+            client.get_open_orders()
+
+    def test_get_open_orders_list_items_not_dicts_raises_malformed(self):
+        """Items inside the list that are not dicts raise TokocryptoMalformedResponseError."""
+        client = _make_client()
+        body = {"code": 0, "msg": "success", "data": {"list": ["order_id_string", 12345]}}
+        resp = _make_response(body)
+        client._session.get = MagicMock(return_value=resp)
+
+        with self.assertRaises(TokocryptoMalformedResponseError):
+            client.get_open_orders()
+
+    def test_get_open_orders_api_error_code_raises_api_error(self):
+        """API returning code != 0 raises TokocryptoAPIError."""
+        client = _make_client()
+        body = {"code": -1021, "msg": "Timestamp for this request is outside of the recvWindow"}
+        resp = _make_response(body, status=200)
+        client._session.get = MagicMock(return_value=resp)
+
+        with self.assertRaises(TokocryptoAPIError) as ctx:
+            client.get_open_orders()
+        self.assertEqual(ctx.exception.code, -1021)
+
+    def test_get_open_orders_network_error_raises_network_error(self):
+        """Connection timeout raises TokocryptoNetworkError."""
+        client = _make_client()
+        client._session.get = MagicMock(side_effect=requests.exceptions.Timeout("Connection timed out"))
+
+        with self.assertRaises(TokocryptoNetworkError):
+            client.get_open_orders()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
