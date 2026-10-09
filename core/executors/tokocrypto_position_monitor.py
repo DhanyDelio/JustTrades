@@ -90,6 +90,7 @@ class TokocryptoPositionMonitor:
                     pnl = row.get("realized_pnl_idr")
                     pnl_s = f"Rp {pnl:+,.0f}" if pnl is not None else "?"
                     print(f"  {sym}  {exit_s}  {pnl_s}")
+            self._check_and_notify_dust(verbose=verbose)
             return
 
         print(f"[Toko Monitor] Checking {len(open_trades)} open position(s)...")
@@ -99,6 +100,60 @@ class TokocryptoPositionMonitor:
             except Exception as exc:
                 sym = trade.get("symbol", "?")
                 print(f"  ✗ _check_one({sym}): unhandled error: {exc}")
+
+        self._check_and_notify_dust(verbose=verbose)
+
+    def _check_and_notify_dust(self, verbose: bool = False) -> None:
+        """
+        Evaluate wallet dust balances and send throttled Telegram notification.
+        Fail-safe: Never raises or interrupts position monitoring.
+        """
+        try:
+            from core.utils.tokocrypto_dust import (
+                classify_and_aggregate_dust,
+                notify_dust_summary_if_needed,
+            )
+
+            # 1. Fetch balances
+            try:
+                balances = self.client.get_balances()
+            except Exception as exc:
+                if verbose:
+                    print(f"  [Toko Dust] Could not fetch balances: {exc}", flush=True)
+                return
+
+            # 2. Database state (fail closed to None on exception)
+            try:
+                db_trades = fetch_all_tokocrypto_strict()
+            except Exception:
+                db_trades = None
+
+            # 3. Exchange open orders (fail closed to None on exception)
+            try:
+                exchange_orders = self.client.get_open_orders()
+            except Exception:
+                exchange_orders = None
+
+            summary = classify_and_aggregate_dust(
+                balances=balances,
+                client=self.client,
+                open_trades=db_trades,
+                exchange_open_orders=exchange_orders,
+            )
+
+            sent = notify_dust_summary_if_needed(
+                summary=summary,
+                sender_fn=_send_toko_telegram,
+            )
+            if sent and verbose:
+                print(
+                    f"  [Toko Dust] Sent dust notification to Telegram "
+                    f"(Eligible: Rp {summary.total_eligible_dust_idr:,.0f})",
+                    flush=True,
+                )
+        except Exception as exc:
+            if verbose:
+                print(f"  [Toko Dust] Non-fatal check error: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Internal: single trade check

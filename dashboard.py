@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import pandas as pd
@@ -21,12 +22,12 @@ from dashboard_ml_metadata import (
     split_ml_shadow_rows,
 )
 
-
 st.set_page_config(page_title="Swing Trade Dashboard", layout="wide")
 
 import threading
 import asyncio
 import time
+
 # SDK v2.x: create_async_client is exported from top-level supabase package.
 # supabase._async.client exposes create_client (not create_async_client) internally,
 # so always import from the top-level package to avoid ImportError.
@@ -51,6 +52,7 @@ class DashboardState:
         self.pending_rerun_key = None
         self.last_handled_update_key = None
 
+
 @st.cache_data(ttl=10)
 def get_fresh_snapshot() -> dict:
     _t0 = time.perf_counter()
@@ -60,7 +62,9 @@ def get_fresh_snapshot() -> dict:
     futures_rows = fetch_all_futures()
     fetched_at = datetime.now(WIB).isoformat()
     _elapsed_ms = (time.perf_counter() - _t0) * 1000
-    log_timing(f"[TIMING] get_fresh_snapshot: cache-miss complete in {_elapsed_ms:.0f}ms")
+    log_timing(
+        f"[TIMING] get_fresh_snapshot: cache-miss complete in {_elapsed_ms:.0f}ms"
+    )
     return {
         "heartbeat": heartbeat,
         "spot_rows": spot_rows,
@@ -78,7 +82,9 @@ def get_global_state():
     try:
         _t0 = time.perf_counter()
         snapshot = get_fresh_snapshot()
-        log_timing(f"[TIMING] dashboard.get_global_state.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        log_timing(
+            f"[TIMING] dashboard.get_global_state.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+        )
         state.spot_rows = snapshot.get("spot_rows")
         state.futures_rows = snapshot.get("futures_rows")
         state.last_updated = time.time()
@@ -96,10 +102,9 @@ def get_global_state():
                     ts = dt.timestamp()
                     if _best_ts is None or ts > _best_ts:
                         _best_ts = ts
-                        state.last_event_time = (
-                            dt.astimezone(pytz.timezone("Asia/Jakarta"))
-                            .strftime("%H:%M:%S")
-                        )
+                        state.last_event_time = dt.astimezone(
+                            pytz.timezone("Asia/Jakarta")
+                        ).strftime("%H:%M:%S")
                 except Exception:
                     pass
     except Exception:
@@ -108,14 +113,16 @@ def get_global_state():
         pass
     return state
 
+
 @st.cache_resource
 def start_realtime_listener(_state: DashboardState):
     def run_async_loop():
         asyncio.run(realtime_loop(_state))
-    
+
     t = threading.Thread(target=run_async_loop, daemon=True)
     t.start()
     return t
+
 
 def _extract_event_time(record: dict) -> str:
     """Return HH:MM:SS WIB string from updated_at / created_at, or current time."""
@@ -138,6 +145,7 @@ def _watcher_tick_context(counter_key: str) -> str:
 
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
+
         ctx = get_script_run_ctx(suppress_warning=True)
         session_id = ctx.session_id if ctx is not None else "unknown"
     except Exception:
@@ -220,12 +228,14 @@ async def realtime_loop(state: DashboardState):
         record = payload.get("record") or payload.get("new")
         if not record:
             return
-        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
+        event_type = str(
+            payload.get("eventType") or payload.get("type") or "unknown"
+        ).upper()
         with state.lock:
             if state.spot_rows is None:
                 state.spot_rows = []
             state.spot_rows = _upsert_row(state.spot_rows, record)
-            state.last_updated  = time.time()
+            state.last_updated = time.time()
             state.last_event_time = _extract_event_time(record)
         trigger_ui_update(event_type, "trades_spot", record)
 
@@ -233,12 +243,14 @@ async def realtime_loop(state: DashboardState):
         record = payload.get("record") or payload.get("new")
         if not record:
             return
-        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
+        event_type = str(
+            payload.get("eventType") or payload.get("type") or "unknown"
+        ).upper()
         with state.lock:
             if state.futures_rows is None:
                 state.futures_rows = []
             state.futures_rows = _upsert_row(state.futures_rows, record)
-            state.last_updated    = time.time()
+            state.last_updated = time.time()
             state.last_event_time = _extract_event_time(record)
         trigger_ui_update(event_type, "trades_futures", record)
 
@@ -246,7 +258,9 @@ async def realtime_loop(state: DashboardState):
         record = payload.get("record") or payload.get("new")
         if not record:
             return
-        event_type = str(payload.get("eventType") or payload.get("type") or "unknown").upper()
+        event_type = str(
+            payload.get("eventType") or payload.get("type") or "unknown"
+        ).upper()
         with state.lock:
             state.last_updated = time.time()
             state.last_event_time = _extract_event_time(record)
@@ -328,6 +342,7 @@ async def realtime_loop(state: DashboardState):
             state.connected = False
             await asyncio.sleep(RETRY_DELAY)
 
+
 global_state = get_global_state()
 start_realtime_listener(global_state)
 
@@ -366,13 +381,18 @@ def _get_autorefresh_interval_ms(now_wib: datetime, is_vm_down: bool) -> int:
 
 
 STARTING_LAB_CAPITAL = 240.0
-MAX_TOKO_SLOTS = int(os.getenv("TOKO_MAX_POSITIONS", "5"))          # Tokocrypto real-money position limit
-TOKO_INITIAL_DEPOSIT_IDR = float(os.getenv("TOKO_INITIAL_DEPOSIT_IDR", "200000"))  # IDR baseline for growth/drawdown display
+MAX_TOKO_SLOTS = int(
+    os.getenv("TOKO_MAX_POSITIONS", "5")
+)  # Tokocrypto real-money position limit
+TOKO_INITIAL_DEPOSIT_IDR = float(
+    os.getenv("TOKO_INITIAL_DEPOSIT_IDR", "200000")
+)  # IDR baseline for growth/drawdown display
 
 
 # ---------------------------------------------------------------------------
 # SPOT — data loading + helpers
 # ---------------------------------------------------------------------------
+
 
 def _sync_session_state():
     """
@@ -383,6 +403,7 @@ def _sync_session_state():
     if global_state.last_updated > seen_ts:
         st.session_state["_last_seen_update"] = global_state.last_updated
 
+
 _sync_session_state()
 
 
@@ -390,7 +411,9 @@ def load_trade_data() -> pd.DataFrame:
     try:
         _t0 = time.perf_counter()
         snapshot = get_fresh_snapshot()
-        log_timing(f"[TIMING] dashboard.load_trade_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        log_timing(
+            f"[TIMING] dashboard.load_trade_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+        )
         rows = list(snapshot.get("spot_rows") or [])
         with global_state.lock:
             global_state.spot_rows = rows
@@ -404,9 +427,19 @@ def load_trade_data() -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    for col in ["realized_pnl_usd", "realized_pnl_pct", "planned_rr",
-                "entry_price", "entry_fill_price", "sl", "tp1",
-                "entry_qty", "entry_notional", "budget_usd", "ml_score"]:
+    for col in [
+        "realized_pnl_usd",
+        "realized_pnl_pct",
+        "planned_rr",
+        "entry_price",
+        "entry_fill_price",
+        "sl",
+        "tp1",
+        "entry_qty",
+        "entry_notional",
+        "budget_usd",
+        "ml_score",
+    ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -415,33 +448,41 @@ def load_trade_data() -> pd.DataFrame:
     # not a trade outcome and must never enter PnL/win-rate research.
     df["is_resolved"] = status.isin(["TP_HIT", "SL_HIT", "CANCELED"])
     df["is_outcome"] = status.isin(["TP_HIT", "SL_HIT"])
-    df["is_win"]      = df["realized_pnl_usd"].gt(0)
+    df["is_win"] = df["realized_pnl_usd"].gt(0)
 
     def parse_epoch_ms(series):
         values = pd.to_numeric(series, errors="coerce")
         return pd.to_datetime(values, unit="ms", utc=True, errors="coerce")
 
     df["entry_fill_dt"] = parse_epoch_ms(df.get("entry_fill_time"))
-    df["exit_dt"]       = parse_epoch_ms(df.get("exit_time"))
-    df["entry_fill_wib"] = (df["entry_fill_dt"].dt.tz_convert("Asia/Jakarta")
-                            if "entry_fill_dt" in df.columns
-                            else pd.Series(dtype="datetime64[ns, UTC]"))
-    df["entry_hour"]    = (df["entry_fill_wib"].dt.hour
-                           if "entry_fill_wib" in df.columns
-                           else pd.Series(dtype="float64"))
+    df["exit_dt"] = parse_epoch_ms(df.get("exit_time"))
+    df["entry_fill_wib"] = (
+        df["entry_fill_dt"].dt.tz_convert("Asia/Jakarta")
+        if "entry_fill_dt" in df.columns
+        else pd.Series(dtype="datetime64[ns, UTC]")
+    )
+    df["entry_hour"] = (
+        df["entry_fill_wib"].dt.hour
+        if "entry_fill_wib" in df.columns
+        else pd.Series(dtype="float64")
+    )
 
-    df["zone_touches_num"]   = pd.to_numeric(df.get("zone_touches"), errors="coerce")
-    df["zone_strength"]      = df["zone_touches_num"].fillna(0)
+    df["zone_touches_num"] = pd.to_numeric(df.get("zone_touches"), errors="coerce")
+    df["zone_strength"] = df["zone_touches_num"].fillna(0)
     df["zone_strength_label"] = pd.cut(
         df["zone_strength"],
         bins=[-1, 1, 2, 3, float("inf")],
         labels=["1x", "2x", "3x", "4x+"],
-        right=True, include_lowest=True,
+        right=True,
+        include_lowest=True,
     )
 
-    df["cluster_mode"] = df["correlation_cluster_id"].notna().map(
-        {True: "lab", False: "single"}
-    ).fillna("single")
+    df["cluster_mode"] = (
+        df["correlation_cluster_id"]
+        .notna()
+        .map({True: "lab", False: "single"})
+        .fillna("single")
+    )
 
     return df
 
@@ -460,31 +501,39 @@ def build_metrics(df: pd.DataFrame):
         "RECOVERED_SL_HIT",
         "STALE_SETUP_CANCELLED",
     }
-    resolved        = df[df["is_outcome"]].copy()
+    resolved = df[df["is_outcome"]].copy()
     # Apply provenance filter: exclude non-genuine exits (phantom price-guard,
     # emergency closes, manual resolutions) from Effective N.
     if "exit_reason" in resolved.columns:
         resolved = resolved[~resolved["exit_reason"].isin(SPOT_EXCLUDED_EXIT_REASONS)]
-    total_trades    = int(len(df))
+    total_trades = int(len(df))
     resolved_trades = int(len(resolved))
-    win_rate        = round((resolved["is_win"].mean() * 100) if resolved_trades else 0.0, 2)
-    total_realized_pnl = round(float(resolved["realized_pnl_usd"].sum()) if resolved_trades else 0.0, 2)
+    win_rate = round((resolved["is_win"].mean() * 100) if resolved_trades else 0.0, 2)
+    total_realized_pnl = round(
+        float(resolved["realized_pnl_usd"].sum()) if resolved_trades else 0.0, 2
+    )
 
     cluster_mask = df["correlation_cluster_id"].notna()
-    cluster_pnl  = float(df.loc[cluster_mask & df["is_outcome"], "realized_pnl_usd"].sum()) if cluster_mask.any() else 0.0
-    lab_capital  = STARTING_LAB_CAPITAL + cluster_pnl
+    cluster_pnl = (
+        float(df.loc[cluster_mask & df["is_outcome"], "realized_pnl_usd"].sum())
+        if cluster_mask.any()
+        else 0.0
+    )
+    lab_capital = STARTING_LAB_CAPITAL + cluster_pnl
 
-    cluster_ids  = resolved["correlation_cluster_id"].dropna().unique()
-    effective_n  = len(cluster_ids) + int((resolved["correlation_cluster_id"].isna()).sum())
+    cluster_ids = resolved["correlation_cluster_id"].dropna().unique()
+    effective_n = len(cluster_ids) + int(
+        (resolved["correlation_cluster_id"].isna()).sum()
+    )
 
     return {
-        "total_trades":        total_trades,
-        "resolved_trades":     resolved_trades,
-        "win_rate":            win_rate,
-        "total_realized_pnl":  total_realized_pnl,
-        "lab_capital":         round(lab_capital, 2),
-        "effective_n":         effective_n,
-        "raw_trade_count":     total_trades,
+        "total_trades": total_trades,
+        "resolved_trades": resolved_trades,
+        "win_rate": win_rate,
+        "total_realized_pnl": total_realized_pnl,
+        "lab_capital": round(lab_capital, 2),
+        "effective_n": effective_n,
+        "raw_trade_count": total_trades,
     }
 
 
@@ -508,8 +557,16 @@ def build_equity_curve(df: pd.DataFrame):
 
     chart_df = pd.concat(data, ignore_index=True)
     fig = px.line(
-        chart_df, x="exit_dt", y="cumulative_pnl", color="mode", markers=True,
-        labels={"exit_dt": "Exit time", "cumulative_pnl": "Cumulative PnL ($)", "mode": "Mode"},
+        chart_df,
+        x="exit_dt",
+        y="cumulative_pnl",
+        color="mode",
+        markers=True,
+        labels={
+            "exit_dt": "Exit time",
+            "cumulative_pnl": "Cumulative PnL ($)",
+            "mode": "Mode",
+        },
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -520,17 +577,27 @@ def build_symbol_pnl(df: pd.DataFrame):
     if resolved.empty:
         return None
 
-    summary = (
-        resolved.groupby("symbol", as_index=False)
-        .agg(realized_pnl_usd=("realized_pnl_usd", "sum"), win=("is_win", "mean"))
+    summary = resolved.groupby("symbol", as_index=False).agg(
+        realized_pnl_usd=("realized_pnl_usd", "sum"), win=("is_win", "mean")
     )
     summary["win_label"] = summary["win"].ge(0.5)
     fig = px.bar(
-        summary, x="symbol", y="realized_pnl_usd", color="win_label",
+        summary,
+        x="symbol",
+        y="realized_pnl_usd",
+        color="win_label",
         color_discrete_map={True: "#2ca02c", False: "#d62728"},
-        labels={"symbol": "Symbol", "realized_pnl_usd": "Realized PnL ($)", "win_label": "Win"},
+        labels={
+            "symbol": "Symbol",
+            "realized_pnl_usd": "Realized PnL ($)",
+            "win_label": "Win",
+        },
     )
-    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), xaxis_tickangle=-30)
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis_tickangle=-30,
+    )
     return fig
 
 
@@ -541,16 +608,22 @@ def build_hourly_charts(df: pd.DataFrame):
 
     hourly = (
         resolved.groupby("entry_hour", as_index=False)
-        .agg(win_rate=("is_win", "mean"), avg_realized_pnl_pct=("realized_pnl_pct", "mean"),
-             trades=("symbol", "count"))
+        .agg(
+            win_rate=("is_win", "mean"),
+            avg_realized_pnl_pct=("realized_pnl_pct", "mean"),
+            trades=("symbol", "count"),
+        )
         .sort_values("entry_hour")
     )
-    hourly["entry_hour"]   = hourly["entry_hour"].fillna(-1).astype(int)
+    hourly["entry_hour"] = hourly["entry_hour"].fillna(-1).astype(int)
     hourly["win_rate_pct"] = hourly["win_rate"] * 100
-    hourly["count_label"]  = hourly["trades"].apply(lambda n: f"{n}t")
+    hourly["count_label"] = hourly["trades"].apply(lambda n: f"{n}t")
 
     win_fig = px.bar(
-        hourly, x="entry_hour", y="win_rate_pct", text="count_label",
+        hourly,
+        x="entry_hour",
+        y="win_rate_pct",
+        text="count_label",
         labels={"entry_hour": "Hour (WIB/UTC+7)", "win_rate_pct": "Win rate (%)"},
         hover_data={"trades": True, "win_rate_pct": ":.1f"},
     )
@@ -559,8 +632,14 @@ def build_hourly_charts(df: pd.DataFrame):
     win_fig.update_yaxes(range=[0, 110])
 
     pnl_fig = px.bar(
-        hourly, x="entry_hour", y="avg_realized_pnl_pct", text="count_label",
-        labels={"entry_hour": "Hour (WIB/UTC+7)", "avg_realized_pnl_pct": "Avg PnL (%)"},
+        hourly,
+        x="entry_hour",
+        y="avg_realized_pnl_pct",
+        text="count_label",
+        labels={
+            "entry_hour": "Hour (WIB/UTC+7)",
+            "avg_realized_pnl_pct": "Avg PnL (%)",
+        },
         hover_data={"trades": True},
     )
     pnl_fig.update_traces(textposition="outside")
@@ -574,10 +653,17 @@ def build_rr_scatter(df: pd.DataFrame):
         return None
 
     fig = px.scatter(
-        resolved, x="planned_rr", y="realized_pnl_pct", color="is_win",
+        resolved,
+        x="planned_rr",
+        y="realized_pnl_pct",
+        color="is_win",
         color_discrete_map={True: "#2ca02c", False: "#d62728"},
         hover_name="symbol",
-        labels={"planned_rr": "Planned R:R", "realized_pnl_pct": "Realized PnL (%)", "is_win": "Win"},
+        labels={
+            "planned_rr": "Planned R:R",
+            "realized_pnl_pct": "Realized PnL (%)",
+            "is_win": "Win",
+        },
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -595,7 +681,9 @@ def build_zone_strength(df: pd.DataFrame):
     )
     summary["win_rate_pct"] = summary["win_rate"] * 100
     fig = px.bar(
-        summary, x="zone_strength_label", y="win_rate_pct",
+        summary,
+        x="zone_strength_label",
+        y="win_rate_pct",
         labels={"zone_strength_label": "Zone touches", "win_rate_pct": "Win rate (%)"},
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
@@ -605,17 +693,23 @@ def build_zone_strength(df: pd.DataFrame):
 
 def build_cluster_breakdown(df: pd.DataFrame):
     if df.empty:
-        return pd.DataFrame(columns=["cluster_id", "trades", "resolved", "aggregate_pnl_usd"])
+        return pd.DataFrame(
+            columns=["cluster_id", "trades", "resolved", "aggregate_pnl_usd"]
+        )
 
     summary = []
     for cluster_id, group in df.groupby(df["correlation_cluster_id"].fillna("single")):
         resolved_group = group[group["is_resolved"]]
-        summary.append({
-            "cluster_id":        cluster_id,
-            "trades":            int(len(group)),
-            "resolved":          int(len(resolved_group)),
-            "aggregate_pnl_usd": round(float(resolved_group["realized_pnl_usd"].sum()), 2),
-        })
+        summary.append(
+            {
+                "cluster_id": cluster_id,
+                "trades": int(len(group)),
+                "resolved": int(len(resolved_group)),
+                "aggregate_pnl_usd": round(
+                    float(resolved_group["realized_pnl_usd"].sum()), 2
+                ),
+            }
+        )
     return pd.DataFrame(summary).sort_values("aggregate_pnl_usd", ascending=False)
 
 
@@ -623,12 +717,15 @@ def build_cluster_breakdown(df: pd.DataFrame):
 # FUTURES — data loading + helpers
 # ---------------------------------------------------------------------------
 
+
 def load_futures_data() -> pd.DataFrame:
     """Load futures trades from Supabase (trades_futures table). Returns empty DataFrame on error."""
     try:
         _t0 = time.perf_counter()
         snapshot = get_fresh_snapshot()
-        log_timing(f"[TIMING] dashboard.load_futures_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        log_timing(
+            f"[TIMING] dashboard.load_futures_data.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+        )
         rows = list(snapshot.get("futures_rows") or [])
         with global_state.lock:
             global_state.futures_rows = rows
@@ -642,16 +739,33 @@ def load_futures_data() -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    for col in ["realized_pnl_usd", "realized_pnl_pct", "planned_rr",
-                "entry_price", "entry_fill_price", "sl", "tp1",
-                "entry_qty", "entry_notional", "margin_used",
-                "leverage", "liquidation_price",
-                "distance_to_liquidation_pct", "funding_rate_paid"]:
+    for col in [
+        "realized_pnl_usd",
+        "realized_pnl_pct",
+        "planned_rr",
+        "entry_price",
+        "entry_fill_price",
+        "sl",
+        "tp1",
+        "entry_qty",
+        "entry_notional",
+        "margin_used",
+        "leverage",
+        "liquidation_price",
+        "distance_to_liquidation_pct",
+        "funding_rate_paid",
+    ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["is_resolved"] = df["exit_status"].fillna("").astype(str).str.upper().isin(["TP_HIT", "SL_HIT", "CANCELED"])
-    df["is_win"]      = df["realized_pnl_usd"].gt(0)
+    df["is_resolved"] = (
+        df["exit_status"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .isin(["TP_HIT", "SL_HIT", "CANCELED"])
+    )
+    df["is_win"] = df["realized_pnl_usd"].gt(0)
 
     def parse_epoch_ms(series):
         values = pd.to_numeric(series, errors="coerce")
@@ -679,30 +793,43 @@ def build_futures_side_stats(df: pd.DataFrame) -> list[dict]:
         return []
 
     groups = resolved.groupby(
-        [resolved["rule_version"].fillna("unknown"),
-         resolved["position_side"].fillna("UNKNOWN")]
+        [
+            resolved["rule_version"].fillna("unknown"),
+            resolved["position_side"].fillna("UNKNOWN"),
+        ]
     )
 
     results = []
     for (version, ps), group in groups:
-        n        = len(group)
-        wins     = group[group["exit_status"].str.upper() == "TP_HIT"]
-        losses   = group[group["exit_status"].str.upper() == "SL_HIT"]
+        n = len(group)
+        wins = group[group["exit_status"].str.upper() == "TP_HIT"]
+        losses = group[group["exit_status"].str.upper() == "SL_HIT"]
         win_rate = len(wins) / n if n > 0 else 0.0
 
-        avg_rr      = group["planned_rr"].mean() if n > 0 else 0.0
+        avg_rr = group["planned_rr"].mean() if n > 0 else 0.0
         be_win_rate = 1 / (1 + avg_rr) if avg_rr > 0 else 0.5
-        avg_win_pct  = float(wins["realized_pnl_pct"].mean())  if len(wins)   else 0.0
+        avg_win_pct = float(wins["realized_pnl_pct"].mean()) if len(wins) else 0.0
         avg_loss_pct = float(losses["realized_pnl_pct"].mean()) if len(losses) else 0.0
-        avg_fee_pct  = float(
-            (group["fee_usd_roundtrip"].fillna(0) /
-             group["entry_notional"].fillna(1).clip(lower=0.001) * 100).mean()
-        ) if n > 0 else 0.0
-        expectancy  = (win_rate * avg_win_pct) - ((1 - win_rate) * abs(avg_loss_pct)) - avg_fee_pct
+        avg_fee_pct = (
+            float(
+                (
+                    group["fee_usd_roundtrip"].fillna(0)
+                    / group["entry_notional"].fillna(1).clip(lower=0.001)
+                    * 100
+                ).mean()
+            )
+            if n > 0
+            else 0.0
+        )
+        expectancy = (
+            (win_rate * avg_win_pct)
+            - ((1 - win_rate) * abs(avg_loss_pct))
+            - avg_fee_pct
+        )
 
         if n >= 2:
             p0 = be_win_rate
-            z  = (win_rate - p0) / math.sqrt(p0 * (1 - p0) / n)
+            z = (win_rate - p0) / math.sqrt(p0 * (1 - p0) / n)
             if abs(z) >= 1.96:
                 sig = "✅ p<0.05"
             elif abs(z) >= 1.645:
@@ -713,34 +840,40 @@ def build_futures_side_stats(df: pd.DataFrame) -> list[dict]:
             z, sig = 0.0, "⚠ n/a"
 
         # Cluster-based effective-n: same logic as spot cmd_stats
-        cluster_col = group.get("correlation_cluster_id") if "correlation_cluster_id" in group.columns else None
+        cluster_col = (
+            group.get("correlation_cluster_id")
+            if "correlation_cluster_id" in group.columns
+            else None
+        )
         if cluster_col is not None:
             cluster_ids = set(cluster_col.dropna().unique())
-            n_clusters  = len(cluster_ids)
-            n_singles   = int((cluster_col.isna()).sum())
+            n_clusters = len(cluster_ids)
+            n_singles = int((cluster_col.isna()).sum())
         else:
             n_clusters = 0
-            n_singles  = n
+            n_singles = n
         effective_n = n_clusters + n_singles
 
-        results.append({
-            "rule_version":  version,
-            "side":          ps,
-            "n":             n,
-            "wins":          len(wins),
-            "losses":        len(losses),
-            "win_rate":      round(win_rate * 100, 1),
-            "be_win_rate":   round(be_win_rate * 100, 1),
-            "avg_rr":        round(avg_rr, 2),
-            "avg_win_pct":   round(avg_win_pct, 2),
-            "avg_loss_pct":  round(avg_loss_pct, 2),
-            "expectancy":    round(expectancy, 3),
-            "z_score":       round(z, 2),
-            "significance":  sig,
-            "effective_n":   effective_n,
-            "n_clusters":    n_clusters,
-            "n_singles":     n_singles,
-        })
+        results.append(
+            {
+                "rule_version": version,
+                "side": ps,
+                "n": n,
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": round(win_rate * 100, 1),
+                "be_win_rate": round(be_win_rate * 100, 1),
+                "avg_rr": round(avg_rr, 2),
+                "avg_win_pct": round(avg_win_pct, 2),
+                "avg_loss_pct": round(avg_loss_pct, 2),
+                "expectancy": round(expectancy, 3),
+                "z_score": round(z, 2),
+                "significance": sig,
+                "effective_n": effective_n,
+                "n_clusters": n_clusters,
+                "n_singles": n_singles,
+            }
+        )
 
     return results
 
@@ -766,7 +899,11 @@ def build_futures_equity(df: pd.DataFrame):
 
     chart_df = pd.concat(data, ignore_index=True)
     fig = px.line(
-        chart_df, x="exit_dt", y="cumulative_pnl", color="Side", markers=True,
+        chart_df,
+        x="exit_dt",
+        y="cumulative_pnl",
+        color="Side",
+        markers=True,
         labels={"exit_dt": "Exit time", "cumulative_pnl": "Cumulative PnL ($)"},
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
@@ -779,18 +916,30 @@ def build_futures_symbol_pnl(df: pd.DataFrame):
     if resolved.empty:
         return None
 
-    resolved["sym_side"] = resolved["symbol"] + " " + resolved["position_side"].fillna("")
-    summary = (
-        resolved.groupby("sym_side", as_index=False)
-        .agg(realized_pnl_usd=("realized_pnl_usd", "sum"), win=("is_win", "mean"))
+    resolved["sym_side"] = (
+        resolved["symbol"] + " " + resolved["position_side"].fillna("")
+    )
+    summary = resolved.groupby("sym_side", as_index=False).agg(
+        realized_pnl_usd=("realized_pnl_usd", "sum"), win=("is_win", "mean")
     )
     summary["win_label"] = summary["win"].ge(0.5)
     fig = px.bar(
-        summary, x="sym_side", y="realized_pnl_usd", color="win_label",
+        summary,
+        x="sym_side",
+        y="realized_pnl_usd",
+        color="win_label",
         color_discrete_map={True: "#2ca02c", False: "#d62728"},
-        labels={"sym_side": "Symbol (side)", "realized_pnl_usd": "Realized PnL ($)", "win_label": "Win"},
+        labels={
+            "sym_side": "Symbol (side)",
+            "realized_pnl_usd": "Realized PnL ($)",
+            "win_label": "Win",
+        },
     )
-    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), xaxis_tickangle=-30)
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis_tickangle=-30,
+    )
     return fig
 
 
@@ -801,13 +950,19 @@ def build_futures_rr_scatter(df: pd.DataFrame):
         return None
 
     fig = px.scatter(
-        resolved, x="planned_rr", y="realized_pnl_pct",
+        resolved,
+        x="planned_rr",
+        y="realized_pnl_pct",
         color="position_side",
         symbol="is_win",
         symbol_map={True: "circle", False: "x"},
         hover_name="symbol",
-        labels={"planned_rr": "Planned R:R", "realized_pnl_pct": "Realized PnL (%)",
-                "position_side": "Side", "is_win": "Win"},
+        labels={
+            "planned_rr": "Planned R:R",
+            "realized_pnl_pct": "Realized PnL (%)",
+            "position_side": "Side",
+            "is_win": "Win",
+        },
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -826,13 +981,19 @@ def render_futures_side_stats(side_stats: list[dict]) -> None:
             expanded=True,
         ):
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Win rate",       f"{s['win_rate']:.1f}%",
-                      delta=f"B/E {s['be_win_rate']:.1f}%")
-            c2.metric("Avg R:R",        f"{s['avg_rr']:.2f}:1")
-            c3.metric("Expectancy",     f"{s['expectancy']:+.3f}%")
-            c4.metric("Z-score",        f"{s['z_score']:+.2f}")
-            c5.metric("Effective N",    s["effective_n"],
-                      delta=f"raw {s['n']}" if s["effective_n"] != s["n"] else None)
+            c1.metric(
+                "Win rate",
+                f"{s['win_rate']:.1f}%",
+                delta=f"B/E {s['be_win_rate']:.1f}%",
+            )
+            c2.metric("Avg R:R", f"{s['avg_rr']:.2f}:1")
+            c3.metric("Expectancy", f"{s['expectancy']:+.3f}%")
+            c4.metric("Z-score", f"{s['z_score']:+.2f}")
+            c5.metric(
+                "Effective N",
+                s["effective_n"],
+                delta=f"raw {s['n']}" if s["effective_n"] != s["n"] else None,
+            )
             if s["n"] < 30:
                 st.caption(f"⚠ Only {s['n']} trades — z-score unreliable until n ≥ 30")
             # Cluster breakdown line — matches spot dashboard style
@@ -853,6 +1014,7 @@ def render_futures_side_stats(side_stats: list[dict]) -> None:
 # OPEN POSITIONS — helpers
 # ---------------------------------------------------------------------------
 
+
 def _fmt_price(val) -> str:
     """Format a price value for display — handles None and low-price assets gracefully.
 
@@ -869,6 +1031,7 @@ def _fmt_price(val) -> str:
     if v == 0:
         return "0"
     import math
+
     abs_v = abs(v)
     if abs_v >= 1000:
         decimals = 2
@@ -924,11 +1087,16 @@ def _req_get(url: str, params: dict | None = None, timeout: int = 8):
     try:
         return _req.get(url, params=params, timeout=timeout, headers=headers)
     except Exception as e:
-        if "SSL" in str(e) or "certificate" in str(e).lower() or "CERTIFICATE" in str(e):
+        if (
+            "SSL" in str(e)
+            or "certificate" in str(e).lower()
+            or "CERTIFICATE" in str(e)
+        ):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                return _req.get(url, params=params, timeout=timeout,
-                                headers=headers, verify=False)
+                return _req.get(
+                    url, params=params, timeout=timeout, headers=headers, verify=False
+                )
         raise
 
 
@@ -952,6 +1120,7 @@ def _fetch_spot_prices(symbols: list[str]) -> dict[str, float]:
     # on some networks. No API key needed for ticker data.
     try:
         from binance.client import Client as _Client
+
         _mainnet = _Client("", "")  # no auth needed for public ticker endpoint
         tickers = _mainnet.get_all_tickers()
         for item in tickers:
@@ -966,10 +1135,11 @@ def _fetch_spot_prices(symbols: list[str]) -> dict[str, float]:
     missing = sym_set - prices.keys()
     if missing:
         try:
-            api_key    = os.getenv("BINANCE_TESTNET_API_KEY", "")
+            api_key = os.getenv("BINANCE_TESTNET_API_KEY", "")
             api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
             if api_key and api_secret:
                 from binance.client import Client as _Client
+
                 _c = _Client(api_key, api_secret, testnet=True)
                 tickers = _c.get_all_tickers()
                 for item in tickers:
@@ -1010,11 +1180,12 @@ def _fetch_futures_prices(symbols: list[str]) -> dict[str, float]:
 
     # ── Primary: Binance Futures Testnet ───────────────────────────────
     try:
-        api_key    = os.getenv("BINANCE_FUTURES_TESTNET_API_KEY", "")
+        api_key = os.getenv("BINANCE_FUTURES_TESTNET_API_KEY", "")
         api_secret = os.getenv("BINANCE_FUTURES_TESTNET_API_SECRET", "")
         if api_key and api_secret:
             from binance.client import Client as _Client
             import requests as _rq
+
             _c = _Client(api_key, api_secret, testnet=True)
             _c.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
             tickers = _c.futures_symbol_ticker()
@@ -1036,13 +1207,13 @@ def _fetch_futures_prices(symbols: list[str]) -> dict[str, float]:
 def _status_badge(status: str) -> str:
     """Return an emoji badge for entry/exit status."""
     return {
-        "NEW":              "🕐 NEW",
+        "NEW": "🕐 NEW",
         "PARTIALLY_FILLED": "🔄 PARTIAL",
-        "FILLED":           "✅ FILLED",
-        "CANCELED":         "⚪️ CANCELED",
-        "OPEN":             "🟢 OPEN",
-        "TP_HIT":           "🟢 TP HIT",
-        "SL_HIT":           "🔴 SL HIT",
+        "FILLED": "✅ FILLED",
+        "CANCELED": "⚪️ CANCELED",
+        "OPEN": "🟢 OPEN",
+        "TP_HIT": "🟢 TP HIT",
+        "SL_HIT": "🔴 SL HIT",
     }.get(str(status).upper(), str(status))
 
 
@@ -1051,30 +1222,30 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     Render a single open spot position as a visual card.
     All original data preserved — layout redesigned for readability.
     """
-    sym          = trade.get("symbol", "?")
-    direction    = str(trade.get("direction", "long")).upper()
+    sym = trade.get("symbol", "?")
+    direction = str(trade.get("direction", "long")).upper()
     entry_status = str(trade.get("entry_status", "NEW")).upper()
-    entry_price  = trade.get("entry_price")
-    fill_price   = trade.get("entry_fill_price")
-    sl           = trade.get("sl")
-    tp1          = trade.get("tp1")
-    qty          = trade.get("entry_qty") or 0
-    oco_placed   = trade.get("oco_placed", False)
-    oco_list_id  = trade.get("oco_list_id")
-    rr           = trade.get("planned_rr")
-    risk_pct     = trade.get("risk_pct")
-    cluster_id   = trade.get("correlation_cluster_id")
-    open_time    = trade.get("open_time", "")
-    slip_pct     = trade.get("slippage_pct")
-    notional     = trade.get("entry_notional")
+    entry_price = trade.get("entry_price")
+    fill_price = trade.get("entry_fill_price")
+    sl = trade.get("sl")
+    tp1 = trade.get("tp1")
+    qty = trade.get("entry_qty") or 0
+    oco_placed = trade.get("oco_placed", False)
+    oco_list_id = trade.get("oco_list_id")
+    rr = trade.get("planned_rr")
+    risk_pct = trade.get("risk_pct")
+    cluster_id = trade.get("correlation_cluster_id")
+    open_time = trade.get("open_time", "")
+    slip_pct = trade.get("slippage_pct")
+    notional = trade.get("entry_notional")
 
     ref_price = fill_price or entry_price
 
     # ── Derived ───────────────────────────────────────────────────────
-    unreal_pnl:   float | None = None
-    pct_to_fill:  float | None = None
-    pct_to_sl:    float | None = None
-    pct_to_tp:    float | None = None
+    unreal_pnl: float | None = None
+    pct_to_fill: float | None = None
+    pct_to_sl: float | None = None
+    pct_to_tp: float | None = None
 
     if current_price and current_price > 0:
         if entry_status == "FILLED" and ref_price and qty:
@@ -1094,11 +1265,17 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
         except Exception:
             ot_str = str(open_time)
 
-    is_filled    = entry_status == "FILLED"
-    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
-    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
-    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
-    oco_ok       = oco_placed and oco_list_id
+    is_filled = entry_status == "FILLED"
+    is_pending = entry_status in ("NEW", "PARTIALLY_FILLED")
+    status_color = {
+        "FILLED": "#2ca02c",
+        "NEW": "#ff7f0e",
+        "PARTIALLY_FILLED": "#1f77b4",
+    }.get(entry_status, "#888")
+    status_icon = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(
+        entry_status, "❓"
+    )
+    oco_ok = oco_placed and oco_list_id
     recon_status = trade.get("oco_reconciliation_status", "")
 
     # ── OCO badge: exchange-authoritative protection state ─────────────────────
@@ -1112,32 +1289,46 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
     #   ✅ OCO ✓ (legacy oco_ok)   — oco_placed=True + oco_list_id present
     #   ⚠ NO OCO                 — filled but no protection at all
     if recon_status == "UNPROTECTED_SL_BREACH":
-        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🚨 SL BREACH UNPROTECTED</span>")
+        oco_badge = (
+            f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🚨 SL BREACH UNPROTECTED</span>"
+        )
     elif recon_status == "UNPROTECTED_TP_BREACH":
-        oco_badge = (f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🚨 TP BREACH UNPROTECTED</span>")
+        oco_badge = (
+            f"<span style='background:#8b0000;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🚨 TP BREACH UNPROTECTED</span>"
+        )
     elif recon_status in ("UNPROTECTED", "RECONCILIATION_REQUIRED"):
-        oco_badge = (f"<span style='background:#cc4400;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🚨 OCO MISSING</span>")
+        oco_badge = (
+            f"<span style='background:#cc4400;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🚨 OCO MISSING</span>"
+        )
     elif recon_status == "TP_ONLY":
-        oco_badge = (f"<span style='background:#8a6800;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🟡 TP ONLY</span>")
+        oco_badge = (
+            f"<span style='background:#8a6800;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🟡 TP ONLY</span>"
+        )
     elif recon_status == "SL_ONLY":
-        oco_badge = (f"<span style='background:#a04000;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
-                     f"🟠 SL ONLY</span>")
+        oco_badge = (
+            f"<span style='background:#a04000;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🟠 SL ONLY</span>"
+        )
     elif recon_status == "FULLY_PROTECTED" or oco_ok:
-        oco_badge = (f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>")
+        oco_badge = (
+            f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em'>OCO ✓</span>"
+        )
     elif is_filled:
         # Filled but no recon_status and no oco_placed — genuinely no protection
-        oco_badge = (f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
-                     f"padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>")
+        oco_badge = (
+            f"<span style='background:#7a1a1a;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>⚠ NO OCO</span>"
+        )
     else:
         oco_badge = ""
 
@@ -1146,14 +1337,17 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
         f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
         f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
         f"⏳ PENDING FILL</span>"
-        if entry_status == "NEW" else
-        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
-        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
-        f"🔄 PARTIAL FILL</span>"
-        if entry_status == "PARTIALLY_FILLED" else ""
+        if entry_status == "NEW"
+        else (
+            f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+            f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+            f"🔄 PARTIAL FILL</span>"
+            if entry_status == "PARTIALLY_FILLED"
+            else ""
+        )
     )
 
-    pnl_color    = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
+    pnl_color = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
 
     with st.container(border=True):
         # ── Header row ────────────────────────────────────────────────
@@ -1183,7 +1377,9 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
 
         # ── Status + PnL banner ───────────────────────────────────────
         if is_filled and unreal_pnl is not None:
-            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            pnl_bg = (
+                "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            )
             st.markdown(
                 f"<div style='display:flex;justify-content:space-between;align-items:center;"
                 f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
@@ -1241,7 +1437,7 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             )
         with pc3:
             notional_str = f"${float(notional):.2f}" if notional else "—"
-            qty_str      = f"{float(qty):.4f}" if qty else "—"
+            qty_str = f"{float(qty):.4f}" if qty else "—"
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
                 f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
@@ -1278,7 +1474,7 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
                 unsafe_allow_html=True,
             )
         with sc3:
-            rr_val   = f"{float(rr):.2f}:1"   if rr       else "—"
+            rr_val = f"{float(rr):.2f}:1" if rr else "—"
             risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
@@ -1309,36 +1505,36 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
     Render a single open futures position as a visual card.
     All original data preserved — layout redesigned for readability.
     """
-    sym          = trade.get("symbol", "?")
-    side         = str(trade.get("position_side", "LONG")).upper()
+    sym = trade.get("symbol", "?")
+    side = str(trade.get("position_side", "LONG")).upper()
     entry_status = str(trade.get("entry_status", "NEW")).upper()
-    entry_price  = trade.get("entry_price")
-    fill_price   = trade.get("entry_fill_price")
-    sl           = trade.get("sl")
-    tp1          = trade.get("tp1")
-    qty          = trade.get("entry_qty") or 0
-    liq_price    = trade.get("liquidation_price")
-    liq_dist     = trade.get("distance_to_liquidation_pct")
-    leverage     = trade.get("leverage")
-    margin_mode  = trade.get("margin_mode", "isolated")
+    entry_price = trade.get("entry_price")
+    fill_price = trade.get("entry_fill_price")
+    sl = trade.get("sl")
+    tp1 = trade.get("tp1")
+    qty = trade.get("entry_qty") or 0
+    liq_price = trade.get("liquidation_price")
+    liq_dist = trade.get("distance_to_liquidation_pct")
+    leverage = trade.get("leverage")
+    margin_mode = trade.get("margin_mode", "isolated")
     funding_paid = trade.get("funding_rate_paid") or 0.0
-    vol_regime   = trade.get("volatility_regime_at_entry", "unknown")
-    rr           = trade.get("planned_rr")
-    risk_pct     = trade.get("risk_pct")
-    cluster_id   = trade.get("correlation_cluster_id")
-    open_time    = trade.get("open_time", "")
-    slip_pct     = trade.get("slippage_pct")
-    notional     = trade.get("entry_notional")
-    margin_used  = trade.get("margin_used")
+    vol_regime = trade.get("volatility_regime_at_entry", "unknown")
+    rr = trade.get("planned_rr")
+    risk_pct = trade.get("risk_pct")
+    cluster_id = trade.get("correlation_cluster_id")
+    open_time = trade.get("open_time", "")
+    slip_pct = trade.get("slippage_pct")
+    notional = trade.get("entry_notional")
+    margin_used = trade.get("margin_used")
 
     ref_price = fill_price or entry_price
 
     # ── Derived ───────────────────────────────────────────────────────
-    unreal_pnl:  float | None = None
+    unreal_pnl: float | None = None
     pct_to_fill: float | None = None
-    pct_to_sl:   float | None = None
-    pct_to_tp:   float | None = None
-    pct_to_liq:  float | None = None
+    pct_to_sl: float | None = None
+    pct_to_tp: float | None = None
+    pct_to_liq: float | None = None
 
     if current_price and current_price > 0:
         mult = 1 if side == "LONG" else -1
@@ -1360,30 +1556,41 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
         except Exception:
             ot_str = str(open_time)
 
-    is_filled    = entry_status == "FILLED"
-    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
-    is_long      = side == "LONG"
-    side_color   = "#1f77b4" if is_long else "#d62728"
-    side_bg      = "rgba(31,119,180,0.10)" if is_long else "rgba(214,39,40,0.10)"
-    side_icon    = "📈" if is_long else "📉"
-    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
-    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
-    pnl_color    = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
-    lev_str      = f"{int(float(leverage))}x" if leverage else "?"
-    regime_icon  = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(str(vol_regime).lower(), "⚪")
+    is_filled = entry_status == "FILLED"
+    is_pending = entry_status in ("NEW", "PARTIALLY_FILLED")
+    is_long = side == "LONG"
+    side_color = "#1f77b4" if is_long else "#d62728"
+    side_bg = "rgba(31,119,180,0.10)" if is_long else "rgba(214,39,40,0.10)"
+    side_icon = "📈" if is_long else "📉"
+    status_color = {
+        "FILLED": "#2ca02c",
+        "NEW": "#ff7f0e",
+        "PARTIALLY_FILLED": "#1f77b4",
+    }.get(entry_status, "#888")
+    status_icon = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(
+        entry_status, "❓"
+    )
+    pnl_color = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
+    lev_str = f"{int(float(leverage))}x" if leverage else "?"
+    regime_icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
+        str(vol_regime).lower(), "⚪"
+    )
     liq_dist_val = float(liq_dist) if liq_dist is not None else None
-    liq_warn     = liq_dist_val is not None and liq_dist_val < 10.0
+    liq_warn = liq_dist_val is not None and liq_dist_val < 10.0
 
     # PENDING FILL badge — shown when futures order not yet filled
     pending_badge = (
         f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
         f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
         f"⏳ PENDING FILL</span>"
-        if entry_status == "NEW" else
-        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
-        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
-        f"🔄 PARTIAL FILL</span>"
-        if entry_status == "PARTIALLY_FILLED" else ""
+        if entry_status == "NEW"
+        else (
+            f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+            f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+            f"🔄 PARTIAL FILL</span>"
+            if entry_status == "PARTIALLY_FILLED"
+            else ""
+        )
     )
 
     with st.container(border=True):
@@ -1416,11 +1623,16 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
 
         # ── PnL / status banner ───────────────────────────────────────
         if is_filled and unreal_pnl is not None:
-            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
-            fund_str = (f"&nbsp;&nbsp;·&nbsp;&nbsp;"
-                        f"<span style='color:{'#d62728' if funding_paid > 0 else '#2ca02c'}'>"
-                        f"Funding {funding_paid:+.4f}</span>"
-                        if funding_paid != 0.0 else "")
+            pnl_bg = (
+                "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            )
+            fund_str = (
+                f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+                f"<span style='color:{'#d62728' if funding_paid > 0 else '#2ca02c'}'>"
+                f"Funding {funding_paid:+.4f}</span>"
+                if funding_paid != 0.0
+                else ""
+            )
             st.markdown(
                 f"<div style='display:flex;justify-content:space-between;align-items:center;"
                 f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
@@ -1464,12 +1676,12 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 unsafe_allow_html=True,
             )
         with pc2:
-            cur_str  = _fmt_price(current_price) if current_price else "—"
+            cur_str = _fmt_price(current_price) if current_price else "—"
             if pct_to_fill is not None:
                 dist_color = "#ff7f0e"
-                dist_str   = f"{pct_to_fill:+.2f}% to fill"
+                dist_str = f"{pct_to_fill:+.2f}% to fill"
             else:
-                dist_str   = ""
+                dist_str = ""
                 dist_color = "#888"
             st.markdown(
                 f"<div style='text-align:center;padding:4px;border-radius:6px;"
@@ -1481,9 +1693,9 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 unsafe_allow_html=True,
             )
         with pc3:
-            notional_str  = f"${float(notional):.2f}" if notional else "—"
-            margin_str    = f"${float(margin_used):.2f}" if margin_used else "—"
-            qty_str       = f"{float(qty):.4f}" if qty else "—"
+            notional_str = f"${float(notional):.2f}" if notional else "—"
+            margin_str = f"${float(margin_used):.2f}" if margin_used else "—"
+            qty_str = f"{float(qty):.4f}" if qty else "—"
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
                 f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
@@ -1520,7 +1732,7 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
                 unsafe_allow_html=True,
             )
         with sc3:
-            rr_val   = f"{float(rr):.2f}:1"    if rr       else "—"
+            rr_val = f"{float(rr):.2f}:1" if rr else "—"
             risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
@@ -1536,12 +1748,19 @@ def render_futures_open_card(trade: dict, current_price: float | None) -> None:
         # ── Liquidation row ───────────────────────────────────────────
         lc1, lc2 = st.columns([3, 1])
         with lc1:
-            liq_color    = "#d62728" if liq_warn else "#888"
-            liq_dist_str = f"{liq_dist_val:.2f}% away" if liq_dist_val is not None else "n/a"
-            liq_pct_str  = f"  ({pct_to_liq:+.2f}% from current)" if pct_to_liq is not None else ""
-            warn_badge   = ("&nbsp;<span style='background:#d62728;color:#fff;border-radius:3px;"
-                            "padding:1px 5px;font-size:0.72em'>⚠ TIGHT</span>"
-                            if liq_warn else "")
+            liq_color = "#d62728" if liq_warn else "#888"
+            liq_dist_str = (
+                f"{liq_dist_val:.2f}% away" if liq_dist_val is not None else "n/a"
+            )
+            liq_pct_str = (
+                f"  ({pct_to_liq:+.2f}% from current)" if pct_to_liq is not None else ""
+            )
+            warn_badge = (
+                "&nbsp;<span style='background:#d62728;color:#fff;border-radius:3px;"
+                "padding:1px 5px;font-size:0.72em'>⚠ TIGHT</span>"
+                if liq_warn
+                else ""
+            )
             st.markdown(
                 f"<div style='font-size:0.85em;font-family:monospace'>"
                 f"<span style='color:#888'>Liq:</span>&nbsp;"
@@ -1578,22 +1797,22 @@ def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
     Render a recently-resolved trade (TP_HIT / SL_HIT) as a compact card.
     PnL is prominently coloured green/red.
     """
-    sym         = trade.get("symbol", "?")
+    sym = trade.get("symbol", "?")
     exit_status = str(trade.get("exit_status", "")).upper()
-    pnl_usd     = trade.get("realized_pnl_usd")
-    pnl_pct     = trade.get("realized_pnl_pct")
+    pnl_usd = trade.get("realized_pnl_usd")
+    pnl_pct = trade.get("realized_pnl_pct")
     entry_price = trade.get("entry_price")
-    exit_price  = trade.get("exit_price")
-    planned_rr  = trade.get("planned_rr")
-    cluster_id  = trade.get("correlation_cluster_id")
-    direction   = trade.get("direction") or trade.get("position_side") or "?"
+    exit_price = trade.get("exit_price")
+    planned_rr = trade.get("planned_rr")
+    cluster_id = trade.get("correlation_cluster_id")
+    direction = trade.get("direction") or trade.get("position_side") or "?"
 
-    is_win      = exit_status == "TP_HIT"
+    is_win = exit_status == "TP_HIT"
     is_canceled = exit_status == "CANCELED"
-    pnl_color   = "#808080" if is_canceled else ("#2ca02c" if is_win else "#d62728")
-    border_css  = f"border-left: 4px solid {pnl_color}; padding-left: 10px;"
-    icon        = "⚪️" if is_canceled else ("🟢" if is_win else "🔴")
-    label       = "CANCELED" if is_canceled else ("TP HIT" if is_win else "SL HIT")
+    pnl_color = "#808080" if is_canceled else ("#2ca02c" if is_win else "#d62728")
+    border_css = f"border-left: 4px solid {pnl_color}; padding-left: 10px;"
+    icon = "⚪️" if is_canceled else ("🟢" if is_win else "🔴")
+    label = "CANCELED" if is_canceled else ("TP HIT" if is_win else "SL HIT")
 
     # Exit time
     exit_time_raw = trade.get("exit_time")
@@ -1617,7 +1836,7 @@ def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
     tip = trade.get("time_to_resolution_sec") or trade.get("time_in_position_sec")
     if tip:
         h, rem = divmod(int(tip), 3600)
-        m_val  = rem // 60
+        m_val = rem // 60
         tip_str = f"{h}h {m_val}m" if h else f"{m_val}m"
     else:
         tip_str = "n/a"
@@ -1625,9 +1844,9 @@ def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
     # Futures-specific extras
     extras = ""
     if trade_type == "futures":
-        side     = str(trade.get("position_side", "?")).upper()
-        funding  = trade.get("funding_rate_paid") or 0.0
-        regime   = trade.get("volatility_regime_at_entry", "?")
+        side = str(trade.get("position_side", "?")).upper()
+        funding = trade.get("funding_rate_paid") or 0.0
+        regime = trade.get("volatility_regime_at_entry", "?")
         side_icon = "📈" if side == "LONG" else "📉"
         extras = (
             f"&nbsp;&nbsp;·&nbsp;&nbsp;{side_icon} {side}"
@@ -1646,25 +1865,34 @@ def render_resolved_card(trade: dict, trade_type: str = "spot") -> None:
         )
 
         # PnL — big and coloured
-        pnl_usd_str = f"<span style='color:{pnl_color};font-size:1.5em;font-weight:bold'>${float(pnl_usd):+.4f}</span>" \
-                      if pnl_usd is not None else "<span style='color:#888'>n/a</span>"
-        pnl_pct_str = f"<span style='color:{pnl_color}'>&nbsp;({float(pnl_pct):+.2f}%)</span>" \
-                      if pnl_pct is not None else ""
+        pnl_usd_str = (
+            f"<span style='color:{pnl_color};font-size:1.5em;font-weight:bold'>${float(pnl_usd):+.4f}</span>"
+            if pnl_usd is not None
+            else "<span style='color:#888'>n/a</span>"
+        )
+        pnl_pct_str = (
+            f"<span style='color:{pnl_color}'>&nbsp;({float(pnl_pct):+.2f}%)</span>"
+            if pnl_pct is not None
+            else ""
+        )
 
         st.markdown(
-            f"<div style='font-family:monospace;font-size:0.95em;line-height:2.2;margin-top:4px'>"
-            f"{pnl_usd_str}{pnl_pct_str}"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Entry:&nbsp;<b>{_fmt_price(entry_price)}</b>"
-            f"&nbsp;&nbsp;→&nbsp;&nbsp;"
-            f"Exit:&nbsp;<b>{_fmt_price(exit_price)}</b>"
-            f"&nbsp;&nbsp;·&nbsp;&nbsp;"
-            f"R:R&nbsp;{float(planned_rr):.2f}:1" if planned_rr else
-            f"{pnl_usd_str}{pnl_pct_str}"
-            f"&nbsp;&nbsp;&nbsp;&nbsp;"
-            f"Entry:&nbsp;<b>{_fmt_price(entry_price)}</b>"
-            f"&nbsp;&nbsp;→&nbsp;&nbsp;"
-            f"Exit:&nbsp;<b>{_fmt_price(exit_price)}</b>",
+            (
+                f"<div style='font-family:monospace;font-size:0.95em;line-height:2.2;margin-top:4px'>"
+                f"{pnl_usd_str}{pnl_pct_str}"
+                f"&nbsp;&nbsp;&nbsp;&nbsp;"
+                f"Entry:&nbsp;<b>{_fmt_price(entry_price)}</b>"
+                f"&nbsp;&nbsp;→&nbsp;&nbsp;"
+                f"Exit:&nbsp;<b>{_fmt_price(exit_price)}</b>"
+                f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+                f"R:R&nbsp;{float(planned_rr):.2f}:1"
+                if planned_rr
+                else f"{pnl_usd_str}{pnl_pct_str}"
+                f"&nbsp;&nbsp;&nbsp;&nbsp;"
+                f"Entry:&nbsp;<b>{_fmt_price(entry_price)}</b>"
+                f"&nbsp;&nbsp;→&nbsp;&nbsp;"
+                f"Exit:&nbsp;<b>{_fmt_price(exit_price)}</b>"
+            ),
             unsafe_allow_html=True,
         )
 
@@ -1691,12 +1919,12 @@ def render_open_positions_tab(
     """
     from datetime import datetime, timezone, timedelta
 
-    now_utc   = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
     cutoff_ms = (now_utc - timedelta(hours=24)).timestamp() * 1000
 
     # ── Split open vs recently resolved ───────────────────────────────
-    spot_open     = [t for t in spot_rows     if t.get("exit_status") == "OPEN"]
-    futures_open  = [t for t in futures_rows  if t.get("exit_status") == "OPEN"]
+    spot_open = [t for t in spot_rows if t.get("exit_status") == "OPEN"]
+    futures_open = [t for t in futures_rows if t.get("exit_status") == "OPEN"]
 
     def _is_recent(t: dict) -> bool:
         et = t.get("exit_time")
@@ -1717,58 +1945,68 @@ def render_open_positions_tab(
     def _sort_key(t: dict) -> float:
         et = t.get("exit_time")
         if et is not None:
-            try: return float(et)
-            except: pass
+            try:
+                return float(et)
+            except:
+                pass
         if t.get("exit_status") == "CANCELED":
             ot = t.get("open_time")
             if ot:
-                try: return pd.to_datetime(ot).timestamp() * 1000
-                except: pass
+                try:
+                    return pd.to_datetime(ot).timestamp() * 1000
+                except:
+                    pass
         return 0.0
 
-    spot_resolved    = [t for t in spot_rows
-                        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)]
-    futures_resolved = [t for t in futures_rows
-                        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)]
+    spot_resolved = [
+        t
+        for t in spot_rows
+        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)
+    ]
+    futures_resolved = [
+        t
+        for t in futures_rows
+        if t.get("exit_status") in ("TP_HIT", "SL_HIT", "CANCELED") and _is_recent(t)
+    ]
 
     # Sort resolved by exit_time desc (most recent first)
     spot_resolved.sort(key=_sort_key, reverse=True)
     futures_resolved.sort(key=_sort_key, reverse=True)
 
     # ── Fetch live prices for open positions ──────────────────────────
-    spot_syms    = list({t["symbol"] for t in spot_open    if t.get("symbol")})
+    spot_syms = list({t["symbol"] for t in spot_open if t.get("symbol")})
     futures_syms = list({t["symbol"] for t in futures_open if t.get("symbol")})
 
-    spot_prices: dict    = {}
+    spot_prices: dict = {}
     futures_prices: dict = {}
-    spot_px_ok:    bool  = True
-    futures_px_ok: bool  = True
+    spot_px_ok: bool = True
+    futures_px_ok: bool = True
 
     with st.spinner("Fetching live prices..."):
         try:
             spot_prices = _fetch_spot_prices(spot_syms)
         except Exception:
-            spot_px_ok  = False
+            spot_px_ok = False
             spot_prices = {}
 
         try:
             futures_prices = _fetch_futures_prices(futures_syms)
         except Exception:
-            futures_px_ok    = False
-            futures_prices   = {}
+            futures_px_ok = False
+            futures_prices = {}
 
     # ── Exchange status banner ────────────────────────────────────────
     # Mainnet prices (spot) come from Binance mainnet — usually always up.
     # Testnet prices (futures) come from testnet — subject to maintenance.
     # If a fetch returned an empty dict for symbols that SHOULD have prices,
     # treat that as a sign the exchange may be unavailable.
-    _spot_unavailable    = spot_syms    and not spot_px_ok
+    _spot_unavailable = spot_syms and not spot_px_ok
     _futures_unavailable = futures_syms and not futures_px_ok
     # Also flag when prices are empty despite having open positions
-    _spot_no_prices      = bool(spot_open)    and not spot_prices    and spot_syms
-    _futures_no_prices   = bool(futures_open) and not futures_prices and futures_syms
+    _spot_no_prices = bool(spot_open) and not spot_prices and spot_syms
+    _futures_no_prices = bool(futures_open) and not futures_prices and futures_syms
 
-    _spot_status_ok    = not (_spot_unavailable    or _spot_no_prices)
+    _spot_status_ok = not (_spot_unavailable or _spot_no_prices)
     _futures_status_ok = not (_futures_unavailable or _futures_no_prices)
 
     if not _spot_status_ok or not _futures_status_ok:
@@ -1779,26 +2017,34 @@ def render_open_positions_tab(
                     st.markdown("🟢 **Spot Testnet** — Online")
                 else:
                     st.markdown("🔴 **Spot Testnet** — Maintenance / Unavailable")
-                    st.caption("Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase.")
+                    st.caption(
+                        "Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase."
+                    )
             with c2:
                 if _futures_status_ok:
                     st.markdown("🟢 **Futures Testnet** — Online")
                 else:
                     st.markdown("🔴 **Futures Testnet** — Maintenance / Unavailable")
-                    st.caption("Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase.")
+                    st.caption(
+                        "Harga CURRENT tidak tersedia. Positions tetap terpantau dari Supabase."
+                    )
     else:
         # Both OK — show compact inline status
         st.caption("Exchange Status: 🟢 Spot Testnet  ·  🟢 Futures Testnet")
 
     # ── Sub-tabs ──────────────────────────────────────────────────────
-    sub_spot, sub_futures = st.tabs([
-        f"📈 Spot ({len(spot_open)} open)",
-        f"⚡ Futures ({len(futures_open)} open)",
-    ])
+    sub_spot, sub_futures = st.tabs(
+        [
+            f"📈 Spot ({len(spot_open)} open)",
+            f"⚡ Futures ({len(futures_open)} open)",
+        ]
+    )
 
     # ════════════════ SPOT SUB-TAB ════════════════════════════════════
     with sub_spot:
-        st.caption("Live data from Supabase  |  Prices from Binance public API  |  Read-only")
+        st.caption(
+            "Live data from Supabase  |  Prices from Binance public API  |  Read-only"
+        )
 
         if not spot_open and not spot_resolved:
             st.info("No open or recently-resolved spot positions.")
@@ -1806,6 +2052,7 @@ def render_open_positions_tab(
             if spot_open:
                 # Group by cluster_id
                 from collections import defaultdict as _dd
+
                 clusters: dict = _dd(list)
                 for t in spot_open:
                     cid = t.get("correlation_cluster_id") or "single"
@@ -1818,7 +2065,7 @@ def render_open_positions_tab(
                         st.subheader(f"Cluster `{cid}`  —  {len(group)} position(s)")
 
                     for trade in group:
-                        sym   = trade.get("symbol", "")
+                        sym = trade.get("symbol", "")
                         price = spot_prices.get(sym)
                         render_spot_open_card(trade, price)
                         st.write("")  # small spacer
@@ -1827,7 +2074,9 @@ def render_open_positions_tab(
 
             # ── Recently Resolved (24h) ───────────────────────────────
             st.divider()
-            st.subheader(f"Recently Resolved — last 24h ({len(spot_resolved)} trade(s))")
+            st.subheader(
+                f"Recently Resolved — last 24h ({len(spot_resolved)} trade(s))"
+            )
             if spot_resolved:
                 for trade in spot_resolved:
                     render_resolved_card(trade, trade_type="spot")
@@ -1837,13 +2086,16 @@ def render_open_positions_tab(
 
     # ════════════════ FUTURES SUB-TAB ═════════════════════════════════
     with sub_futures:
-        st.caption("Live data from Supabase  |  Mark prices from Binance Futures API  |  Read-only")
+        st.caption(
+            "Live data from Supabase  |  Mark prices from Binance Futures API  |  Read-only"
+        )
 
         if not futures_open and not futures_resolved:
             st.info("No open or recently-resolved futures positions.")
         else:
             if futures_open:
                 from collections import defaultdict as _dd2
+
                 fclusters: dict = _dd2(list)
                 for t in futures_open:
                     cid = t.get("correlation_cluster_id") or "single"
@@ -1856,7 +2108,7 @@ def render_open_positions_tab(
                         st.subheader(f"Cluster `{cid}`  —  {len(group)} position(s)")
 
                     for trade in group:
-                        sym   = trade.get("symbol", "")
+                        sym = trade.get("symbol", "")
                         price = futures_prices.get(sym)
                         render_futures_open_card(trade, price)
                         st.write("")
@@ -1865,7 +2117,9 @@ def render_open_positions_tab(
 
             # ── Recently Resolved (24h) ───────────────────────────────
             st.divider()
-            st.subheader(f"Recently Resolved — last 24h ({len(futures_resolved)} trade(s))")
+            st.subheader(
+                f"Recently Resolved — last 24h ({len(futures_resolved)} trade(s))"
+            )
             if futures_resolved:
                 for trade in futures_resolved:
                     render_resolved_card(trade, trade_type="futures")
@@ -1879,8 +2133,8 @@ def render_open_positions_tab(
 # ---------------------------------------------------------------------------
 
 # Slippage thresholds from the Tokocrypto state machine design
-TOKO_SLIP_ENTRY_THRESHOLD_PCT = 0.3    # entry slippage flag level
-TOKO_SLIP_EXIT_THRESHOLD_PCT  = 0.1    # exit  slippage flag level
+TOKO_SLIP_ENTRY_THRESHOLD_PCT = 0.3  # entry slippage flag level
+TOKO_SLIP_EXIT_THRESHOLD_PCT = 0.1  # exit  slippage flag level
 
 # Exit reasons excluded from "genuine" PnL totals — same provenance discipline
 # as SPOT_EXCLUDED_EXIT_REASONS in build_metrics().
@@ -1907,6 +2161,7 @@ def load_tokocrypto_data() -> pd.DataFrame:
     """
     try:
         from services.supabase_client import fetch_all_tokocrypto
+
         rows = fetch_all_tokocrypto()
     except Exception as exc:
         st.error("Failed to load Tokocrypto trades from Supabase.")
@@ -1919,44 +2174,67 @@ def load_tokocrypto_data() -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     for col in [
-        "entry_price", "entry_fill_price", "entry_qty",
-        "entry_notional_idr", "tp_price", "sl_price",
-        "realized_pnl_idr", "realized_pnl_pct",
-        "slippage_pct", "exit_fill_slippage_pct",
+        "entry_price",
+        "entry_fill_price",
+        "entry_qty",
+        "entry_notional_idr",
+        "tp_price",
+        "sl_price",
+        "realized_pnl_idr",
+        "realized_pnl_pct",
+        "slippage_pct",
+        "exit_fill_slippage_pct",
         "slot_size_idr",
     ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    exit_st = df["exit_status"].fillna("").astype(str).str.upper() \
-              if "exit_status" in df.columns else pd.Series("", index=df.index)
+    exit_st = (
+        df["exit_status"].fillna("").astype(str).str.upper()
+        if "exit_status" in df.columns
+        else pd.Series("", index=df.index)
+    )
     df["is_resolved"] = exit_st.isin(["TP_HIT", "SL_HIT"])
-    df["is_win"]      = df["realized_pnl_idr"].gt(0) if "realized_pnl_idr" in df.columns \
-                        else pd.Series(False, index=df.index)
+    df["is_win"] = (
+        df["realized_pnl_idr"].gt(0)
+        if "realized_pnl_idr" in df.columns
+        else pd.Series(False, index=df.index)
+    )
 
-    oco_st = df["oco_state"].fillna("").astype(str) \
-             if "oco_state" in df.columns else pd.Series("", index=df.index)
+    oco_st = (
+        df["oco_state"].fillna("").astype(str)
+        if "oco_state" in df.columns
+        else pd.Series("", index=df.index)
+    )
     df["has_anomaly"] = oco_st.isin(TOKO_ANOMALY_STATES)
 
     def _parse_epoch_ms(series):
         vals = pd.to_numeric(series, errors="coerce")
         return pd.to_datetime(vals, unit="ms", utc=True, errors="coerce")
 
-    df["entry_fill_dt"] = _parse_epoch_ms(df["entry_fill_time"]) \
-                          if "entry_fill_time" in df.columns else pd.NaT
-    df["exit_dt"]       = _parse_epoch_ms(df["exit_time"]) \
-                          if "exit_time" in df.columns else pd.NaT
+    df["entry_fill_dt"] = (
+        _parse_epoch_ms(df["entry_fill_time"])
+        if "entry_fill_time" in df.columns
+        else pd.NaT
+    )
+    df["exit_dt"] = (
+        _parse_epoch_ms(df["exit_time"]) if "exit_time" in df.columns else pd.NaT
+    )
 
     # is_outcome — only TP_HIT / SL_HIT count as genuine outcomes (same as Spot)
     df["is_outcome"] = exit_st.isin(["TP_HIT", "SL_HIT"])
 
     # WIB-localised entry time + hour for hourly analysis
-    df["entry_fill_wib"] = (df["entry_fill_dt"].dt.tz_convert("Asia/Jakarta")
-                            if "entry_fill_dt" in df.columns
-                            else pd.Series(dtype="datetime64[ns, UTC]"))
-    df["entry_hour"] = (df["entry_fill_wib"].dt.hour
-                        if "entry_fill_wib" in df.columns
-                        else pd.Series(dtype="float64"))
+    df["entry_fill_wib"] = (
+        df["entry_fill_dt"].dt.tz_convert("Asia/Jakarta")
+        if "entry_fill_dt" in df.columns
+        else pd.Series(dtype="datetime64[ns, UTC]")
+    )
+    df["entry_hour"] = (
+        df["entry_fill_wib"].dt.hour
+        if "entry_fill_wib" in df.columns
+        else pd.Series(dtype="float64")
+    )
 
     # Ensure planned_rr and realized_pnl_pct are numeric
     for _num_col in ["planned_rr", "realized_pnl_pct"]:
@@ -1964,9 +2242,11 @@ def load_tokocrypto_data() -> pd.DataFrame:
             df[_num_col] = pd.to_numeric(df[_num_col], errors="coerce")
 
     # Age of position (seconds since entry fill)
-    now_utc = pd.Timestamp.utcnow().tz_localize("UTC") \
-              if pd.Timestamp.utcnow().tzinfo is None \
-              else pd.Timestamp.utcnow()
+    now_utc = (
+        pd.Timestamp.utcnow().tz_localize("UTC")
+        if pd.Timestamp.utcnow().tzinfo is None
+        else pd.Timestamp.utcnow()
+    )
     if "entry_fill_dt" in df.columns:
         df["age_seconds"] = (now_utc - df["entry_fill_dt"]).dt.total_seconds()
     else:
@@ -1977,10 +2257,12 @@ def load_tokocrypto_data() -> pd.DataFrame:
         df["anomaly_detected_dt"] = pd.to_datetime(
             df["oco_state_detected_at"], utc=True, errors="coerce"
         )
-        df["anomaly_age_seconds"] = (now_utc - df["anomaly_detected_dt"]).dt.total_seconds()
+        df["anomaly_age_seconds"] = (
+            now_utc - df["anomaly_detected_dt"]
+        ).dt.total_seconds()
     else:
-        df["anomaly_detected_dt"]  = pd.NaT
-        df["anomaly_age_seconds"]  = pd.NA
+        df["anomaly_detected_dt"] = pd.NaT
+        df["anomaly_age_seconds"] = pd.NA
 
     return df
 
@@ -1996,23 +2278,28 @@ def build_toko_metrics(df: pd.DataFrame) -> dict:
     else:
         genuine = resolved
 
-    total_trades     = int(len(df))
-    resolved_count   = int(len(resolved))
-    genuine_count    = int(len(genuine))
-    win_rate         = round(float(genuine["is_win"].mean() * 100) if genuine_count else 0.0, 2)
-    total_pnl_idr    = round(float(genuine["realized_pnl_idr"].sum()) if genuine_count else 0.0, 0)
+    total_trades = int(len(df))
+    resolved_count = int(len(resolved))
+    genuine_count = int(len(genuine))
+    win_rate = round(float(genuine["is_win"].mean() * 100) if genuine_count else 0.0, 2)
+    total_pnl_idr = round(
+        float(genuine["realized_pnl_idr"].sum()) if genuine_count else 0.0, 0
+    )
 
-    open_rows        = df[df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"] \
-                       if "exit_status" in df.columns else pd.DataFrame()
-    slots_occupied   = int(len(open_rows))
+    open_rows = (
+        df[df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"]
+        if "exit_status" in df.columns
+        else pd.DataFrame()
+    )
+    slots_occupied = int(len(open_rows))
 
     return {
-        "total_trades":     total_trades,
-        "resolved_count":   resolved_count,
-        "genuine_count":    genuine_count,
-        "win_rate":         win_rate,
-        "total_pnl_idr":    total_pnl_idr,
-        "slots_occupied":   slots_occupied,
+        "total_trades": total_trades,
+        "resolved_count": resolved_count,
+        "genuine_count": genuine_count,
+        "win_rate": win_rate,
+        "total_pnl_idr": total_pnl_idr,
+        "slots_occupied": slots_occupied,
     }
 
 
@@ -2029,7 +2316,10 @@ def build_toko_equity_curve(df: pd.DataFrame):
     resolved = resolved.sort_values("exit_dt")
     resolved["cumulative_pnl_idr"] = resolved["realized_pnl_idr"].cumsum()
     fig = px.line(
-        resolved, x="exit_dt", y="cumulative_pnl_idr", markers=True,
+        resolved,
+        x="exit_dt",
+        y="cumulative_pnl_idr",
+        markers=True,
         labels={"exit_dt": "Exit time", "cumulative_pnl_idr": "Cumulative PnL (Rp)"},
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
@@ -2063,17 +2353,27 @@ def build_toko_symbol_pnl(df: pd.DataFrame):
     if resolved.empty:
         return None
 
-    summary = (
-        resolved.groupby("symbol", as_index=False)
-        .agg(realized_pnl_idr=("realized_pnl_idr", "sum"), win=("is_win", "mean"))
+    summary = resolved.groupby("symbol", as_index=False).agg(
+        realized_pnl_idr=("realized_pnl_idr", "sum"), win=("is_win", "mean")
     )
     summary["win_label"] = summary["win"].ge(0.5)
     fig = px.bar(
-        summary, x="symbol", y="realized_pnl_idr", color="win_label",
+        summary,
+        x="symbol",
+        y="realized_pnl_idr",
+        color="win_label",
         color_discrete_map={True: "#2ca02c", False: "#d62728"},
-        labels={"symbol": "Symbol", "realized_pnl_idr": "Realized PnL (Rp)", "win_label": "Win"},
+        labels={
+            "symbol": "Symbol",
+            "realized_pnl_idr": "Realized PnL (Rp)",
+            "win_label": "Win",
+        },
     )
-    fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), xaxis_tickangle=-30)
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis_tickangle=-30,
+    )
     return fig
 
 
@@ -2092,12 +2392,15 @@ def build_toko_hourly_charts(df: pd.DataFrame):
         )
         .sort_values("entry_hour")
     )
-    hourly["entry_hour"]   = hourly["entry_hour"].fillna(-1).astype(int)
+    hourly["entry_hour"] = hourly["entry_hour"].fillna(-1).astype(int)
     hourly["win_rate_pct"] = hourly["win_rate"] * 100
-    hourly["count_label"]  = hourly["trades"].apply(lambda n: f"{n}t")
+    hourly["count_label"] = hourly["trades"].apply(lambda n: f"{n}t")
 
     win_fig = px.bar(
-        hourly, x="entry_hour", y="win_rate_pct", text="count_label",
+        hourly,
+        x="entry_hour",
+        y="win_rate_pct",
+        text="count_label",
         labels={"entry_hour": "Hour (WIB/UTC+7)", "win_rate_pct": "Win rate (%)"},
         hover_data={"trades": True, "win_rate_pct": ":.1f"},
     )
@@ -2106,8 +2409,14 @@ def build_toko_hourly_charts(df: pd.DataFrame):
     win_fig.update_yaxes(range=[0, 110])
 
     pnl_fig = px.bar(
-        hourly, x="entry_hour", y="avg_realized_pnl_pct", text="count_label",
-        labels={"entry_hour": "Hour (WIB/UTC+7)", "avg_realized_pnl_pct": "Avg PnL (%)"},
+        hourly,
+        x="entry_hour",
+        y="avg_realized_pnl_pct",
+        text="count_label",
+        labels={
+            "entry_hour": "Hour (WIB/UTC+7)",
+            "avg_realized_pnl_pct": "Avg PnL (%)",
+        },
         hover_data={"trades": True},
     )
     pnl_fig.update_traces(textposition="outside")
@@ -2126,10 +2435,17 @@ def build_toko_rr_scatter(df: pd.DataFrame):
         return None
 
     fig = px.scatter(
-        resolved, x="planned_rr", y="realized_pnl_pct", color="is_win",
+        resolved,
+        x="planned_rr",
+        y="realized_pnl_pct",
+        color="is_win",
         color_discrete_map={True: "#2ca02c", False: "#d62728"},
         hover_name="symbol",
-        labels={"planned_rr": "Planned R:R", "realized_pnl_pct": "Realized PnL (%)", "is_win": "Win"},
+        labels={
+            "planned_rr": "Planned R:R",
+            "realized_pnl_pct": "Realized PnL (%)",
+            "is_win": "Win",
+        },
     )
     fig.update_layout(template="plotly_white", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -2244,28 +2560,28 @@ def render_toko_open_card(
     Render a single open Tokocrypto position as a visual card.
     Mirrors render_spot_open_card layout but IDR-denominated.
     """
-    sym          = trade.get("symbol", "?")
+    sym = trade.get("symbol", "?")
     entry_status = str(trade.get("entry_status", "NEW")).upper()
-    entry_price  = trade.get("entry_price")
-    fill_price   = trade.get("entry_fill_price")
-    sl           = trade.get("sl_price") or trade.get("sl")
-    tp1          = trade.get("tp_price") or trade.get("tp1")
-    qty          = trade.get("entry_qty") or 0
-    oco_state    = trade.get("oco_state", "")
-    rr           = trade.get("planned_rr")
-    risk_pct     = trade.get("risk_pct")
-    notional     = trade.get("entry_notional_idr")
-    slip_pct     = trade.get("slippage_pct")
-    oco_list_id  = trade.get("b_order_list_id")
-    open_time    = trade.get("open_time") or trade.get("created_at", "")
+    entry_price = trade.get("entry_price")
+    fill_price = trade.get("entry_fill_price")
+    sl = trade.get("sl_price") or trade.get("sl")
+    tp1 = trade.get("tp_price") or trade.get("tp1")
+    qty = trade.get("entry_qty") or 0
+    oco_state = trade.get("oco_state", "")
+    rr = trade.get("planned_rr")
+    risk_pct = trade.get("risk_pct")
+    notional = trade.get("entry_notional_idr")
+    slip_pct = trade.get("slippage_pct")
+    oco_list_id = trade.get("b_order_list_id")
+    open_time = trade.get("open_time") or trade.get("created_at", "")
 
     ref_price = fill_price or entry_price
 
     # ── Derived ───────────────────────────────────────────────────────
-    unreal_pnl:   float | None = None
-    pct_to_fill:  float | None = None
-    pct_to_sl:    float | None = None
-    pct_to_tp:    float | None = None
+    unreal_pnl: float | None = None
+    pct_to_fill: float | None = None
+    pct_to_sl: float | None = None
+    pct_to_tp: float | None = None
 
     if current_price and current_price > 0:
         if entry_status == "FILLED" and ref_price and qty:
@@ -2284,10 +2600,16 @@ def render_toko_open_card(
         except Exception:
             ot_str = str(open_time)
 
-    is_filled    = entry_status == "FILLED"
-    is_pending   = entry_status in ("NEW", "PARTIALLY_FILLED")
-    status_color = {"FILLED": "#2ca02c", "NEW": "#ff7f0e", "PARTIALLY_FILLED": "#1f77b4"}.get(entry_status, "#888")
-    status_icon  = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(entry_status, "❓")
+    is_filled = entry_status == "FILLED"
+    is_pending = entry_status in ("NEW", "PARTIALLY_FILLED")
+    status_color = {
+        "FILLED": "#2ca02c",
+        "NEW": "#ff7f0e",
+        "PARTIALLY_FILLED": "#1f77b4",
+    }.get(entry_status, "#888")
+    status_icon = {"FILLED": "✅", "NEW": "🕐", "PARTIALLY_FILLED": "🔄"}.get(
+        entry_status, "❓"
+    )
 
     # OCO badge
     oco_badge = compute_toko_oco_badge(trade)
@@ -2297,20 +2619,25 @@ def render_toko_open_card(
         f"<span style='background:#b85c00;color:#fff;border-radius:4px;"
         f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
         f"⏳ PENDING FILL</span>"
-        if entry_status == "NEW" else
-        f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
-        f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
-        f"🔄 PARTIAL FILL</span>"
-        if entry_status == "PARTIALLY_FILLED" else ""
+        if entry_status == "NEW"
+        else (
+            f"<span style='background:#1f5fa6;color:#fff;border-radius:4px;"
+            f"padding:2px 8px;font-size:0.78em;font-weight:700;letter-spacing:0.04em'>"
+            f"🔄 PARTIAL FILL</span>"
+            if entry_status == "PARTIALLY_FILLED"
+            else ""
+        )
     )
 
     pnl_color = "#2ca02c" if (unreal_pnl or 0) >= 0 else "#d62728"
 
     def _fmt_idr_price(val) -> str:
         if val is None:
-            return "n/a"
+            return "—"
         try:
             v = float(val)
+            if not math.isfinite(v):
+                return "—"
             if v >= 1000:
                 return f"Rp {v:,.2f}"
             elif v >= 1:
@@ -2318,7 +2645,7 @@ def render_toko_open_card(
             else:
                 return f"Rp {v:,.8f}"
         except (TypeError, ValueError):
-            return "n/a"
+            return "—"
 
     with st.container(border=True):
         # ── Header row ────────────────────────────────────────────────
@@ -2347,7 +2674,9 @@ def render_toko_open_card(
 
         # ── Status + PnL banner ───────────────────────────────────────
         if is_filled and unreal_pnl is not None:
-            pnl_bg = "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            pnl_bg = (
+                "rgba(44,160,44,0.08)" if unreal_pnl >= 0 else "rgba(214,39,40,0.08)"
+            )
             st.markdown(
                 f"<div style='display:flex;justify-content:space-between;align-items:center;"
                 f"background:{pnl_bg};border-radius:6px;padding:6px 12px;margin-bottom:8px'>"
@@ -2404,7 +2733,7 @@ def render_toko_open_card(
             )
         with pc3:
             notional_str = _fmt_idr(notional) if notional else "—"
-            qty_str      = f"{float(qty):.6f}".rstrip("0").rstrip(".") if qty else "—"
+            qty_str = f"{float(qty):.6f}".rstrip("0").rstrip(".") if qty else "—"
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
                 f"<div style='font-size:0.72em;color:#888;text-transform:uppercase;letter-spacing:0.05em'>Size</div>"
@@ -2441,8 +2770,24 @@ def render_toko_open_card(
                 unsafe_allow_html=True,
             )
         with sc3:
-            rr_val   = f"{float(rr):.2f}:1"   if rr       else "—"
-            risk_val = f"{float(risk_pct):.2f}%" if risk_pct else "—"
+            rr_val = "—"
+            if rr is not None:
+                try:
+                    r_f = float(rr)
+                    if math.isfinite(r_f):
+                        rr_val = f"{r_f:.2f}:1"
+                except (TypeError, ValueError):
+                    pass
+
+            risk_val = "—"
+            if risk_pct is not None:
+                try:
+                    rk_f = float(risk_pct)
+                    if math.isfinite(rk_f):
+                        risk_val = f"{rk_f:.2f}%"
+                except (TypeError, ValueError):
+                    pass
+
             st.markdown(
                 f"<div style='text-align:center;padding:4px'>"
                 f"<div style='font-size:0.72em;color:#888'>R:R</div>"
@@ -2456,13 +2801,25 @@ def render_toko_open_card(
         foot_parts = []
         if slip_pct is not None:
             try:
-                foot_parts.append(f"Slip: {float(slip_pct):+.3f}%")
+                s_f = float(slip_pct)
+                if math.isfinite(s_f):
+                    foot_parts.append(f"Slip: {s_f:+.3f}%")
             except (TypeError, ValueError):
                 pass
-        if oco_list_id:
-            foot_parts.append(f"OCO #{oco_list_id}")
+
+        if oco_list_id is not None:
+            s_oco = str(oco_list_id).strip()
+            if s_oco.lower() not in ("none", "nan", "null", "0", ""):
+                foot_parts.append(f"OCO #{s_oco}")
+
         if trade.get("age_seconds") is not None:
-            foot_parts.append(f"Age: {_age_str(trade.get('age_seconds'))}")
+            try:
+                age_val = float(trade.get("age_seconds"))
+                if math.isfinite(age_val):
+                    foot_parts.append(f"Age: {_age_str(age_val)}")
+            except (TypeError, ValueError):
+                pass
+
         if foot_parts:
             st.markdown(
                 f"<div style='font-size:0.78em;color:#aaa;margin-top:4px'>"
@@ -2476,18 +2833,26 @@ def render_toko_resolved_card(trade: dict) -> None:
     """
     Render a resolved Tokocrypto trade as a compact card — same style as spot.
     """
-    sym        = trade.get("symbol", "?")
-    exit_st    = str(trade.get("exit_status", "")).upper()
-    pnl_idr    = trade.get("realized_pnl_idr")
-    pnl_pct    = trade.get("realized_pnl_pct")
-    entry_p    = trade.get("entry_price")
-    exit_p     = trade.get("exit_price") or trade.get("exit_fill_price")
+    sym = trade.get("symbol", "?")
+    exit_st = str(trade.get("exit_status", "")).upper()
+    pnl_idr = trade.get("realized_pnl_idr")
+    pnl_pct = trade.get("realized_pnl_pct")
+    entry_p = trade.get("entry_price")
+    exit_p = trade.get("exit_price") or trade.get("exit_fill_price")
     exit_reason = trade.get("exit_reason", "")
 
     is_win = (pnl_idr or 0) > 0
-    badge_bg    = "#2ca02c" if exit_st == "TP_HIT" else "#d62728" if exit_st == "SL_HIT" else "#888"
-    badge_label = {"TP_HIT": "🟢 TP HIT", "SL_HIT": "🔴 SL HIT", "CANCELED": "⚪ CANCELED"}.get(exit_st, exit_st)
-    pnl_color   = "#2ca02c" if is_win else "#d62728"
+    badge_bg = (
+        "#2ca02c"
+        if exit_st == "TP_HIT"
+        else "#d62728" if exit_st == "SL_HIT" else "#888"
+    )
+    badge_label = {
+        "TP_HIT": "🟢 TP HIT",
+        "SL_HIT": "🔴 SL HIT",
+        "CANCELED": "⚪ CANCELED",
+    }.get(exit_st, exit_st)
+    pnl_color = "#2ca02c" if is_win else "#d62728"
 
     def _fmt_idr_price(val) -> str:
         if val is None:
@@ -2554,7 +2919,7 @@ def _age_str(seconds) -> str:
     except (TypeError, ValueError):
         return "n/a"
     h, rem = divmod(int(s), 3600)
-    m_val  = rem // 60
+    m_val = rem // 60
     if h >= 24:
         return f"{h // 24}d {h % 24}h"
     return f"{h}h {m_val}m" if h else f"{m_val}m"
@@ -2563,6 +2928,7 @@ def _age_str(seconds) -> str:
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
+
 
 def main():
     st.title("Swing Trade Dashboard")
@@ -2589,7 +2955,9 @@ def main():
     try:
         _t0 = time.perf_counter()
         snapshot = get_fresh_snapshot()
-        log_timing(f"[TIMING] dashboard.main.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+        log_timing(
+            f"[TIMING] dashboard.main.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+        )
         _heartbeat_for_timer = snapshot.get("heartbeat")
         log_timing(
             "[TIMING] get_fresh_snapshot: cache-hit or warmed snapshot used by main()",
@@ -2598,7 +2966,9 @@ def main():
     except Exception:
         _heartbeat_for_timer = None
 
-    _timer_last_seen_wib = _parse_iso_to_wib((_heartbeat_for_timer or {}).get("last_seen_at"))
+    _timer_last_seen_wib = _parse_iso_to_wib(
+        (_heartbeat_for_timer or {}).get("last_seen_at")
+    )
     _timer_time_since_last_seen = (
         (now_wib - _timer_last_seen_wib).total_seconds()
         if _timer_last_seen_wib is not None
@@ -2624,7 +2994,9 @@ def main():
         try:
             _t0 = time.perf_counter()
             _badge_snapshot = get_fresh_snapshot()
-            log_timing(f"[TIMING] dashboard.badge.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            log_timing(
+                f"[TIMING] dashboard.badge.get_fresh_snapshot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+            )
             _hb = _badge_snapshot.get("heartbeat")
         except Exception:
             _hb = _heartbeat_for_timer
@@ -2642,14 +3014,18 @@ def main():
         )
 
         conn_color = "#2ca02c" if global_state.connected else "#d62728"
-        conn_text = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        conn_text = (
+            "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        )
 
         try:
             _time_since_sec_num = float(_time_since_sec)
         except (TypeError, ValueError):
             _time_since_sec_num = float("nan")
 
-        is_time_since_valid = math.isfinite(_time_since_sec_num) and _time_since_sec_num >= 0
+        is_time_since_valid = (
+            math.isfinite(_time_since_sec_num) and _time_since_sec_num >= 0
+        )
         is_stalled = (
             _time_since_sec_num > VM_STALL_THRESHOLD_SECONDS
             if is_time_since_valid
@@ -2664,7 +3040,8 @@ def main():
         else:
             vm_badge = "🟢 VM Active"
 
-        components.html(f"""
+        components.html(
+            f"""
         <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; 
                     display: flex; align-items: center; gap: 15px; color: #555; padding-top: 6px;">
             <div style="font-size: 14px; display: flex; align-items: center; gap: 8px;">
@@ -2675,15 +3052,27 @@ def main():
                 <strong>Last Cycle: {_last_seen_wib} WIB</strong>
             </div>
         </div>
-        """, height=34)
+        """,
+            height=34,
+        )
 
     st.write("")
 
-    tab_spot, tab_futures, tab_open, tab_ml, tab_toko = st.tabs(["📈 Spot", "⚡ Futures", "📋 Open Positions", "🧪 ML Shadow Metrics", "🏦 Tokocrypto"])
+    tab_spot, tab_futures, tab_open, tab_ml, tab_toko = st.tabs(
+        [
+            "📈 Spot",
+            "⚡ Futures",
+            "📋 Open Positions",
+            "🧪 ML Shadow Metrics",
+            "🏦 Tokocrypto",
+        ]
+    )
 
     # ── TAB 1: SPOT ──────────────────────────────────────────────────────────
     with tab_spot:
-        st.caption("Read-only analysis — Supabase: trades_spot  |  Stats are INDEPENDENT from Futures tab")
+        st.caption(
+            "Read-only analysis — Supabase: trades_spot  |  Stats are INDEPENDENT from Futures tab"
+        )
 
         df = load_trade_data()
 
@@ -2692,14 +3081,20 @@ def main():
         else:
             metrics = build_metrics(df)
             col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("Total trades",   metrics["total_trades"])
-            col2.metric("Resolved",       metrics["resolved_trades"])
-            col3.metric("Win rate",       f"{metrics['win_rate']:.2f}%")
-            col4.metric("Realized PnL",   f"${metrics['total_realized_pnl']:+.2f}")
-            col5.metric("Lab capital",    f"${metrics['lab_capital']:.2f}",
-                        delta=f"vs ${STARTING_LAB_CAPITAL:.0f}")
-            col6.metric("Effective N",    metrics["effective_n"],
-                        delta=f"raw {metrics['raw_trade_count']}")
+            col1.metric("Total trades", metrics["total_trades"])
+            col2.metric("Resolved", metrics["resolved_trades"])
+            col3.metric("Win rate", f"{metrics['win_rate']:.2f}%")
+            col4.metric("Realized PnL", f"${metrics['total_realized_pnl']:+.2f}")
+            col5.metric(
+                "Lab capital",
+                f"${metrics['lab_capital']:.2f}",
+                delta=f"vs ${STARTING_LAB_CAPITAL:.0f}",
+            )
+            col6.metric(
+                "Effective N",
+                metrics["effective_n"],
+                delta=f"raw {metrics['raw_trade_count']}",
+            )
 
             st.subheader("Equity curve")
             equity_fig = build_equity_curve(df)
@@ -2750,41 +3145,66 @@ def main():
 
     # ── TAB 2: FUTURES ───────────────────────────────────────────────────────
     with tab_futures:
-        st.caption("Read-only analysis — Supabase: trades_futures  |  Stats are INDEPENDENT from Spot tab")
-        st.caption("Effective N and Z-score computed per side (LONG/SHORT) independently — "
-                   "consistent with --stats-futures logic")
+        st.caption(
+            "Read-only analysis — Supabase: trades_futures  |  Stats are INDEPENDENT from Spot tab"
+        )
+        st.caption(
+            "Effective N and Z-score computed per side (LONG/SHORT) independently — "
+            "consistent with --stats-futures logic"
+        )
 
         fdf = load_futures_data()
 
         if fdf.empty:
-            st.info("No futures trade data yet. Run `python3 futures_trade_executor.py --propose` "
-                    "to place your first futures trade.")
+            st.info(
+                "No futures trade data yet. Run `python3 futures_trade_executor.py --propose` "
+                "to place your first futures trade."
+            )
         else:
             # ── Header metrics ────────────────────────────────────────────────
-            f_resolved     = fdf[fdf["is_resolved"]]
-            f_total        = int(len(fdf))
-            f_resolved_n   = int(len(f_resolved))
-            f_win_rate     = round(float(f_resolved["is_win"].mean() * 100) if f_resolved_n else 0.0, 1)
-            f_total_pnl    = round(float(f_resolved["realized_pnl_usd"].sum()) if f_resolved_n else 0.0, 4)
-            f_total_fund   = round(float(fdf["funding_rate_paid"].fillna(0).sum()), 4)
-            f_net_pnl      = round(f_total_pnl + f_total_fund, 4)
-            f_avg_liq_dist = round(float(fdf["distance_to_liquidation_pct"].mean()), 2) \
-                             if "distance_to_liquidation_pct" in fdf.columns else 0.0
-            f_leverage     = int(fdf["leverage"].dropna().mode()[0]) \
-                             if "leverage" in fdf.columns and not fdf["leverage"].dropna().empty else "?"
+            f_resolved = fdf[fdf["is_resolved"]]
+            f_total = int(len(fdf))
+            f_resolved_n = int(len(f_resolved))
+            f_win_rate = round(
+                float(f_resolved["is_win"].mean() * 100) if f_resolved_n else 0.0, 1
+            )
+            f_total_pnl = round(
+                float(f_resolved["realized_pnl_usd"].sum()) if f_resolved_n else 0.0, 4
+            )
+            f_total_fund = round(float(fdf["funding_rate_paid"].fillna(0).sum()), 4)
+            f_net_pnl = round(f_total_pnl + f_total_fund, 4)
+            f_avg_liq_dist = (
+                round(float(fdf["distance_to_liquidation_pct"].mean()), 2)
+                if "distance_to_liquidation_pct" in fdf.columns
+                else 0.0
+            )
+            f_leverage = (
+                int(fdf["leverage"].dropna().mode()[0])
+                if "leverage" in fdf.columns and not fdf["leverage"].dropna().empty
+                else "?"
+            )
 
             col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("Total trades",       f_total)
-            col2.metric("Resolved",           f_resolved_n)
+            col1.metric("Total trades", f_total)
+            col2.metric("Resolved", f_resolved_n)
             col3.metric("Win rate (overall)", f"{f_win_rate:.1f}%")
-            col4.metric("Realized PnL",       f"${f_total_pnl:+.4f}")
-            col5.metric("Funding accrued",    f"${f_total_fund:+.4f}",
-                        delta=f"Net ${f_net_pnl:+.4f}", delta_color="inverse")
-            col6.metric("Avg liq distance",   f"{f_avg_liq_dist:.1f}%",
-                        delta=f"{f_leverage}x leverage")
+            col4.metric("Realized PnL", f"${f_total_pnl:+.4f}")
+            col5.metric(
+                "Funding accrued",
+                f"${f_total_fund:+.4f}",
+                delta=f"Net ${f_net_pnl:+.4f}",
+                delta_color="inverse",
+            )
+            col6.metric(
+                "Avg liq distance",
+                f"{f_avg_liq_dist:.1f}%",
+                delta=f"{f_leverage}x leverage",
+            )
 
             # ── Per-side stats (z-score + effective-n independent per side) ───
-            st.subheader("Stats by side — LONG / SHORT (independent effective-n & z-score)")
+            st.subheader(
+                "Stats by side — LONG / SHORT (independent effective-n & z-score)"
+            )
             side_stats = build_futures_side_stats(fdf)
             render_futures_side_stats(side_stats)
 
@@ -2814,20 +3234,41 @@ def main():
 
             # ── Futures-specific details table ────────────────────────────────
             st.subheader("Open & closed futures positions")
-            display_cols = [c for c in [
-                "symbol", "position_side", "entry_status", "exit_status",
-                "entry_price", "entry_fill_price", "sl", "tp1",
-                "leverage", "liquidation_price", "distance_to_liquidation_pct",
-                "realized_pnl_usd", "realized_pnl_pct", "funding_rate_paid",
-                "planned_rr", "risk_pct", "volatility_regime_at_entry",
-                "correlation_cluster_id", "open_time",
-            ] if c in fdf.columns]
+            display_cols = [
+                c
+                for c in [
+                    "symbol",
+                    "position_side",
+                    "entry_status",
+                    "exit_status",
+                    "entry_price",
+                    "entry_fill_price",
+                    "sl",
+                    "tp1",
+                    "leverage",
+                    "liquidation_price",
+                    "distance_to_liquidation_pct",
+                    "realized_pnl_usd",
+                    "realized_pnl_pct",
+                    "funding_rate_paid",
+                    "planned_rr",
+                    "risk_pct",
+                    "volatility_regime_at_entry",
+                    "correlation_cluster_id",
+                    "open_time",
+                ]
+                if c in fdf.columns
+            ]
             with st.expander("Show full futures trade log", expanded=False):
-                st.dataframe(fdf[display_cols], use_container_width=True, hide_index=True)
+                st.dataframe(
+                    fdf[display_cols], use_container_width=True, hide_index=True
+                )
 
     # ── TAB 3: OPEN POSITIONS ─────────────────────────────────────────────
     with tab_open:
-        st.caption("Live view of all open positions + trades resolved in the last 24h  |  Read-only")
+        st.caption(
+            "Live view of all open positions + trades resolved in the last 24h  |  Read-only"
+        )
 
         # ── Check Positions button ────────────────────────────────────────
         st.markdown("#### Run check-positions")
@@ -2835,9 +3276,10 @@ def main():
 
         if _run_all:
             import subprocess, sys, os
+
             _env = {**os.environ}  # inherits all .env vars already loaded
             _jobs = [
-                ("📈 Spot",    "paper_trade_executor.py"),
+                ("📈 Spot", "paper_trade_executor.py"),
                 ("⚡ Futures", "futures_trade_executor.py"),
             ]
 
@@ -2846,13 +3288,15 @@ def main():
                     try:
                         _proc = subprocess.run(
                             [sys.executable, _script, "--check-positions"],
-                            capture_output=True, text=True, timeout=120,
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
                             cwd=str(Path(__file__).parent),
                             env=_env,
                         )
                         _stdout = _proc.stdout.strip()
                         _stderr = _proc.stderr.strip()
-                        _rc     = _proc.returncode
+                        _rc = _proc.returncode
                     except subprocess.TimeoutExpired:
                         _stdout, _stderr, _rc = "", "Timed out after 120 s", 1
                     except Exception as _exc:
@@ -2881,7 +3325,9 @@ def main():
         try:
             _t0 = time.perf_counter()
             snapshot = get_fresh_snapshot()
-            log_timing(f"[TIMING] dashboard.tab_open.get_fresh_snapshot.spot: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            log_timing(
+                f"[TIMING] dashboard.tab_open.get_fresh_snapshot.spot: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+            )
             _spot_rows = list(snapshot.get("spot_rows") or [])
             with global_state.lock:
                 global_state.spot_rows = _spot_rows
@@ -2893,7 +3339,9 @@ def main():
         try:
             _t0 = time.perf_counter()
             snapshot = get_fresh_snapshot()
-            log_timing(f"[TIMING] dashboard.tab_open.get_fresh_snapshot.futures: {(time.perf_counter() - _t0) * 1000:.0f}ms")
+            log_timing(
+                f"[TIMING] dashboard.tab_open.get_fresh_snapshot.futures: {(time.perf_counter() - _t0) * 1000:.0f}ms"
+            )
             _futures_rows = list(snapshot.get("futures_rows") or [])
             with global_state.lock:
                 global_state.futures_rows = _futures_rows
@@ -2912,9 +3360,9 @@ def main():
             f"Version: `{ml_display['version']}` · "
             f"Mode: **{ml_display['mode']}**"
         )
-        
+
         df_spot_ml = load_trade_data()
-        
+
         if df_spot_ml.empty:
             st.info("No spot trades found.")
         else:
@@ -2923,7 +3371,10 @@ def main():
                 ml_display["version"],
             )
             historical_resolved = df_spot_ml[
-                df_spot_ml["exit_status"].fillna("").astype(str).str.upper()
+                df_spot_ml["exit_status"]
+                .fillna("")
+                .astype(str)
+                .str.upper()
                 .isin(["TP_HIT", "SL_HIT"])
             ]
 
@@ -2942,7 +3393,10 @@ def main():
                 m4.metric("Avg V3 Score", f"{avg_score:.3f}")
             else:
                 m3.metric("V3 Win Rate", "—")
-                m4.metric("Avg V3 Score", f"{scored['ml_score'].mean():.3f}" if not scored.empty else "—")
+                m4.metric(
+                    "Avg V3 Score",
+                    f"{scored['ml_score'].mean():.3f}" if not scored.empty else "—",
+                )
 
             st.caption(
                 f"Forward V3 only · Pending outcomes: {len(scored) - len(scored_resolved)} · "
@@ -2968,11 +3422,15 @@ def main():
                         {True: "✅ Win (TP Hit)", False: "🔴 Loss (SL Hit)"}
                     )
                     fig_dist = px.histogram(
-                        scored_resolved, x="ml_score", color="Outcome",
-                        nbins=20, barmode="overlay", opacity=0.7,
+                        scored_resolved,
+                        x="ml_score",
+                        color="Outcome",
+                        nbins=20,
+                        barmode="overlay",
+                        opacity=0.7,
                         color_discrete_map={
                             "✅ Win (TP Hit)": "#2ca02c",
-                            "🔴 Loss (SL Hit)": "#d62728"
+                            "🔴 Loss (SL Hit)": "#d62728",
                         },
                         labels={"ml_score": "ML Score (P(win))"},
                     )
@@ -2987,11 +3445,13 @@ def main():
                 with col_right:
                     st.markdown("#### Score Box Plot by Outcome")
                     fig_box = px.box(
-                        scored_resolved, x="Outcome", y="ml_score",
+                        scored_resolved,
+                        x="Outcome",
+                        y="ml_score",
                         color="Outcome",
                         color_discrete_map={
                             "✅ Win (TP Hit)": "#2ca02c",
-                            "🔴 Loss (SL Hit)": "#d62728"
+                            "🔴 Loss (SL Hit)": "#d62728",
                         },
                         labels={"ml_score": "ML Score"},
                     )
@@ -3000,7 +3460,9 @@ def main():
 
                 # ── Threshold Simulation ─────────────────────────────────
                 st.markdown("#### 🎯 Threshold Simulation (What-If)")
-                st.caption("If we had used the ML score to filter trades, what would be the impact?")
+                st.caption(
+                    "If we had used the ML score to filter trades, what would be the impact?"
+                )
 
                 thresh_data = []
                 for thresh in np.arange(0.1, 0.95, 0.05):
@@ -3011,31 +3473,46 @@ def main():
                     wr = approved["is_win"].mean() * 100
                     pnl = approved["realized_pnl_usd"].sum()
                     filtered = len(scored_resolved) - n_app
-                    thresh_data.append({
-                        "Threshold": f"≥ {thresh:.2f}",
-                        "Trades": n_app,
-                        "Filtered": filtered,
-                        "Win Rate (%)": round(wr, 1),
-                        "Total PnL ($)": round(pnl, 2),
-                    })
+                    thresh_data.append(
+                        {
+                            "Threshold": f"≥ {thresh:.2f}",
+                            "Trades": n_app,
+                            "Filtered": filtered,
+                            "Win Rate (%)": round(wr, 1),
+                            "Total PnL ($)": round(pnl, 2),
+                        }
+                    )
 
                 if thresh_data:
-                    st.dataframe(pd.DataFrame(thresh_data), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        pd.DataFrame(thresh_data),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                 # ── Score vs PnL scatter ─────────────────────────────────
                 st.markdown("#### ML Score vs Realized PnL")
                 fig_scatter = px.scatter(
-                    scored_resolved, x="ml_score", y="realized_pnl_pct",
+                    scored_resolved,
+                    x="ml_score",
+                    y="realized_pnl_pct",
                     color="Outcome",
                     color_discrete_map={
                         "✅ Win (TP Hit)": "#2ca02c",
-                        "🔴 Loss (SL Hit)": "#d62728"
+                        "🔴 Loss (SL Hit)": "#d62728",
                     },
                     hover_name="symbol",
-                    labels={"ml_score": "ML Score", "realized_pnl_pct": "Realized PnL (%)"},
+                    labels={
+                        "ml_score": "ML Score",
+                        "realized_pnl_pct": "Realized PnL (%)",
+                    },
                 )
-                fig_scatter.add_vline(x=0.5, line_dash="dash", line_color="gray",
-                                      annotation_text="Default threshold")
+                fig_scatter.add_vline(
+                    x=0.5,
+                    line_dash="dash",
+                    line_color="gray",
+                    annotation_text="Default threshold",
+                )
                 fig_scatter.update_layout(template="plotly_white")
                 st.plotly_chart(fig_scatter, use_container_width=True)
 
@@ -3045,22 +3522,46 @@ def main():
 
                 wins_scored = scored_resolved[scored_resolved["is_win"]]
                 losses_scored = scored_resolved[~scored_resolved["is_win"]]
-                avg_win_score = wins_scored["ml_score"].mean() if not wins_scored.empty else float("nan")
-                avg_loss_score = losses_scored["ml_score"].mean() if not losses_scored.empty else float("nan")
+                avg_win_score = (
+                    wins_scored["ml_score"].mean()
+                    if not wins_scored.empty
+                    else float("nan")
+                )
+                avg_loss_score = (
+                    losses_scored["ml_score"].mean()
+                    if not losses_scored.empty
+                    else float("nan")
+                )
 
                 d1, d2, d3 = st.columns(3)
-                d1.metric("Avg Score (Wins)", f"{avg_win_score:.3f}" if not pd.isna(avg_win_score) else "—")
-                d2.metric("Avg Score (Losses)", f"{avg_loss_score:.3f}" if not pd.isna(avg_loss_score) else "—")
-                score_gap = avg_win_score - avg_loss_score if not (pd.isna(avg_win_score) or pd.isna(avg_loss_score)) else 0
+                d1.metric(
+                    "Avg Score (Wins)",
+                    f"{avg_win_score:.3f}" if not pd.isna(avg_win_score) else "—",
+                )
+                d2.metric(
+                    "Avg Score (Losses)",
+                    f"{avg_loss_score:.3f}" if not pd.isna(avg_loss_score) else "—",
+                )
+                score_gap = (
+                    avg_win_score - avg_loss_score
+                    if not (pd.isna(avg_win_score) or pd.isna(avg_loss_score))
+                    else 0
+                )
                 d3.metric("Score Gap (Win - Loss)", f"{score_gap:+.3f}")
 
                 if abs(score_gap) < 0.05:
-                    st.warning("⚠️ **Score gap < 0.05** — Model cannot distinguish wins from losses. "
-                               "ROC-AUC ≈ 0.50 (random). Shadow scoring is collecting data only.")
+                    st.warning(
+                        "⚠️ **Score gap < 0.05** — Model cannot distinguish wins from losses. "
+                        "ROC-AUC ≈ 0.50 (random). Shadow scoring is collecting data only."
+                    )
                 elif score_gap > 0.05:
-                    st.success("✅ **Positive score gap detected.** Monitor ROC-AUC trend as N grows.")
+                    st.success(
+                        "✅ **Positive score gap detected.** Monitor ROC-AUC trend as N grows."
+                    )
                 else:
-                    st.error("🔴 **Negative score gap** — Model is inversely correlated. Needs retraining.")
+                    st.error(
+                        "🔴 **Negative score gap** — Model is inversely correlated. Needs retraining."
+                    )
 
                 st.caption(
                     f"ℹ️ ML {ml_display['version']} Shadow Scoring is **Spot-only**. "
@@ -3077,14 +3578,16 @@ def main():
             "letter-spacing:0.03em'>🏦 REAL MONEY — Tokocrypto Spot &nbsp;·&nbsp; IDR</div>",
             unsafe_allow_html=True,
         )
-        st.caption("Read-only analysis — Supabase: Toko_Crypto_Spot  |  Stats are INDEPENDENT from Spot/Futures tabs")
+        st.caption(
+            "Read-only analysis — Supabase: Toko_Crypto_Spot  |  Stats are INDEPENDENT from Spot/Futures tabs"
+        )
 
         # ── Load data ─────────────────────────────────────────────────────
         toko_df = load_tokocrypto_data()
 
         # Determine current phase
-        _current_phase  = 1
-        _supervised     = True
+        _current_phase = 1
+        _supervised = True
         if not toko_df.empty and "trading_phase" in toko_df.columns:
             try:
                 _phase_source = (
@@ -3115,8 +3618,8 @@ def main():
         _supervised_badge = (
             "<span style='background:#555;color:#eee;border-radius:3px;"
             "padding:1px 7px;font-size:0.82em'>manual-supervised</span>"
-            if _supervised else
-            "<span style='background:#8b0000;color:#fff;border-radius:3px;"
+            if _supervised
+            else "<span style='background:#8b0000;color:#fff;border-radius:3px;"
             "padding:1px 7px;font-size:0.82em;font-weight:700'>AUTOMATED</span>"
         )
 
@@ -3129,7 +3632,9 @@ def main():
 
         # Connection bar
         _toko_conn_color = "#2ca02c" if global_state.connected else "#d62728"
-        _toko_conn_text  = "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        _toko_conn_text = (
+            "🟢 Realtime Connected" if global_state.connected else "🔴 Disconnected"
+        )
         st.markdown(
             f"<div style='font-size:0.84em;color:#888'>"
             f"{_toko_conn_text} &nbsp;·&nbsp; "
@@ -3148,18 +3653,21 @@ def main():
 
             # Fetch portfolio data
             _idr_balance: float | None = None
-            _idr_locked:  float | None = None
+            _idr_locked: float | None = None
             _all_balances: list = []
             _toko_client = None
             try:
                 from core.clients.tokocrypto_client import TokocryptoClient
+
                 _toko_client = TokocryptoClient.build()
                 if _toko_client.authenticated:
                     _all_balances = _toko_client.get_balances()
-                    _idr_obj = next((b for b in _all_balances if b.asset == "IDR"), None)
+                    _idr_obj = next(
+                        (b for b in _all_balances if b.asset == "IDR"), None
+                    )
                     if _idr_obj:
                         _idr_balance = _idr_obj.free
-                        _idr_locked  = _idr_obj.locked
+                        _idr_locked = _idr_obj.locked
             except Exception as _e:
                 st.warning(f"Could not fetch IDR balance from Tokocrypto: {_e}")
 
@@ -3186,7 +3694,7 @@ def main():
                     except Exception:
                         try:
                             _usdt_price = _toko_client.get_ticker(f"{_bal.asset}_USDT")
-                            _usdt_idr   = _toko_client.get_ticker("USDT_IDR")
+                            _usdt_idr = _toko_client.get_ticker("USDT_IDR")
                             _asset_price_idr = _usdt_price * _usdt_idr
                             _asset_value_idr = _asset_total * _asset_price_idr
                         except Exception:
@@ -3195,14 +3703,16 @@ def main():
 
                     _crypto_holdings_idr += _asset_value_idr
                     _total_portfolio_idr += _asset_value_idr
-                    _holdings_breakdown.append({
-                        "Asset": _bal.asset,
-                        "Free": _bal.free,
-                        "Locked": _bal.locked,
-                        "Total Qty": _asset_total,
-                        "Price (IDR)": _asset_price_idr,
-                        "Value (IDR)": _asset_value_idr,
-                    })
+                    _holdings_breakdown.append(
+                        {
+                            "Asset": _bal.asset,
+                            "Free": _bal.free,
+                            "Locked": _bal.locked,
+                            "Total Qty": _asset_total,
+                            "Price (IDR)": _asset_price_idr,
+                            "Value (IDR)": _asset_value_idr,
+                        }
+                    )
 
                 _holdings_breakdown.sort(key=lambda x: x["Value (IDR)"], reverse=True)
 
@@ -3213,17 +3723,24 @@ def main():
 
             # ── Row 1: Header metrics (same pattern as Spot col1-6) ───────
             col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("Total trades",   _toko_metrics["total_trades"])
-            col2.metric("Resolved",       _toko_metrics["resolved_count"])
-            col3.metric("Win rate",       f"{_toko_metrics['win_rate']:.2f}%")
-            col4.metric("Realized PnL",   _fmt_idr(_toko_metrics["total_pnl_idr"]))
-            col5.metric("💰 Portfolio",
-                        _fmt_idr(_total_portfolio_idr),
-                        delta=f"{_fmt_idr(_total_portfolio_idr - TOKO_INITIAL_DEPOSIT_IDR)} vs deposit"
-                        if _total_portfolio_idr is not None else None)
-            col6.metric("Slots",
-                        f"{_slots_occupied} / {MAX_TOKO_SLOTS}",
-                        delta=f"slot {_fmt_idr(_slot_size)}" if _slot_size else None)
+            col1.metric("Total trades", _toko_metrics["total_trades"])
+            col2.metric("Resolved", _toko_metrics["resolved_count"])
+            col3.metric("Win rate", f"{_toko_metrics['win_rate']:.2f}%")
+            col4.metric("Realized PnL", _fmt_idr(_toko_metrics["total_pnl_idr"]))
+            col5.metric(
+                "💰 Portfolio",
+                _fmt_idr(_total_portfolio_idr),
+                delta=(
+                    f"{_fmt_idr(_total_portfolio_idr - TOKO_INITIAL_DEPOSIT_IDR)} vs deposit"
+                    if _total_portfolio_idr is not None
+                    else None
+                ),
+            )
+            col6.metric(
+                "Slots",
+                f"{_slots_occupied} / {MAX_TOKO_SLOTS}",
+                delta=f"slot {_fmt_idr(_slot_size)}" if _slot_size else None,
+            )
 
             # ── Capital detail (collapsible) ──────────────────────────────
             with st.expander("💵 Capital & Wallet Details", expanded=False):
@@ -3235,25 +3752,40 @@ def main():
                 )
                 cap_c2.metric(
                     "IDR Cash (free + locked)",
-                    _fmt_idr((_idr_balance or 0) + (_idr_locked or 0))
-                    if _idr_balance is not None else "—",
+                    (
+                        _fmt_idr((_idr_balance or 0) + (_idr_locked or 0))
+                        if _idr_balance is not None
+                        else "—"
+                    ),
                 )
                 cap_c3.metric(
                     "Crypto Holdings Value",
-                    _fmt_idr(_crypto_holdings_idr) if _crypto_holdings_idr > 0 else "Rp 0",
-                    delta=f"{len(_holdings_breakdown)} asset(s)"
-                    if _holdings_breakdown else None,
+                    (
+                        _fmt_idr(_crypto_holdings_idr)
+                        if _crypto_holdings_idr > 0
+                        else "Rp 0"
+                    ),
+                    delta=(
+                        f"{len(_holdings_breakdown)} asset(s)"
+                        if _holdings_breakdown
+                        else None
+                    ),
                 )
                 cap_c4.metric(
                     "Balance vs Initial Deposit",
                     _fmt_idr(_idr_balance) if _idr_balance is not None else "—",
-                    delta=f"{_fmt_idr(_idr_balance - TOKO_INITIAL_DEPOSIT_IDR)} vs Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f}"
-                    if _idr_balance is not None else None,
+                    delta=(
+                        f"{_fmt_idr(_idr_balance - TOKO_INITIAL_DEPOSIT_IDR)} vs Rp {TOKO_INITIAL_DEPOSIT_IDR:,.0f}"
+                        if _idr_balance is not None
+                        else None
+                    ),
                 )
 
                 # Wallet breakdown table
                 if _holdings_breakdown:
-                    st.markdown(f"**🪙 Wallet Holdings ({len(_holdings_breakdown)} assets)**")
+                    st.markdown(
+                        f"**🪙 Wallet Holdings ({len(_holdings_breakdown)} assets)**"
+                    )
                     _hold_df = pd.DataFrame(_holdings_breakdown)
                     _hold_display = _hold_df.copy()
                     _hold_display["Price (IDR)"] = _hold_display["Price (IDR)"].apply(
@@ -3271,7 +3803,104 @@ def main():
                     _hold_display["Total Qty"] = _hold_display["Total Qty"].apply(
                         lambda v: f"{v:,.8f}".rstrip("0").rstrip(".")
                     )
-                    st.dataframe(_hold_display, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        _hold_display, use_container_width=True, hide_index=True
+                    )
+
+                # ── Dust Balances Indicator (Read-Only) ───────────────────
+                _dust_summary = None
+                try:
+                    from core.utils.tokocrypto_dust import (
+                        classify_and_aggregate_dust,
+                        DUST_CANDIDATE,
+                        ACTIVE_POSITION_RESIDUAL,
+                        UNVERIFIED,
+                        DISCLAIMER_TEXT,
+                    )
+
+                    _ex_open = None
+                    if _toko_client:
+                        try:
+                            _ex_open = _toko_client.get_open_orders()
+                        except Exception:
+                            _ex_open = None
+
+                    _db_trades = toko_df.to_dict("records") if not toko_df.empty else []
+                    _dust_summary = classify_and_aggregate_dust(
+                        balances=_all_balances,
+                        client=_toko_client,
+                        open_trades=_db_trades,
+                        exchange_open_orders=_ex_open,
+                    )
+                except Exception as _dust_exc:
+                    _dust_summary = None
+
+                if _dust_summary and _dust_summary.items:
+                    st.markdown("---")
+                    st.markdown("**🧹 Indikator Saldo Kecil (Dust)**")
+                    st.caption(
+                        "Deteksi saldo kecil residu untuk dipertimbangkan konversi manual di aplikasi Tokocrypto."
+                    )
+
+                    dc1, dc2, dc3 = st.columns(3)
+                    dc1.metric(
+                        "Total Debu Bebas (Eligible)",
+                        f"Rp {_dust_summary.total_eligible_dust_idr:,.0f}",
+                        delta=f"{_dust_summary.eligible_count} aset siap tukar",
+                    )
+                    dc2.metric(
+                        "Residu Terkait Posisi/Order",
+                        f"{_dust_summary.active_residual_count} aset",
+                        delta="Dilindungi (Jangan ditukar)",
+                        delta_color="off",
+                    )
+                    dc3.metric(
+                        "Ambang Batas Dust",
+                        f"< Rp {_dust_summary.threshold_idr:,.0f}",
+                        delta="Configurable",
+                        delta_color="off",
+                    )
+
+                    _dust_table = []
+                    for _ditem in _dust_summary.items:
+                        _badge = (
+                            "🟢 DUST_CANDIDATE"
+                            if _ditem.classification == DUST_CANDIDATE
+                            else (
+                                "🟡 ACTIVE_POSITION_RESIDUAL"
+                                if _ditem.classification == ACTIVE_POSITION_RESIDUAL
+                                else "⚪ UNVERIFIED"
+                            )
+                        )
+                        _v_str = (
+                            f"Rp {_ditem.estimated_value_idr:,.0f}"
+                            if _ditem.estimated_value_idr is not None
+                            else "—"
+                        )
+                        _p_str = (
+                            f"Rp {_ditem.price_idr:,.2f}"
+                            if _ditem.price_idr is not None
+                            else "—"
+                        )
+                        _note = _ditem.warning or _ditem.reason or "—"
+                        _dust_table.append(
+                            {
+                                "Asset": _ditem.asset,
+                                "Free": f"{_ditem.free:,.8f}".rstrip("0").rstrip("."),
+                                "Locked": f"{_ditem.locked:,.8f}".rstrip("0").rstrip("."),
+                                "Price (IDR)": _p_str,
+                                "Est. Nilai (IDR)": _v_str,
+                                "Klasifikasi": _badge,
+                                "Catatan": _note,
+                            }
+                        )
+
+                    st.dataframe(
+                        pd.DataFrame(_dust_table),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(f"ℹ️ *{DISCLAIMER_TEXT}*")
 
             # ── Anomaly panel (always visible) ────────────────────────────
             if not toko_df.empty and "has_anomaly" in toko_df.columns:
@@ -3287,14 +3916,23 @@ def main():
                     unsafe_allow_html=True,
                 )
                 for _arow in _anomaly_rows:
-                    _a_sym       = _arow.get("symbol", "?")
-                    _a_state     = _arow.get("oco_state", "?")
-                    _a_detected  = _arow.get("oco_state_detected_at", "?")
-                    _a_tp_id     = _arow.get("tp_order_id", "n/a")
-                    _a_sl_id     = _arow.get("sl_order_id", "n/a")
-                    _a_exit_st   = _arow.get("exit_status") or "OPEN"
-                    _a_entry_st  = _arow.get("entry_status") or "n/a"
-                    _a_age       = _age_str(_arow.get("anomaly_age_seconds"))
+                    _a_sym = _arow.get("symbol", "?")
+                    _a_state = _arow.get("oco_state", "?")
+                    _a_detected_raw = _arow.get("oco_state_detected_at")
+                    _a_detected = "—"
+                    if _a_detected_raw is not None and str(_a_detected_raw).lower() not in ("none", "nan", "null", ""):
+                        _a_detected = str(_a_detected_raw)
+
+                    def _clean_id(val) -> str:
+                        if val is None or str(val).lower() in ("none", "nan", "null", ""):
+                            return "n/a"
+                        return str(val)
+
+                    _a_tp_id = _clean_id(_arow.get("tp_order_id"))
+                    _a_sl_id = _clean_id(_arow.get("sl_order_id"))
+                    _a_exit_st = _arow.get("exit_status") or "OPEN"
+                    _a_entry_st = _arow.get("entry_status") or "n/a"
+                    _a_age = _age_str(_arow.get("anomaly_age_seconds"))
 
                     with st.container(border=True):
                         st.markdown(
@@ -3308,7 +3946,9 @@ def main():
                         ac1, ac2, ac3 = st.columns(3)
                         ac1.markdown(f"**Detected at:** `{_a_detected}`")
                         ac2.markdown(f"**Age:** {_a_age}")
-                        ac3.markdown(f"**Entry status:** `{_a_entry_st}` &nbsp; **Exit status:** `{_a_exit_st}`")
+                        ac3.markdown(
+                            f"**Entry status:** `{_a_entry_st}` &nbsp; **Exit status:** `{_a_exit_st}`"
+                        )
                         st.markdown(
                             f"TP order ID: `{_a_tp_id}` &nbsp;·&nbsp; SL order ID: `{_a_sl_id}`"
                         )
@@ -3326,8 +3966,10 @@ def main():
             st.subheader("Open Positions")
 
             _open_mask = (
-                toko_df["exit_status"].fillna("").astype(str).str.upper() == "OPEN"
-            ) if "exit_status" in toko_df.columns else pd.Series(False, index=toko_df.index)
+                (toko_df["exit_status"].fillna("").astype(str).str.upper() == "OPEN")
+                if "exit_status" in toko_df.columns
+                else pd.Series(False, index=toko_df.index)
+            )
             _open_toko = toko_df[_open_mask].copy()
 
             if _open_toko.empty:
@@ -3340,7 +3982,9 @@ def main():
                         _o_sym = _orow.get("symbol", "")
                         if _o_sym and _o_sym not in _toko_live_prices:
                             try:
-                                _toko_live_prices[_o_sym] = _toko_client.get_ticker(_o_sym)
+                                _toko_live_prices[_o_sym] = _toko_client.get_ticker(
+                                    _o_sym
+                                )
                             except Exception:
                                 _toko_live_prices[_o_sym] = 0.0
 
@@ -3353,15 +3997,22 @@ def main():
             # ── Recently Resolved (24h) — visual cards ────────────────────
             st.divider()
             from datetime import timezone as _tz
-            _now_utc_toko = datetime.now(_tz.utc)
-            _cutoff_24h = (_now_utc_toko - timedelta(hours=24))
-            _resolved_toko = toko_df[
-                toko_df["is_resolved"] &
-                toko_df["exit_dt"].notna() &
-                (toko_df["exit_dt"] >= _cutoff_24h)
-            ].sort_values("exit_dt", ascending=False) if not toko_df.empty else pd.DataFrame()
 
-            st.subheader(f"Recently Resolved — last 24h ({len(_resolved_toko)} trade(s))")
+            _now_utc_toko = datetime.now(_tz.utc)
+            _cutoff_24h = _now_utc_toko - timedelta(hours=24)
+            _resolved_toko = (
+                toko_df[
+                    toko_df["is_resolved"]
+                    & toko_df["exit_dt"].notna()
+                    & (toko_df["exit_dt"] >= _cutoff_24h)
+                ].sort_values("exit_dt", ascending=False)
+                if not toko_df.empty
+                else pd.DataFrame()
+            )
+
+            st.subheader(
+                f"Recently Resolved — last 24h ({len(_resolved_toko)} trade(s))"
+            )
             if not _resolved_toko.empty:
                 for _, _rrow in _resolved_toko.iterrows():
                     render_toko_resolved_card(_rrow.to_dict())
@@ -3409,24 +4060,37 @@ def main():
 
             # ── Slippage Review ───────────────────────────────────────────
             st.subheader("Per-trade Slippage")
-            _slip_cols = [c for c in [
-                "symbol", "entry_fill_price", "slippage_pct",
-                "exit_price" if "exit_price" in toko_df.columns else None,
-                "exit_fill_slippage_pct", "exit_reason",
-            ] if c and c in toko_df.columns]
+            _slip_cols = [
+                c
+                for c in [
+                    "symbol",
+                    "entry_fill_price",
+                    "slippage_pct",
+                    "exit_price" if "exit_price" in toko_df.columns else None,
+                    "exit_fill_slippage_pct",
+                    "exit_reason",
+                ]
+                if c and c in toko_df.columns
+            ]
             if _slip_cols and _toko_metrics["resolved_count"] > 0:
                 _slip_df = toko_df[toko_df["is_resolved"]][_slip_cols].copy()
                 if "slippage_pct" in _slip_df.columns:
-                    _slip_df["entry_slip_flag"] = _slip_df["slippage_pct"].abs().gt(
-                        TOKO_SLIP_ENTRY_THRESHOLD_PCT
+                    _slip_df["entry_slip_flag"] = (
+                        _slip_df["slippage_pct"].abs().gt(TOKO_SLIP_ENTRY_THRESHOLD_PCT)
                     )
                 if "exit_fill_slippage_pct" in _slip_df.columns:
-                    _slip_df["exit_slip_flag"] = _slip_df["exit_fill_slippage_pct"].abs().gt(
-                        TOKO_SLIP_EXIT_THRESHOLD_PCT
+                    _slip_df["exit_slip_flag"] = (
+                        _slip_df["exit_fill_slippage_pct"]
+                        .abs()
+                        .gt(TOKO_SLIP_EXIT_THRESHOLD_PCT)
                     )
                 st.dataframe(_slip_df, use_container_width=True, hide_index=True)
-                _n_entry_flag = int(_slip_df.get("entry_slip_flag", pd.Series(dtype=bool)).sum())
-                _n_exit_flag  = int(_slip_df.get("exit_slip_flag",  pd.Series(dtype=bool)).sum())
+                _n_entry_flag = int(
+                    _slip_df.get("entry_slip_flag", pd.Series(dtype=bool)).sum()
+                )
+                _n_exit_flag = int(
+                    _slip_df.get("exit_slip_flag", pd.Series(dtype=bool)).sum()
+                )
                 if _n_entry_flag or _n_exit_flag:
                     st.warning(
                         f"⚠ {_n_entry_flag} trade(s) exceeded entry slippage threshold "
@@ -3463,7 +4127,6 @@ def main():
             "No order placement on this dashboard · "
             f"Phase {_current_phase} {'(manual-supervised)' if _supervised else '(automated)'}"
         )
-
 
     # Realtime is the normal path.  This is its bounded fallback for a missed
     # WebSocket event: query only in the short period after an expected cycle,
@@ -3518,11 +4181,15 @@ def main():
                 )
                 return
 
-            refresh_target_wib = next_expected_wib + timedelta(seconds=NORMAL_REFRESH_BUFFER_SECONDS)
+            refresh_target_wib = next_expected_wib + timedelta(
+                seconds=NORMAL_REFRESH_BUFFER_SECONDS
+            )
             fallback_window_end_wib = refresh_target_wib + timedelta(
                 seconds=HEARTBEAT_FALLBACK_WINDOW_SECONDS
             )
-            should_poll = refresh_target_wib <= watcher_now_wib < fallback_window_end_wib
+            should_poll = (
+                refresh_target_wib <= watcher_now_wib < fallback_window_end_wib
+            )
             log_timing(
                 f"[TIMING] scheduled_refresh_watcher_tick: "
                 f"{watcher_context} "
@@ -3541,7 +4208,10 @@ def main():
             current_last_seen_wib = _parse_iso_to_wib(
                 (current_heartbeat or {}).get("last_seen_at")
             )
-            if current_last_seen_wib is None or current_last_seen_wib < next_expected_wib:
+            if (
+                current_last_seen_wib is None
+                or current_last_seen_wib < next_expected_wib
+            ):
                 log_timing(
                     f"[TIMING] scheduled_refresh_watcher_poll: {watcher_context} "
                     "heartbeat_not_advanced=True",

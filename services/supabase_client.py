@@ -21,6 +21,7 @@ from services.timing_logger import log_timing
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -45,9 +46,7 @@ def get_client():
     key = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
     if not url or not key:
-        raise RuntimeError(
-            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env"
-        )
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env")
 
     placeholders = ("your_", "paste_", "replace_", "changeme", "<project")
     for p in placeholders:
@@ -62,15 +61,16 @@ def get_client():
 # ---------------------------------------------------------------------------
 # Table constants — single source of truth
 # ---------------------------------------------------------------------------
-TABLE_SPOT        = "trades_spot"
-TABLE_FUTURES     = "trades_futures"
-TABLE_HEARTBEAT   = "system_heartbeat"   # bot liveness + next cycle promise
-TABLE_TOKOCRYPTO  = "Toko_Crypto_Spot"
+TABLE_SPOT = "trades_spot"
+TABLE_FUTURES = "trades_futures"
+TABLE_HEARTBEAT = "system_heartbeat"  # bot liveness + next cycle promise
+TABLE_TOKOCRYPTO = "Toko_Crypto_Spot"
 
 
 # ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
+
 
 def fetch_all_spot() -> list[dict]:
     """
@@ -101,38 +101,47 @@ def fetch_all_futures() -> list[dict]:
 
 def upsert_spot(record: dict) -> None:
     """Insert or update a single spot trade row (keyed on entry_order_id)."""
-    get_client().table(TABLE_SPOT).upsert(record, on_conflict="entry_order_id").execute()
+    get_client().table(TABLE_SPOT).upsert(
+        record, on_conflict="entry_order_id"
+    ).execute()
 
 
 def upsert_futures(record: dict) -> None:
     """Insert or update a single futures trade row (keyed on entry_order_id)."""
-    get_client().table(TABLE_FUTURES).upsert(record, on_conflict="entry_order_id").execute()
+    get_client().table(TABLE_FUTURES).upsert(
+        record, on_conflict="entry_order_id"
+    ).execute()
 
 
 def update_spot_by_order_id(entry_order_id: int, fields: dict) -> None:
     """Patch specific fields on an existing spot row."""
-    (get_client()
-     .table(TABLE_SPOT)
-     .update(fields)
-     .eq("entry_order_id", entry_order_id)
-     .execute())
+    (
+        get_client()
+        .table(TABLE_SPOT)
+        .update(fields)
+        .eq("entry_order_id", entry_order_id)
+        .execute()
+    )
 
 
 def update_futures_by_order_id(entry_order_id: int, fields: dict) -> None:
     """Patch specific fields on an existing futures row."""
-    (get_client()
-     .table(TABLE_FUTURES)
-     .update(fields)
-     .eq("entry_order_id", entry_order_id)
-     .execute())
+    (
+        get_client()
+        .table(TABLE_FUTURES)
+        .update(fields)
+        .eq("entry_order_id", entry_order_id)
+        .execute()
+    )
 
 
 def send_heartbeat():
     try:
         from datetime import datetime, timezone
+
         rows = fetch_all_spot()
         if rows:
-            last_id = rows[-1]['entry_order_id'] # Use the most recent record
+            last_id = rows[-1]["entry_order_id"]  # Use the most recent record
             now_iso = datetime.now(timezone.utc).isoformat()
             update_spot_by_order_id(last_id, {"updated_at": now_iso})
             print(f"💓 [HEARTBEAT] Pushed for Spot Order ID: {last_id}")
@@ -160,10 +169,10 @@ def upsert_heartbeat(last_seen_at: str, next_expected_at: str) -> None:
     try:
         get_client().table(TABLE_HEARTBEAT).upsert(
             {
-                "id":               1,
-                "last_seen_at":     last_seen_at,
+                "id": 1,
+                "last_seen_at": last_seen_at,
                 "next_expected_at": next_expected_at,
-                "updated_at":       last_seen_at,
+                "updated_at": last_seen_at,
             },
             on_conflict="id",
         ).execute()
@@ -212,7 +221,9 @@ def fetch_all_tokocrypto_strict() -> list[dict]:
 
 def upsert_tokocrypto(record: dict) -> None:
     try:
-        get_client().table(TABLE_TOKOCRYPTO).upsert(record, on_conflict="entry_order_id").execute()
+        get_client().table(TABLE_TOKOCRYPTO).upsert(
+            record, on_conflict="entry_order_id"
+        ).execute()
     except Exception as e:
         print(f"⚠️ upsert_tokocrypto failed: {e}")
         raise
@@ -220,12 +231,13 @@ def upsert_tokocrypto(record: dict) -> None:
 
 def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
     try:
-        (get_client()
-         .table(TABLE_TOKOCRYPTO)
-         .update(fields)
-         .eq("entry_order_id", entry_order_id)
-         .execute())
+        (
+            get_client()
+            .table(TABLE_TOKOCRYPTO)
+            .update(fields)
+            .eq("entry_order_id", entry_order_id)
+            .execute()
+        )
     except Exception as e:
         print(f"⚠️ update_tokocrypto_by_order_id failed: {e}")
         raise
-
