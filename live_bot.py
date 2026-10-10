@@ -27,6 +27,9 @@ Exchange maintenance handling:
 """
 
 import os
+# live_bot.py is the 24/7 production entrypoint; ensure production environment is set by default
+os.environ.setdefault("APP_ENV", "production")
+
 import time
 import subprocess
 import sys

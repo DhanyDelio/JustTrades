@@ -14,3 +14,4 @@ services:
     # Ensure Python output is not buffered (visible in docker logs)
     environment:
       - PYTHONUNBUFFERED=1
+      - APP_ENV=production

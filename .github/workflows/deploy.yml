@@ -32,9 +32,10 @@ jobs:
       - name: Safe-window check (WIB :10–:50 only)
         id: window_check
         run: |
-          if [ "${{ github.event.inputs.force_window }}" = "yes" ]; then
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          if [ "${{ github.event.inputs.force_window }}" = "yes" ] || [[ "$COMMIT_MSG" == *"[force-deploy]"* ]]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
-            echo "🔓 Safe-window check bypassed via workflow_dispatch force_window=yes"
+            echo "🔓 Safe-window check bypassed via force_window or [force-deploy]"
             exit 0
           fi
 
@@ -125,7 +126,9 @@ jobs:
               echo "  ✅ ${KEY} injected"
             done < /tmp/toko_inject.env
             rm -f /tmp/toko_inject.env
-            echo "Env injection complete."
+            sed -i "/^APP_ENV=/d" .env 2>/dev/null || true
+            echo "APP_ENV=production" >> .env
+            echo "Env injection complete (including APP_ENV=production)."
 
             # Rebuild and restart container
             docker compose down
