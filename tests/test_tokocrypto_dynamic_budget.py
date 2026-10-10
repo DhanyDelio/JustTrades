@@ -39,14 +39,31 @@ from tokocrypto_executor import (
 
 class TestTokocryptoDynamicBudget(unittest.TestCase):
     def setUp(self):
-        from core.clients.tokocrypto_order_executor import (
-            _UNKNOWN_ENTRY_SUBMISSIONS,
-            _ACTIVE_ENTRY_SUBMISSIONS,
-        )
+        from core.clients import tokocrypto_order_executor as order_executor_module
+
         with patch("core.clients.tokocrypto_order_executor._LIFECYCLE_LOCKS_GUARD"):
             _ACTIVE_BUDGET_RESERVATIONS.clear()
-            _UNKNOWN_ENTRY_SUBMISSIONS.clear()
-            _ACTIVE_ENTRY_SUBMISSIONS.clear()
+            order_executor_module._UNKNOWN_ENTRY_SUBMISSIONS.clear()
+            order_executor_module._ACTIVE_ENTRY_SUBMISSIONS.clear()
+
+        # Strict test isolation: mock all database write pathways by default
+        self._patch_exec_upsert = patch("core.clients.tokocrypto_order_executor.upsert_tokocrypto")
+        self._patch_exec_update = patch("core.clients.tokocrypto_order_executor.update_tokocrypto_by_order_id")
+        self._patch_exec_tg = patch("core.clients.tokocrypto_order_executor._send_toko_telegram")
+        self._patch_sb_upsert = patch("services.supabase_client.upsert_tokocrypto")
+        self._patch_sb_update = patch("services.supabase_client.update_tokocrypto_by_order_id")
+
+        self.mock_exec_upsert = self._patch_exec_upsert.start()
+        self.mock_exec_update = self._patch_exec_update.start()
+        self.mock_exec_tg = self._patch_exec_tg.start()
+        self.mock_sb_upsert = self._patch_sb_upsert.start()
+        self.mock_sb_update = self._patch_sb_update.start()
+
+        self.addCleanup(self._patch_sb_update.stop)
+        self.addCleanup(self._patch_sb_upsert.stop)
+        self.addCleanup(self._patch_exec_tg.stop)
+        self.addCleanup(self._patch_exec_update.stop)
+        self.addCleanup(self._patch_exec_upsert.stop)
 
     # -------------------------------------------------------------------------
     # 1. Modal bertambah melalui deposit (Slot Cap Enforcement)
@@ -1048,6 +1065,28 @@ class TestTokocryptoDynamicBudget(unittest.TestCase):
             symbols_called = [c[0][0]["symbol"] for c in calls]
             self.assertNotIn("BTC_IDR", symbols_called, "BTC_IDR tidak boleh dipanggil execute_entry!")
             self.assertIn("ETH_IDR", symbols_called, "ETH_IDR harus dipanggil execute_entry!")
+
+    # -------------------------------------------------------------------------
+    # 23. Production Write Guard: Menolak akses tulis tanpa mock saat test runner aktif
+    # -------------------------------------------------------------------------
+    def test_23_production_write_guard_blocks_unmocked_writes_during_testing(self):
+        """
+        Scenario:
+          - Fungsi write Supabase asli dipanggil tanpa mock saat unit test berjalan.
+          - _assert_safe_write_environment() WAJIB melempar RuntimeError
+            dan memblokir panggilan ke production Supabase.
+        """
+        import services.supabase_client as sb_mod
+
+        # Unpatch sementara sb_upsert untuk menguji fungsi asli
+        self._patch_sb_upsert.stop()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                sb_mod.upsert_tokocrypto({"symbol": "TEST_IDR", "entry_order_id": "MOCK_FAIL"})
+
+            self.assertIn("CRITICAL PRODUCTION DATABASE WRITE BLOCKED", str(ctx.exception))
+        finally:
+            self._patch_sb_upsert.start()
 
 
 if __name__ == "__main__":

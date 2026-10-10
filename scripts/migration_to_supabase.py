@@ -50,6 +50,18 @@ FUTURES_LOG_PATH = Path(__file__).resolve().parent / "trade_futures.json"
 # Supabase client
 # ---------------------------------------------------------------------------
 
+def _assert_safe_migration_environment() -> None:
+    from services.supabase_client import is_test_environment, is_production_environment
+
+    if is_test_environment():
+        raise RuntimeError("🚨 Migration writes to Supabase are strictly BLOCKED in test environment.")
+    if not is_production_environment() or os.getenv("ALLOW_MIGRATION_WRITE", "").strip().lower() != "true":
+        raise RuntimeError(
+            "🚨 Migration writes to production Supabase require APP_ENV=production "
+            "and ALLOW_MIGRATION_WRITE=true. Use --dry-run for testing."
+        )
+
+
 def get_supabase_client():
     try:
         from supabase import create_client, Client
@@ -71,7 +83,8 @@ def get_supabase_client():
             print(f"❌  .env still contains placeholder values — fill in real credentials.")
             sys.exit(1)
 
-    return create_client(url, key)
+    from services.supabase_client import _GuardedClient
+    return _GuardedClient(create_client(url, key))
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +342,8 @@ def insert_batched(client, table: str, rows: list[dict], dry_run: bool) -> tuple
             inserted += len(batch)
             continue
 
+        _assert_safe_migration_environment()
+
         try:
             result = (
                 client.table(table)
@@ -336,6 +351,8 @@ def insert_batched(client, table: str, rows: list[dict], dry_run: bool) -> tuple
                 .execute()
             )
             inserted += len(batch)
+        except RuntimeError:
+            raise
         except Exception as e:
             print(f"  ❌  Batch {start}–{start+len(batch)} failed: {e}")
             errors += len(batch)
