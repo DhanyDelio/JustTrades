@@ -493,9 +493,9 @@ class TestTokocryptoAdaptiveAllocation(unittest.TestCase):
         """Scenario 6: Locked balance (e.g. pending Limit Buy) is NOT treated as free balance."""
         # 3 open trades: ETH, POL, and SOL (pending NEW)
         mock_fetch.return_value = [
-            {"symbol": "ETH_IDR", "exit_status": "OPEN", "entry_status": "FILLED"},
-            {"symbol": "POL_IDR", "exit_status": "OPEN", "entry_status": "FILLED"},
-            {"symbol": "SOL_IDR", "exit_status": "OPEN", "entry_status": "NEW"},
+            {"symbol": "ETH_IDR", "exit_status": "OPEN", "entry_status": "FILLED", "entry_notional_idr": 38_761.0},
+            {"symbol": "POL_IDR", "exit_status": "OPEN", "entry_status": "FILLED", "entry_notional_idr": 38_761.0},
+            {"symbol": "SOL_IDR", "exit_status": "OPEN", "entry_status": "NEW", "entry_notional_idr": 36_606.50},
         ]
         client_mock = MagicMock()
         client_mock.get_open_orders.return_value = []

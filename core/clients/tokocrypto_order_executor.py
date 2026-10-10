@@ -88,6 +88,59 @@ def release_oco_submission(entry_order_id: str) -> None:
         _UNKNOWN_OCO_SUBMISSIONS.discard(entry_order_id)
 
 
+_ACTIVE_BUDGET_RESERVATIONS: dict[str, float] = {}
+
+
+def claim_budget_reservation(symbol: str, amount_idr: float) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _ACTIVE_BUDGET_RESERVATIONS[str(symbol).upper()] = float(amount_idr)
+
+
+def release_budget_reservation(symbol: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _ACTIVE_BUDGET_RESERVATIONS.pop(str(symbol).upper(), None)
+
+
+def get_reserved_budget(exclude_symbol: str | None = None) -> float:
+    with _LIFECYCLE_LOCKS_GUARD:
+        ex = str(exclude_symbol).upper() if exclude_symbol else None
+        return sum(v for k, v in _ACTIVE_BUDGET_RESERVATIONS.items() if k != ex)
+
+
+def sync_budget_reservations_from_db(trades: list[dict] | None = None) -> None:
+    """
+    Re-hydrate active budget reservations from Supabase for any trades
+    in pending or ambiguous states (RECONCILIATION_REQUIRED, ENTRY_SUBMISSION_UNKNOWN,
+    ENTRY_SUBMISSION_PENDING). This ensures restart resilience so budget reservations
+    are not lost when the process terminates.
+    """
+    if trades is None:
+        try:
+            from services.supabase_client import fetch_all_tokocrypto_strict
+
+            trades = fetch_all_tokocrypto_strict() or []
+        except Exception as exc:
+            logger.warning("Could not fetch trades to sync budget reservations: %s", exc)
+            return
+
+    for t in trades:
+        if t.get("exit_status") == "OPEN":
+            st = str(t.get("entry_status", "")).upper()
+            sym = t.get("symbol")
+            if sym and st in (
+                "RECONCILIATION_REQUIRED",
+                "ENTRY_SUBMISSION_UNKNOWN",
+                "ENTRY_SUBMISSION_PENDING",
+            ):
+                res_amt = float(t.get("entry_notional_idr") or t.get("slot_size_idr") or 0.0)
+                if res_amt <= 0.0:
+                    t_p = float(t.get("entry_price") or 0.0)
+                    t_q = float(t.get("entry_qty") or 0.0)
+                    res_amt = t_p * t_q
+                if res_amt > 0.0:
+                    claim_budget_reservation(sym, res_amt)
+
+
 # ---------------------------------------------------------------------------
 # Order status integer mapping (Tokocrypto uses int codes, not string literals)
 # ---------------------------------------------------------------------------
@@ -411,6 +464,7 @@ class TokocryptoOrderExecutor:
         trading_phase: str = "PHASE_3",
         dry_run: bool = False,
         max_slots: int | None = None,
+        check_balance: bool = False,
     ) -> None:
         self.client = client
         self.supervised = supervised
@@ -418,6 +472,7 @@ class TokocryptoOrderExecutor:
             trading_phase  # written to DB at upsert — never rely on column default
         )
         self.dry_run = dry_run
+        self.check_balance = check_balance
         self._cached_fee_rate: Decimal | None = None
         if max_slots is not None:
             self.MAX_SLOTS = max_slots
@@ -563,7 +618,12 @@ class TokocryptoOrderExecutor:
     # validate_and_size
     # ------------------------------------------------------------------
 
-    def validate_and_size(self, cand: dict, available_idr: float) -> bool:
+    def validate_and_size(
+        self,
+        cand: dict,
+        available_idr: float = 0.0,
+        slot_size_override: float | None = None,
+    ) -> bool:
         """
         Validate sizing constraints and populate cand['sizing'] + cand['constraints'].
 
@@ -585,7 +645,11 @@ class TokocryptoOrderExecutor:
             print(f"  ✗ validate_and_size: get_symbol failed: {e}")
             return False
 
-        slot_size_idr = available_idr / self.MAX_SLOTS
+        if slot_size_override is not None and slot_size_override > 0:
+            slot_size_idr = float(slot_size_override)
+        else:
+            slot_size_idr = available_idr / self.MAX_SLOTS
+
         entry_price = float(cand["entry_price"])
 
         if entry_price <= 0:
@@ -607,6 +671,15 @@ class TokocryptoOrderExecutor:
         min_notional = (
             sym.min_notional if sym.min_notional > 0 else self.MIN_NOTIONAL_IDR
         )
+
+        # If rounding down causes notional to fall below min_notional,
+        # round UP by one step if within slot budget + step tolerance (matching scanner)
+        if qty > 0 and entry_price * qty < min_notional:
+            stepped_qty = self.client.round_step(qty + sym.step_size, sym.step_size)
+            if entry_price * stepped_qty >= min_notional:
+                if entry_price * stepped_qty <= slot_size_idr + (entry_price * sym.step_size):
+                    qty = stepped_qty
+
         notional = qty * entry_price
         if notional < min_notional:
             print(
@@ -704,9 +777,8 @@ class TokocryptoOrderExecutor:
             )
             return None
 
-        # 1. Validate and size
-        available_idr = slot_size_idr * self.MAX_SLOTS
-        if not self.validate_and_size(cand, available_idr):
+        # 1. Validate and size (use slot_size_idr directly without redundant MAX_SLOTS round-trip)
+        if not self.validate_and_size(cand, slot_size_override=slot_size_idr):
             return None
 
         # 2. Build payload
@@ -715,87 +787,125 @@ class TokocryptoOrderExecutor:
         qty = payload["quantity"]
         price = payload["price"]
 
-        # 3. Supervised gate
-        if self.supervised:
-            if not _confirm(f"Place ENTRY BUY {sym}  qty={qty}  @ {price:,.0f} IDR?"):
-                print("  ✗ Entry aborted by operator.")
+        # Pre-flight Live IDR Balance & Reservation Check
+        fee_rate, _ = self.get_fee_config(sym)
+        required_idr = float(qty) * float(price) * (1.0 + float(fee_rate))
+        if self.check_balance and not self.dry_run:
+            try:
+                sync_budget_reservations_from_db()
+                bal = self.client.get_balance("IDR")
+                if bal is not None:
+                    raw_free = getattr(bal, "free", None)
+                    if isinstance(raw_free, (int, float, str)):
+                        live_free = float(raw_free)
+                        reserved_other = get_reserved_budget(exclude_symbol=sym)
+                        effective_free = live_free - reserved_other
+                        if effective_free < required_idr:
+                            print(
+                                f"  ✗ execute_entry: Insufficient live IDR balance "
+                                f"(effective free Rp {effective_free:,.2f} < required Rp {required_idr:,.2f}) — aborting."
+                            )
+                            return None
+            except Exception as exc:
+                print(
+                    f"  [GUARD] Failed to verify live IDR balance ({exc}) — failing closed."
+                )
                 return None
 
-        # 4. Dry-run bypass
-        if self.dry_run:
-            fake_order_id = f"DRY_{int(time.time())}"
-            print(f"[DRY RUN] execute_entry: BUY {sym} qty={qty} @ {price}")
-            return {
-                "data": {"orderId": fake_order_id, "status": 0},
-                "_dry_run": True,
-            }
-
-        # Persist an intent before the non-idempotent POST. A restart must not
-        # treat an uncertain submission as permission to place another entry.
-        reservation_id = f"SUBMITTING_{uuid.uuid4().hex}"
-        now_iso = datetime.now(timezone.utc).isoformat()
-        upsert_tokocrypto(
-            {
-                "symbol": sym,
-                "entry_order_id": reservation_id,
-                "entry_price": float(cand["entry_price"]),
-                "tp_price": float(cand.get("tp_price") or cand.get("tp1") or 0),
-                "sl_price": float(cand.get("sl_price") or cand.get("sl") or 0),
-                "entry_qty": float(qty),
-                "entry_status": "ENTRY_SUBMISSION_PENDING",
-                "exit_status": "OPEN",
-                "oco_state": "ENTRY_SUBMISSION_PENDING",
-                "entry_notional_idr": float(qty) * float(cand["entry_price"]),
-                "supervised": self.supervised,
-                "trading_phase": self._trading_phase,
-                "planned_rr": cand.get("rr"),
-                "risk_pct": cand.get("risk_pct"),
-                "slot_size_idr": slot_size_idr,
-                "created_at": now_iso,
-                "updated_at": now_iso,
-            }
-        )
-
-        # 5. Exchange call
+        claim_budget_reservation(sym, required_idr)
+        keep_reservation = False
         try:
-            resp = self.client._signed_post("/open/v1/orders", payload)
-        except Exception as exc:
-            mark_entry_submission_unknown(sym)
-            try:
-                update_tokocrypto_by_order_id(
-                    reservation_id,
-                    {
-                        "entry_status": "RECONCILIATION_REQUIRED",
-                        "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-            except Exception:
-                logger.exception(
-                    "Could not persist unknown entry submission for %s", sym
-                )
-            raise TokocryptoSubmissionUnknownError(
-                f"execute_entry: POST outcome unknown for {sym}; automatic retry blocked"
-            ) from exc
+            # 3. Supervised gate
+            if self.supervised:
+                if not _confirm(f"Place ENTRY BUY {sym}  qty={qty}  @ {price:,.0f} IDR?"):
+                    print("  ✗ Entry aborted by operator.")
+                    return None
 
-        # 6. Persist to Supabase
-        order_data = resp.get("data") or resp
-        entry_oid = str(order_data.get("orderId", ""))
-        now_iso = datetime.now(timezone.utc).isoformat()
+            # 4. Dry-run bypass
+            if self.dry_run:
+                fake_order_id = f"DRY_{int(time.time())}"
+                print(f"[DRY RUN] execute_entry: BUY {sym} qty={qty} @ {price}")
+                return {
+                    "data": {"orderId": fake_order_id, "status": 0},
+                    "_dry_run": True,
+                }
 
-        if not entry_oid.strip():
-            mark_entry_submission_unknown(sym)
-            update_tokocrypto_by_order_id(
-                reservation_id,
+            # Persist an intent before the non-idempotent POST. A restart must not
+            # treat an uncertain submission as permission to place another entry.
+            reservation_id = f"SUBMITTING_{uuid.uuid4().hex}"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            upsert_tokocrypto(
                 {
-                    "entry_status": "RECONCILIATION_REQUIRED",
-                    "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
+                    "symbol": sym,
+                    "entry_order_id": reservation_id,
+                    "entry_price": float(cand["entry_price"]),
+                    "tp_price": float(cand.get("tp_price") or cand.get("tp1") or 0),
+                    "sl_price": float(cand.get("sl_price") or cand.get("sl") or 0),
+                    "entry_qty": float(qty),
+                    "entry_status": "ENTRY_SUBMISSION_PENDING",
+                    "exit_status": "OPEN",
+                    "oco_state": "ENTRY_SUBMISSION_PENDING",
+                    "entry_notional_idr": float(qty) * float(cand["entry_price"]),
+                    "supervised": self.supervised,
+                    "trading_phase": self._trading_phase,
+                    "planned_rr": cand.get("rr"),
+                    "risk_pct": cand.get("risk_pct"),
+                    "slot_size_idr": slot_size_idr,
+                    "created_at": now_iso,
                     "updated_at": now_iso,
-                },
+                }
             )
-            raise TokocryptoSubmissionUnknownError(
-                f"execute_entry: exchange response omitted orderId for {sym}; automatic retry blocked"
-            )
+
+            # 5. Exchange call
+            try:
+                resp = self.client._signed_post("/open/v1/orders", payload)
+            except Exception as exc:
+                mark_entry_submission_unknown(sym)
+                keep_reservation = True  # Outcome ambiguous: retain budget reservation!
+                try:
+                    update_tokocrypto_by_order_id(
+                        reservation_id,
+                        {
+                            "entry_status": "RECONCILIATION_REQUIRED",
+                            "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not persist unknown entry submission for %s", sym
+                    )
+                raise TokocryptoSubmissionUnknownError(
+                    f"execute_entry: POST outcome unknown for {sym}; automatic retry blocked"
+                ) from exc
+
+            # 6. Verify exchange response
+            order_data = resp.get("data") or resp
+            entry_oid = str(order_data.get("orderId", "")) if isinstance(order_data, dict) else ""
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            if not entry_oid.strip():
+                mark_entry_submission_unknown(sym)
+                keep_reservation = True  # Ambiguous outcome without orderId: retain reservation!
+                try:
+                    update_tokocrypto_by_order_id(
+                        reservation_id,
+                        {
+                            "entry_status": "RECONCILIATION_REQUIRED",
+                            "oco_state": "ENTRY_SUBMISSION_UNKNOWN",
+                            "updated_at": now_iso,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not persist missing orderId for %s", sym
+                    )
+                raise TokocryptoSubmissionUnknownError(
+                    f"execute_entry: exchange response omitted orderId for {sym}; automatic retry blocked"
+                )
+        finally:
+            if not keep_reservation:
+                release_budget_reservation(sym)
 
         mark_entry_submission_active(sym)
 

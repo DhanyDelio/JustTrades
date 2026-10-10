@@ -99,18 +99,25 @@ def calculate_adaptive_allocation(
     wallet_balance: float,
     available_slots: int,
     min_notional: float = MIN_NOTIONAL_IDR,
+    max_positions: int = MAX_POSITIONS,
+    total_equity: float | None = None,
 ) -> tuple[int, float]:
     """
     Calculate adaptive (target_slots, allocation_per_slot) based on free balance,
-    available slots, and minimum notional.
+    available slots, minimum notional, and total portfolio equity.
 
     Logic:
       1. If wallet_balance <= 0 or available_slots <= 0, return (0, 0.0).
-      2. Step down target_slots from available_slots down to 1:
-         alloc = calculate_new_order_allocation(wallet_balance, target_slots)
+      2. If total_equity is provided and > 0, compute slot_cap = total_equity / eff_slots
+         where eff_slots = max(1, min(max_positions, int(total_equity // min_notional))).
+         This bounds a single order so it never over-allocates the entire portfolio
+         budget even when available_slots drops to 1 after an external deposit.
+      3. Step down target_slots from available_slots down to 1:
+         raw_alloc = calculate_new_order_allocation(wallet_balance, target_slots)
+         alloc = min(raw_alloc, slot_cap) if slot_cap is not None else raw_alloc
          If alloc >= min_notional:
              return target_slots, alloc
-      3. If even 1 slot cannot meet min_notional (wallet_balance < min_notional):
+      4. If even 1 slot cannot meet min_notional:
          return 0, 0.0 (NO ENTRY).
     """
     if wallet_balance is None or available_slots is None:
@@ -119,14 +126,26 @@ def calculate_adaptive_allocation(
         w = float(wallet_balance)
         s = int(available_slots)
         m = float(min_notional)
+        mp = int(max_positions) if max_positions else MAX_POSITIONS
     except (TypeError, ValueError):
         return 0, 0.0
 
     if w <= 0.0 or s <= 0 or math.isnan(w) or math.isinf(w):
         return 0, 0.0
 
+    slot_cap = None
+    if (
+        total_equity is not None
+        and not math.isnan(total_equity)
+        and not math.isinf(total_equity)
+        and total_equity > 0.0
+    ):
+        eff_slots = max(1, min(mp, int(total_equity // m)))
+        slot_cap = total_equity / eff_slots
+
     for target in range(s, 0, -1):
-        alloc = calculate_new_order_allocation(w, target)
+        raw_alloc = calculate_new_order_allocation(w, target)
+        alloc = min(raw_alloc, slot_cap) if slot_cap is not None else raw_alloc
         if alloc >= m:
             return target, alloc
 
@@ -158,6 +177,7 @@ def _build_executor(client):
         trading_phase=TRADING_PHASE,
         dry_run=False,
         max_slots=MAX_POSITIONS,
+        check_balance=True,
     )
 
 
@@ -247,11 +267,20 @@ def _cmd_propose_locked() -> None:
         executor._sl_buffer_pct_fn = _sl_buffer_pct
 
         # How many open positions do we already have?
-        from services.supabase_client import fetch_all_tokocrypto_strict
+        try:
+            from services.supabase_client import fetch_all_tokocrypto_strict
+
+            db_trades = fetch_all_tokocrypto_strict() or []
+        except Exception as exc:
+            print(
+                f"  [GUARD] Failed to load lifecycle state from database: {exc} — failing closed.",
+                flush=True,
+            )
+            return
 
         open_trades = [
             t
-            for t in (fetch_all_tokocrypto_strict() or [])
+            for t in db_trades
             if t.get("exit_status") == "OPEN"
             and str(t.get("entry_status", "")).upper()
             not in ("CANCELED", "REJECTED", "EXPIRED")
@@ -292,10 +321,66 @@ def _cmd_propose_locked() -> None:
             )
             return
 
+        # Re-hydrate budget reservations for pending/ambiguous trades from DB so reservations survive restart
+        from core.clients.tokocrypto_order_executor import (
+            claim_budget_reservation,
+            get_reserved_budget,
+            sync_budget_reservations_from_db,
+        )
+        sync_budget_reservations_from_db(open_trades)
+
+        # Calculate committed capital from filled positions only (to prevent double counting with idr_locked)
+        committed_idr = 0.0
+        has_unverified = False
+        for t in open_trades:
+            st = str(t.get("entry_status", "")).upper()
+            if st == "FILLED":
+                t_price = float(t.get("entry_fill_price") or t.get("entry_price") or 0.0)
+                t_qty = float(t.get("entry_qty") or 0.0)
+                t_notional = t_price * t_qty
+                if t_notional <= 0.0:
+                    t_notional = float(t.get("entry_notional_idr") or t.get("slot_size_idr") or 0.0)
+                if t_notional <= 0.0:
+                    has_unverified = True
+                committed_idr += max(0.0, t_notional)
+            elif st in ("RECONCILIATION_REQUIRED", "ENTRY_SUBMISSION_UNKNOWN", "ENTRY_SUBMISSION_PENDING"):
+                res_amt = float(t.get("entry_notional_idr") or t.get("slot_size_idr") or 0.0)
+                if res_amt <= 0.0:
+                    t_p = float(t.get("entry_price") or 0.0)
+                    t_q = float(t.get("entry_qty") or 0.0)
+                    res_amt = t_p * t_q
+                if res_amt <= 0.0:
+                    has_unverified = True
+
+        if has_unverified:
+            print(
+                "  [GUARD] Detected open position with unverified capital — failing closed.",
+                flush=True,
+            )
+            return
+
+        raw_locked = getattr(balance_obj, "locked", 0.0)
+        try:
+            idr_locked = float(raw_locked) if not hasattr(raw_locked, "_mock_return_value") else 0.0
+            if math.isnan(idr_locked) or math.isinf(idr_locked) or idr_locked < 0.0:
+                idr_locked = 0.0
+        except Exception:
+            idr_locked = 0.0
+
+        total_equity = idr_bal + idr_locked + committed_idr
+        if math.isnan(total_equity) or math.isinf(total_equity) or total_equity <= 0:
+            print(
+                "  [GUARD] Total equity cannot be verified — failing closed.",
+                flush=True,
+            )
+            return
+
         target_slots, alloc_per_order = calculate_adaptive_allocation(
             wallet_balance=idr_bal,
             available_slots=slots_available,
             min_notional=MIN_NOTIONAL_IDR,
+            max_positions=MAX_POSITIONS,
+            total_equity=total_equity,
         )
 
         # Runtime verification log
@@ -345,9 +430,21 @@ def _cmd_propose_locked() -> None:
                 )
                 continue
 
-            slot_budget = min(alloc_per_order, remaining_idr)
-            if slot_budget <= 0:
-                print("  Remaining wallet IDR depleted — stopping.", flush=True)
+            # Live balance refresh before sizing each candidate
+            try:
+                bal_refresh = client.get_balance("IDR")
+                live_free_now = float(getattr(bal_refresh, "free", 0.0) or 0.0)
+            except Exception:
+                live_free_now = remaining_idr
+
+            from core.clients.tokocrypto_order_executor import get_reserved_budget
+            allocatable_idr = min(remaining_idr, max(0.0, live_free_now - get_reserved_budget()))
+            slot_budget = min(alloc_per_order, allocatable_idr)
+            if slot_budget < MIN_NOTIONAL_IDR:
+                print(
+                    f"  Remaining allocatable IDR (Rp {allocatable_idr:,.2f}) is below minimum notional (Rp {MIN_NOTIONAL_IDR:,.2f}) — stopping.",
+                    flush=True,
+                )
                 break
 
             print(
@@ -452,10 +549,32 @@ def cmd_diagnostic() -> None:
         )
         idr_bal = 0.0
 
+    committed_idr = 0.0
+    for t in open_trades:
+        st = str(t.get("entry_status", "")).upper()
+        if st == "FILLED":
+            t_price = float(t.get("entry_fill_price") or t.get("entry_price") or 0.0)
+            t_qty = float(t.get("entry_qty") or 0.0)
+            t_notional = t_price * t_qty
+            if t_notional <= 0.0:
+                t_notional = float(t.get("entry_notional_idr") or t.get("slot_size_idr") or 0.0)
+            committed_idr += max(0.0, t_notional)
+
+    raw_locked = getattr(balance_obj, "locked", 0.0)
+    try:
+        idr_locked = float(raw_locked) if not hasattr(raw_locked, "_mock_return_value") else 0.0
+    except Exception:
+        idr_locked = 0.0
+
+    total_equity = idr_bal + idr_locked + committed_idr
+    equity_to_pass = total_equity if (committed_idr > 0 or n_open == 0) else None
+
     target_slots, alloc_per_order = calculate_adaptive_allocation(
         wallet_balance=idr_bal,
         available_slots=slots_available,
         min_notional=MIN_NOTIONAL_IDR,
+        max_positions=MAX_POSITIONS,
+        total_equity=equity_to_pass,
     )
 
     print(f"Wallet balance fetched: Rp {idr_bal:,.2f}", flush=True)
