@@ -10,13 +10,17 @@ class TestTokoSupabaseHelpers(unittest.TestCase):
     def test_toko_supabase_helpers_exist(self):
         """fetch_all_tokocrypto, upsert_tokocrypto, update_tokocrypto_by_order_id must be importable."""
         from services.supabase_client import (
+            claim_tokocrypto_recovery,
             fetch_all_tokocrypto,
+            transition_tokocrypto_state,
             upsert_tokocrypto,
             update_tokocrypto_by_order_id,
         )
         self.assertTrue(callable(fetch_all_tokocrypto))
         self.assertTrue(callable(upsert_tokocrypto))
         self.assertTrue(callable(update_tokocrypto_by_order_id))
+        self.assertTrue(callable(claim_tokocrypto_recovery))
+        self.assertTrue(callable(transition_tokocrypto_state))
 
     def test_fetch_all_tokocrypto_returns_empty_on_missing_table(self):
         """fetch_all_tokocrypto must return [] gracefully when Supabase raises."""

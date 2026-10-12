@@ -1115,6 +1115,29 @@ class TokocryptoClient:
                 )
         return orders
 
+    def get_order_history(self, symbol: str | None = None, limit: int = 10) -> list[dict]:
+        """
+        Query historical/completed orders (SIGNED GET /open/v1/orders with type=2).
+        Returns list of order dicts.
+
+        Fail-closed:
+        - Raises TokocryptoMalformedResponseError if response envelope or list format is invalid.
+        - Raises TokocryptoMalformedResponseError if items inside the list are not dicts.
+        """
+        params: dict[str, str | int] = {"type": 2}
+        if symbol:
+            params["symbol"] = self.normalize_symbol(symbol)
+        if limit:
+            params["limit"] = limit
+        resp = self._signed_get("/open/v1/orders", params)
+        orders = self._extract_data_list(resp, context="get_order_history")
+        for idx, item in enumerate(orders):
+            if not isinstance(item, dict):
+                raise TokocryptoMalformedResponseError(
+                    f"get_order_history: expected order dict at index {idx}, got {type(item).__name__}"
+                )
+        return orders
+
 
 # ---------------------------------------------------------------------------
 # Convenience re-exports for callers that only need normalization helpers

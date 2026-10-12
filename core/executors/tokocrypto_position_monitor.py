@@ -25,12 +25,16 @@ from core.clients.tokocrypto_client import TokocryptoClient, TokocryptoError
 from core.clients.tokocrypto_order_executor import (
     TokocryptoOrderExecutor,
     claim_oco_submission,
+    claim_recovery_submission,
     lifecycle_lock,
     release_entry_submission,
     release_oco_submission,
+    release_recovery_submission,
 )
 from services.supabase_client import (
+    claim_tokocrypto_recovery,
     fetch_all_tokocrypto_strict,
+    transition_tokocrypto_state,
     update_tokocrypto_by_order_id,
     TABLE_TOKOCRYPTO,
 )
@@ -177,6 +181,68 @@ class TokocryptoPositionMonitor:
             print(
                 f"  [{sym}] entry_status={entry_status}  OCO={b_order_list or ('legs:' + tp_oid)}"
             )
+
+        # ----------------------------------------------------------------
+        # Phase 0: Interrupted Recovery Guard for SL_RECOVERY_IN_PROGRESS
+        # ----------------------------------------------------------------
+        if trade.get("oco_state") == "SL_RECOVERY_IN_PROGRESS":
+            now_iso = datetime.now(timezone.utc).isoformat()
+            raw_meta = (
+                dict(trade.get("raw_entry_order") or {})
+                if isinstance(trade.get("raw_entry_order"), dict)
+                else {}
+            )
+            claimed_at_iso = raw_meta.get("recovery_claimed_at")
+            window_start_ms = 0
+            window_end_ms = 0
+            if claimed_at_iso:
+                try:
+                    dt = datetime.fromisoformat(claimed_at_iso.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    claim_ms = int(dt.timestamp() * 1000)
+                    if claim_ms > 0:
+                        window_start_ms = claim_ms - 10_000
+                        window_end_ms = claim_ms + 180_000
+                except Exception:
+                    pass
+
+            # Only attempt history reconciliation if recovery_claimed_at is a valid timestamp.
+            # If timestamp is missing/unparseable, fail closed to RECONCILIATION_REQUIRED directly.
+            if window_start_ms > 0 and window_end_ms > 0:
+                entry_qty = float(trade.get("entry_qty") or 0)
+                reconciled = self.executor.reconcile_emergency_sell_from_history(
+                    sym, remaining_qty=entry_qty, window_start_ms=window_start_ms, window_end_ms=window_end_ms
+                )
+                if reconciled and reconciled.get("state") == "SL_HIT":
+                    self._resolve_exit(trade, reconciled)
+                    _send_toko_telegram(
+                        f"🚨 STUCK-SL RECOVERED (CRASH RECONCILIATION): {sym}\n"
+                        f"Prior recovery SELL confirmed filled on exchange.\n"
+                        f"Exit price: Rp {float(reconciled.get('exit_price', 0)):,.2f}\n"
+                        f"Reason: {reconciled.get('exit_reason')}"
+                    )
+                    return
+
+            # If not verified filled, atomically transition to RECONCILIATION_REQUIRED
+            raw_meta["requires_manual_review"] = True
+            raw_meta["interrupted_at"] = now_iso
+            transitioned = transition_tokocrypto_state(
+                entry_oid,
+                from_state="SL_RECOVERY_IN_PROGRESS",
+                to_state="RECONCILIATION_REQUIRED",
+                fields={
+                    "raw_entry_order": raw_meta,
+                    "updated_at": now_iso,
+                },
+            )
+            if transitioned:
+                _send_toko_telegram(
+                    f"⚠️ RECOVERY_INTERRUPTED: {sym}  "
+                    f"Trade was in SL_RECOVERY_IN_PROGRESS from prior run.  "
+                    f"Auto-retry blocked to prevent double sell — manual reconciliation required."
+                )
+            return
 
         # ----------------------------------------------------------------
         # Phase A: Entry order not yet confirmed filled
@@ -624,8 +690,48 @@ class TokocryptoPositionMonitor:
                         )
                 else:
                     # Second+ cycle: SL leg is stuck unfilled!
-                    # Attempt safe recovery via executor once
-                    recovery_dict = self.executor.recover_stuck_sl(trade)
+                    # 1. In-process concurrency guard (threads within same process)
+                    if not claim_recovery_submission(entry_oid):
+                        if verbose:
+                            print(
+                                f"  [{sym}] Recovery already claimed by concurrent thread, skipping."
+                            )
+                        return
+
+                    # 2. Cross-process atomic claim & persistent DB lock BEFORE any exchange action
+                    try:
+                        raw_meta = (
+                            dict(trade.get("raw_entry_order") or {})
+                            if isinstance(trade.get("raw_entry_order"), dict)
+                            else {}
+                        )
+                        raw_meta["recovery_attempted"] = True
+                        raw_meta["recovery_claimed_at"] = now_iso
+                        try:
+                            claimed = claim_tokocrypto_recovery(
+                                entry_oid,
+                                {
+                                    "oco_state": "SL_RECOVERY_IN_PROGRESS",
+                                    "raw_entry_order": raw_meta,
+                                    "updated_at": now_iso,
+                                },
+                            )
+                        except Exception as exc:
+                            print(f"  [{sym}] claim_tokocrypto_recovery exception: {exc}")
+                            claimed = False
+
+                        if not claimed:
+                            if verbose:
+                                print(
+                                    f"  [{sym}] Recovery already claimed or resolved by another process in database, skipping."
+                                )
+                            return
+
+                        # Attempt safe recovery via executor once
+                        recovery_dict = self.executor.recover_stuck_sl(trade)
+                    finally:
+                        release_recovery_submission(entry_oid)
+
                     if recovery_dict and recovery_dict.get("state") == "SL_HIT":
                         self._resolve_exit(trade, recovery_dict)
                         _send_toko_telegram(
@@ -655,6 +761,31 @@ class TokocryptoPositionMonitor:
                             f"Order remains OPEN and UNRESOLVED.\n"
                             f"Manual action required immediately!"
                         )
+
+            elif oco_state == "SL_RECOVERY_IN_PROGRESS":
+                # Previous recovery attempt crashed or was interrupted mid-flight.
+                # Never retry automatic market sell to prevent duplicate selling!
+                raw_meta = (
+                    dict(trade.get("raw_entry_order") or {})
+                    if isinstance(trade.get("raw_entry_order"), dict)
+                    else {}
+                )
+                raw_meta["requires_manual_review"] = True
+                transitioned = transition_tokocrypto_state(
+                    entry_oid,
+                    from_state="SL_RECOVERY_IN_PROGRESS",
+                    to_state="RECONCILIATION_REQUIRED",
+                    fields={
+                        "raw_entry_order": raw_meta,
+                        "updated_at": now_iso,
+                    },
+                )
+                if transitioned:
+                    _send_toko_telegram(
+                        f"⚠️ RECOVERY_INTERRUPTED: {sym}  "
+                        f"Trade was in SL_RECOVERY_IN_PROGRESS from prior run.  "
+                        f"Auto-retry blocked to prevent double sell — manual reconciliation required."
+                    )
 
             elif oco_state == "RECONCILIATION_REQUIRED":
                 raw_meta = (
@@ -688,21 +819,28 @@ class TokocryptoPositionMonitor:
         exit_price ALWAYS from state_dict["exit_price"], which was populated
         from executedPrice in the order detail — never from get_ticker().
         """
+        sym = trade.get("symbol", "?")
+        # Idempotency guard: if position is already resolved, do NOT re-process or duplicate alerts
+        if trade.get("exit_status") in ("TP_HIT", "SL_HIT"):
+            print(
+                f"  [{sym}] Position already resolved as {trade.get('exit_status')}. Skipping redundant exit resolution."
+            )
+            return
+
         is_tp = state_dict["state"] == "TP_HIT"
         exit_price = float(state_dict["exit_price"] or 0)
         entry_oid = str(trade.get("entry_order_id", ""))
-        sym = trade.get("symbol", "?")
         now_iso = datetime.now(timezone.utc).isoformat()
 
         entry_fill_price = float(
             trade.get("entry_fill_price") or trade.get("entry_price") or 0
         )
-        qty = float(trade.get("entry_qty") or 0)
+        exit_qty = float(state_dict.get("exit_qty") or trade.get("entry_qty") or 0)
         entry_notional_idr = float(
-            trade.get("entry_notional_idr") or (entry_fill_price * qty)
+            trade.get("entry_notional_idr") or (entry_fill_price * exit_qty)
         )
 
-        realized_pnl_idr = (exit_price - entry_fill_price) * qty
+        realized_pnl_idr = (exit_price - entry_fill_price) * exit_qty
         realized_pnl_pct = (
             (realized_pnl_idr / entry_notional_idr * 100) if entry_notional_idr else 0.0
         )

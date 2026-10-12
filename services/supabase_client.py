@@ -455,3 +455,70 @@ def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
     except Exception as e:
         print(f"⚠️ update_tokocrypto_by_order_id failed: {e}")
         raise
+
+
+def claim_tokocrypto_recovery(entry_order_id: str, fields: dict) -> bool:
+    """
+    Atomically claim stuck-SL recovery for a specific order in Toko_Crypto_Spot.
+    Guarantees mutual exclusion across concurrent processes by executing a conditional update:
+    UPDATE Toko_Crypto_Spot
+    SET ... fields ...
+    WHERE entry_order_id = <entry_order_id>
+      AND oco_state != 'SL_RECOVERY_IN_PROGRESS'
+      AND oco_state != 'RECONCILIATION_REQUIRED';
+
+    Returns True if this process successfully claimed the recovery (1 row updated),
+    False if another process already claimed it or state transitioned (0 rows updated).
+    """
+    _assert_safe_write_environment("claim_tokocrypto_recovery")
+    try:
+        res = (
+            get_client()
+            .table(TABLE_TOKOCRYPTO)
+            .update(fields)
+            .eq("entry_order_id", entry_order_id)
+            .neq("oco_state", "SL_RECOVERY_IN_PROGRESS")
+            .neq("oco_state", "RECONCILIATION_REQUIRED")
+            .execute()
+        )
+        data = getattr(res, "data", None)
+        if data is not None and isinstance(data, list):
+            return len(data) > 0
+        return False
+    except Exception as e:
+        print(f"⚠️ claim_tokocrypto_recovery failed: {e}")
+        return False
+
+
+def transition_tokocrypto_state(
+    entry_order_id: str,
+    from_state: str,
+    to_state: str,
+    fields: dict | None = None,
+) -> bool:
+    """
+    Atomically transition a trade's oco_state in Toko_Crypto_Spot from from_state to to_state.
+    Guarantees mutual exclusion: only succeeds if current oco_state == from_state.
+    Returns True if 1 row was updated, False if 0 rows (another process won the race or state transitioned).
+    """
+    _assert_safe_write_environment("transition_tokocrypto_state")
+    try:
+        update_payload = dict(fields or {})
+        update_payload["oco_state"] = to_state
+        res = (
+            get_client()
+            .table(TABLE_TOKOCRYPTO)
+            .update(update_payload)
+            .eq("entry_order_id", entry_order_id)
+            .eq("oco_state", from_state)
+            .execute()
+        )
+        data = getattr(res, "data", None)
+        if data is not None and isinstance(data, list):
+            return len(data) > 0
+        return False
+    except Exception as e:
+        print(f"⚠️ transition_tokocrypto_state failed: {e}")
+        return False
+
+

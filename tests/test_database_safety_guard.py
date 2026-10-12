@@ -149,6 +149,10 @@ class TestDatabaseSafetyGuard(unittest.TestCase):
                 sbc.upsert_tokocrypto({"symbol": "BTC_IDR"})
             with self.assertRaises(RuntimeError):
                 sbc.update_tokocrypto_by_order_id("123", {"status": "FILLED"})
+            with self.assertRaises(RuntimeError):
+                sbc.claim_tokocrypto_recovery("123", {"oco_state": "SL_RECOVERY_IN_PROGRESS"})
+            with self.assertRaises(RuntimeError):
+                sbc.transition_tokocrypto_state("123", "SL_RECOVERY_IN_PROGRESS", "RECONCILIATION_REQUIRED")
 
     # -------------------------------------------------------------------------
     # 8. Skrip migrasi: tidak dapat melakukan mutasi tanpa otorisasi eksplisit

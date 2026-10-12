@@ -88,6 +88,23 @@ def release_oco_submission(entry_order_id: str) -> None:
         _UNKNOWN_OCO_SUBMISSIONS.discard(entry_order_id)
 
 
+_ACTIVE_RECOVERY_SUBMISSIONS: set[str] = set()
+
+
+def claim_recovery_submission(entry_order_id: str) -> bool:
+    with _LIFECYCLE_LOCKS_GUARD:
+        key = str(entry_order_id).strip()
+        if not key or key in _ACTIVE_RECOVERY_SUBMISSIONS:
+            return False
+        _ACTIVE_RECOVERY_SUBMISSIONS.add(key)
+        return True
+
+
+def release_recovery_submission(entry_order_id: str) -> None:
+    with _LIFECYCLE_LOCKS_GUARD:
+        _ACTIVE_RECOVERY_SUBMISSIONS.discard(str(entry_order_id).strip())
+
+
 _ACTIVE_BUDGET_RESERVATIONS: dict[str, float] = {}
 
 
@@ -1636,6 +1653,7 @@ class TokocryptoOrderExecutor:
             return True
 
         # Exchange call
+        resp = None
         try:
             resp = self.client._signed_post(
                 "/open/v1/orders/cancel",
@@ -1646,18 +1664,48 @@ class TokocryptoOrderExecutor:
                 },
             )
         except TokocryptoError as e:
-            print(f"  ✗ cancel_order: exchange call failed: {e}")
+            print(f"  ⚠ cancel_order: exchange post call failed: {e}")
+
+        # If immediate response contains confirmed CANCELED status (int 3 or str "CANCELED")
+        if resp is not None:
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            status = data.get("status") if isinstance(data, dict) else resp.get("status")
+            if status in (3, "CANCELED", "3"):
+                return True
+
+        # Verification fallback: query get_order_detail when status is None/absent or POST threw error
+        try:
+            detail = self.client.get_order_detail(symbol, str(order_id))
+            det_status = detail.get("status")
+            det_exec_qty = float(detail.get("executedQty", 0) or 0)
+            det_orig_qty = float(detail.get("origQty", 0) or 0)
+
+            # CANCELED (3)
+            if det_status in (3, "CANCELED", "3"):
+                return True
+
+            # FILLED (2) -> order was filled, NOT canceled
+            if det_status in (2, "FILLED", "2") or (det_orig_qty > 0 and det_exec_qty >= det_orig_qty):
+                print(f"  ⚠ cancel_order: orderId={order_id} was already FILLED (not canceled).")
+                return False
+
+            # EXPIRED (6) / REJECTED (5) -> terminal state
+            if det_status in (6, "EXPIRED", "6", 5, "REJECTED", "5"):
+                if det_exec_qty == 0:
+                    return True
+                print(f"  ⚠ cancel_order: orderId={order_id} terminal with partial fill (executedQty={det_exec_qty}).")
+                return True
+
+            # NEW (0), PARTIALLY_FILLED (1), PENDING_CANCEL (4) -> still active in orderbook
+            if det_status in (0, "NEW", "0", 1, "PARTIALLY_FILLED", "1", 4, "PENDING_CANCEL", "4"):
+                print(f"  ⚠ cancel_order: orderId={order_id} is still active on exchange (status={det_status!r}).")
+                return False
+
+            print(f"  ⚠ cancel_order: unrecognized status={det_status!r} for orderId={order_id}")
             return False
-
-        # Confirm cancellation
-        data = resp.get("data") or {}
-        status = data.get("status") if isinstance(data, dict) else resp.get("status")
-        # Tokocrypto returns status as int (3) or string "CANCELED"
-        if status in (3, "CANCELED", "3"):
-            return True
-
-        print(f"  ⚠ cancel_order: unexpected status={status!r} for orderId={order_id}")
-        return False
+        except Exception as exc:
+            print(f"  ✗ cancel_order: get_order_detail verification failed for {order_id}: {exc}")
+            return False
 
     # ------------------------------------------------------------------
     # execute_market_sell
@@ -1711,18 +1759,82 @@ class TokocryptoOrderExecutor:
                 "time": int(time.time() * 1000),
             }
 
+        t_order_start = int(time.time() * 1000)
+
         payload = {
             "symbol": self.client.normalize_symbol(symbol),
             "side": 1,  # 1 = SELL
             "type": 2,  # 2 = MARKET
             "quantity": qty_rounded,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": t_order_start,
         }
+
+        if "_" in symbol:
+            base_asset = symbol.split("_")[0]
+        elif symbol.endswith("IDR"):
+            base_asset = symbol[:-3]
+        elif symbol.endswith("USDT"):
+            base_asset = symbol[:-4]
+        else:
+            base_asset = symbol.replace("_IDR", "").replace("IDR", "")
+
+        bal_before = 0.0
+        try:
+            b_init = self.client.get_balance(base_asset)
+            bal_before = float(b_init.free) if b_init else 0.0
+        except Exception:
+            pass
 
         try:
             resp = self.client._signed_post("/open/v1/orders", payload)
-        except TokocryptoError as e:
-            print(f"  ✗ execute_market_sell: exchange call failed: {e}")
+        except Exception as e:
+            print(f"  ⚠ execute_market_sell: exchange POST call failed/timed out: {e}")
+            # Reconciliation attempt 1: check order history for recent filled market sell
+            if hasattr(self.client, "get_order_history"):
+                try:
+                    hist = self.client.get_order_history(symbol, limit=5)
+                    for o in hist:
+                        o_side = o.get("side")
+                        o_status = o.get("status")
+                        o_time = int(o.get("createTime") or o.get("time") or 0)
+                        # Must match current order attempt window (within last 60 seconds)
+                        if o_time > 0 and o_time < (t_order_start - 60_000):
+                            continue
+                        if o_side in (1, "SELL", "1") and o_status in (2, "FILLED", "2"):
+                            oid = str(o.get("orderId", ""))
+                            if oid:
+                                try:
+                                    det = self.client.get_order_detail(symbol, oid)
+                                    if isinstance(det, dict) and det.get("status") in (2, "FILLED", "2"):
+                                        print(
+                                            f"  ✅ execute_market_sell: recovered and verified filled sell order {oid} from history."
+                                        )
+                                        return det
+                                except Exception:
+                                    pass
+                            print(
+                                f"  ✅ execute_market_sell: recovered filled sell order {o.get('orderId')} from history after POST timeout."
+                            )
+                            return o
+                except Exception as hist_err:
+                    print(f"  ⚠ execute_market_sell: order history reconciliation failed: {hist_err}")
+
+            # Reconciliation attempt 2: check if balance dropped
+            bal_after = 0.0
+            try:
+                b_post = self.client.get_balance(base_asset)
+                bal_after = float(b_post.free) if b_post else 0.0
+            except Exception:
+                bal_after = bal_before
+
+            if bal_before > 0 and bal_after < (bal_before * 0.5):
+                print(
+                    f"  🚨 execute_market_sell({symbol}): POST timed out and balance dropped ({bal_before} -> {bal_after}), "
+                    "but order details could not be verified. Halting resells to prevent double sell."
+                )
+                return None
+
+            print(f"  ✗ execute_market_sell({symbol}): POST failed and order was not executed.")
             return None
 
         resp_data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
@@ -1739,26 +1851,157 @@ class TokocryptoOrderExecutor:
             except Exception as exc:
                 print(f"  ⚠ execute_market_sell: query detail failed: {exc}")
 
+        # Fallback to ticker price if executedPrice is still missing/zero
+        if float(resp_data.get("executedPrice", 0) or 0) <= 0:
+            try:
+                ticker_p = float(self.client.get_ticker(symbol))
+                if ticker_p > 0:
+                    resp_data["executedPrice"] = str(ticker_p)
+            except Exception:
+                pass
+
         return resp_data
+
+    def reconcile_emergency_sell_from_history(
+        self,
+        sym: str,
+        remaining_qty: float,
+        window_start_ms: int,
+        window_end_ms: int | None = None,
+        sl_exec_qty: float = 0.0,
+        sl_exec_price: float = 0.0,
+    ) -> dict | None:
+        """
+        Check Tokocrypto order history for an existing FILLED MARKET SELL order
+        placed during the recovery window, verifying order details directly.
+        Returns SL_HIT result dict if matched, None otherwise.
+        """
+        if not hasattr(self.client, "get_order_history") or remaining_qty <= 0 or window_start_ms <= 0:
+            return None
+        norm_sym = self.client.normalize_symbol(sym)
+        try:
+            hist = self.client.get_order_history(sym, limit=10)
+            matched_orders = []
+            for o in hist:
+                o_time = int(o.get("createTime") or o.get("time") or 0)
+                # Normalize seconds to milliseconds if applicable
+                if 0 < o_time < 100_000_000_000:
+                    o_time *= 1000
+                # Strict window gate: reject missing timestamp, or outside window
+                if o_time <= 0 or o_time < window_start_ms:
+                    continue
+                if window_end_ms and o_time > window_end_ms:
+                    continue
+                if o.get("side") not in (1, "SELL", "1") or o.get("status") not in (2, "FILLED", "2"):
+                    continue
+
+                oid = str(o.get("orderId", ""))
+                if not oid:
+                    continue
+
+                # Mandatory order detail query for verification
+                det = None
+                try:
+                    det = self.client.get_order_detail(sym, oid)
+                except Exception:
+                    det = None
+
+                if not isinstance(det, dict) or det.get("status") not in (2, "FILLED", "2"):
+                    continue
+
+                # Verify symbol match if present in order detail
+                det_sym = det.get("symbol")
+                if det_sym and self.client.normalize_symbol(str(det_sym)) != norm_sym:
+                    continue
+
+                # Verify side is SELL
+                if det.get("side") not in (1, "SELL", "1"):
+                    continue
+
+                # Verify type is MARKET (type 2)
+                ord_type = det.get("type") if det.get("type") is not None else o.get("type")
+                if ord_type is not None and ord_type not in (2, "MARKET", "2"):
+                    continue
+
+                o_qty = float(det.get("executedQty", 0) or 0)
+                o_price = float(det.get("executedPrice", 0) or 0)
+
+                # Strict quantity match: within +-2% tolerance of remaining_qty
+                # Rejects orders that are too small (partial fill) or significantly larger (manual sells / other positions)
+                if o_price <= 0 or not (remaining_qty * 0.98 <= o_qty <= remaining_qty * 1.02):
+                    continue
+
+                matched_orders.append((oid, o_qty, o_price, det))
+
+            # Disambiguation guard: If more than 1 matching order is found within the window,
+            # identity is ambiguous (multiple collision candidates). Fail closed to prevent wrong match!
+            if len(matched_orders) > 1:
+                print(
+                    f"  🚨 reconcile_emergency_sell({sym}): ambiguous match — found {len(matched_orders)} matching orders in window. Failing closed."
+                )
+                return None
+
+            if len(matched_orders) == 1:
+                oid, o_qty, o_price, det = matched_orders[0]
+                print(
+                    f"  ✅ reconcile_emergency_sell({sym}): reconciled existing filled market sell {oid} from history."
+                )
+                total_exit_qty = sl_exec_qty + o_qty
+                blended_price = (
+                    (sl_exec_qty * sl_exec_price + o_qty * o_price) / total_exit_qty
+                    if total_exit_qty > 0
+                    else o_price
+                )
+                return {
+                    "state": "SL_HIT",
+                    "exit_price": blended_price,
+                    "exit_qty": total_exit_qty,
+                    "exit_reason": "EMERGENCY_SL_MARKET",
+                    "raw_sl": det,
+                    "slippage_flagged": False,
+                }
+        except Exception as e:
+            print(f"  ⚠ reconcile_emergency_sell({sym}) error: {e}")
+        return None
 
     # ------------------------------------------------------------------
     # recover_stuck_sl
     # ------------------------------------------------------------------
 
+
     def recover_stuck_sl(self, trade: dict) -> dict | None:
         """
         Safely recover a stuck SL limit order:
-        1. Query latest status of SL order from exchange.
-        2. If already FILLED, return clean SL_HIT dict without placing new orders.
-        3. If active, CANCEL the order. Abort if cancel fails to prevent duplicate sell.
-        4. Re-query order detail to confirm cancellation and get exact executedQty.
-        5. Verify available wallet balance.
-        6. Execute MARKET SELL for remaining unfilled quantity.
-        7. Compute blended exit price if partial fill occurred.
+        1. Thread concurrency guard via lifecycle_lock.
+        2. Idempotency guard: abort if position is already marked exited.
+        3. Query latest status of SL order from exchange.
+        4. If already FILLED, cancel counterpart TP leg and return clean SL_HIT dict without placing new orders.
+        5. If active, CANCEL SL order. Abort if cancel fails to prevent duplicate sell.
+        6. Cancel counterpart TP order if present and verify no open orders remain on exchange.
+        7. Re-query order detail to confirm cancellation and get exact executedQty.
+        8. Verify available wallet balance with brief polling for ledger unfreeze.
+        9. Sizing & dust check.
+        10. Execute MARKET SELL for remaining unfilled quantity with timeout reconciliation.
+        11. Verify no substantial unsold position remains before declaring full exit.
+        12. Compute blended exit price if partial fill occurred.
         """
         sym = trade.get("symbol", "")
         sl_oid = str(trade.get("sl_order_id", ""))
+        tp_oid = str(trade.get("tp_order_id", "") or "").strip()
         entry_qty = float(trade.get("entry_qty") or 0)
+
+        with lifecycle_lock(sym):
+            return self._recover_stuck_sl_locked(trade, sym, sl_oid, tp_oid, entry_qty)
+
+    def _recover_stuck_sl_locked(
+        self, trade: dict, sym: str, sl_oid: str, tp_oid: str, entry_qty: float
+    ) -> dict | None:
+        t_rec_start = int(time.time() * 1000)
+
+        # Idempotency guard: if trade is already marked resolved, do NOT re-act
+        if trade.get("exit_status") in ("TP_HIT", "SL_HIT"):
+            print(f"  ℹ recover_stuck_sl({sym}): trade already marked {trade.get('exit_status')}. Aborting recovery.")
+            return None
 
         if not sl_oid:
             print(f"  ✗ recover_stuck_sl({sym}): missing sl_order_id")
@@ -1771,13 +2014,15 @@ class TokocryptoOrderExecutor:
             print(f"  ✗ recover_stuck_sl({sym}): get_order_detail failed: {e}")
             return None
 
-        sl_status = int(sl_detail.get("status", -99))
+        sl_status = sl_detail.get("status")
         sl_exec_qty = float(sl_detail.get("executedQty", 0) or 0)
         sl_exec_price = float(sl_detail.get("executedPrice", 0) or 0)
         sl_orig_qty = float(sl_detail.get("origQty", 0) or entry_qty)
 
         # Step 2: If already filled
-        if sl_status == 2 or (sl_orig_qty > 0 and sl_exec_qty >= sl_orig_qty):
+        if sl_status in (2, "FILLED", "2") or (sl_orig_qty > 0 and sl_exec_qty >= sl_orig_qty):
+            if tp_oid and tp_oid not in ("None", "0"):
+                self.cancel_order(sym, tp_oid)
             return {
                 "state": "SL_HIT",
                 "exit_price": sl_exec_price,
@@ -1787,12 +2032,72 @@ class TokocryptoOrderExecutor:
                 "slippage_flagged": False,
             }
 
-        # Step 3: Atomic Cancel
+        # Step 3: Atomic Cancel SL leg
         canceled = self.cancel_order(sym, sl_oid)
         if not canceled:
+            # Race condition check: did the order fill during the cancel request?
+            try:
+                rc_detail = self.client.get_order_detail(sym, sl_oid)
+                rc_status = rc_detail.get("status")
+                rc_exec_qty = float(rc_detail.get("executedQty", 0) or 0)
+                rc_exec_price = float(rc_detail.get("executedPrice", 0) or 0)
+                rc_orig_qty = float(rc_detail.get("origQty", 0) or entry_qty)
+                if rc_status in (2, "FILLED", "2") or (rc_orig_qty > 0 and rc_exec_qty >= rc_orig_qty):
+                    if tp_oid and tp_oid not in ("None", "0"):
+                        self.cancel_order(sym, tp_oid)
+                    return {
+                        "state": "SL_HIT",
+                        "exit_price": rc_exec_price,
+                        "exit_qty": rc_exec_qty,
+                        "exit_reason": "OCO_TRIGGERED",
+                        "raw_sl": rc_detail,
+                        "slippage_flagged": False,
+                    }
+            except Exception:
+                pass
+
             print(
                 f"  ✗ recover_stuck_sl({sym}): cancel_order({sl_oid}) failed. Aborting recovery to prevent duplicate sell."
             )
+            return None
+
+        # Step 3b: Cancel and verify counterpart TP leg if present
+        if tp_oid and tp_oid not in ("None", "0"):
+            tp_canceled = self.cancel_order(sym, tp_oid)
+            if not tp_canceled:
+                # Race condition check: did TP fill?
+                try:
+                    tp_det = self.client.get_order_detail(sym, tp_oid)
+                    if tp_det.get("status") in (2, "FILLED", "2"):
+                        print(
+                            f"  ⚠ recover_stuck_sl({sym}): counterpart TP order {tp_oid} was already FILLED! Resolving as TP_HIT."
+                        )
+                        return {
+                            "state": "TP_HIT",
+                            "exit_price": float(tp_det.get("executedPrice", 0) or 0),
+                            "exit_qty": float(tp_det.get("executedQty", 0) or entry_qty),
+                            "exit_reason": "OCO_TRIGGERED",
+                            "raw_tp": tp_det,
+                            "slippage_flagged": False,
+                        }
+                except Exception:
+                    pass
+                print(
+                    f"  ✗ recover_stuck_sl({sym}): counterpart TP order {tp_oid} could not be canceled/verified terminal. Aborting."
+                )
+                return None
+
+        # Open order verification: ensure no active orders remain on exchange for this symbol
+        try:
+            open_orders = self.client.get_open_orders(sym)
+            if not isinstance(open_orders, list) or len(open_orders) > 0:
+                print(
+                    f"  ✗ recover_stuck_sl({sym}): active open order(s) remain or unverified on exchange: "
+                    f"{[o.get('orderId') for o in open_orders] if isinstance(open_orders, list) else open_orders}. Aborting to prevent duplicate sell."
+                )
+                return None
+        except Exception as exc:
+            print(f"  ✗ recover_stuck_sl({sym}): open orders check failed: {exc}. Aborting.")
             return None
 
         # Step 4: Re-query post-cancel
@@ -1824,14 +2129,45 @@ class TokocryptoOrderExecutor:
             base_asset = sym[:-4]
         else:
             base_asset = sym.replace("_IDR", "").replace("IDR", "")
-        try:
-            bal = self.client.get_balance(base_asset)
-            free_bal = float(bal.free) if bal else 0.0
-        except Exception as e:
-            print(f"  ✗ recover_stuck_sl({sym}): get_balance({base_asset}) failed: {e}")
-            return None
+
+        # Step 5: Verify available wallet balance with brief polling (up to 3 polls, 300ms pause)
+        # to allow exchange account ledger to complete unfreezing locked balance
+        free_bal = 0.0
+        for poll_idx in range(3):
+            try:
+                bal = self.client.get_balance(base_asset)
+                free_bal = float(bal.free) if bal else 0.0
+                if free_bal >= remaining_qty:
+                    break
+            except Exception as e:
+                print(f"  ⚠ recover_stuck_sl({sym}): get_balance({base_asset}) poll {poll_idx + 1} failed: {e}")
+            if poll_idx < 2:
+                time.sleep(0.3)
 
         if free_bal <= 0:
+            # Check if an emergency market sell was already placed and filled previously
+            hist_match = None
+            raw_meta = dict(trade.get("raw_entry_order") or {}) if isinstance(trade.get("raw_entry_order"), dict) else {}
+            claimed_at_iso = raw_meta.get("recovery_claimed_at")
+            if claimed_at_iso:
+                try:
+                    dt = datetime.fromisoformat(claimed_at_iso.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    c_ms = int(dt.timestamp() * 1000)
+                    if c_ms > 0:
+                        hist_match = self.reconcile_emergency_sell_from_history(
+                            sym, remaining_qty, window_start_ms=c_ms - 10_000, window_end_ms=c_ms + 180_000, sl_exec_qty=sl_exec_qty, sl_exec_price=sl_exec_price
+                        )
+                except Exception:
+                    pass
+            elif t_rec_start > 0:
+                hist_match = self.reconcile_emergency_sell_from_history(
+                    sym, remaining_qty, window_start_ms=t_rec_start - 10_000, window_end_ms=t_rec_start + 180_000, sl_exec_qty=sl_exec_qty, sl_exec_price=sl_exec_price
+                )
+            if hist_match:
+                return hist_match
+
             print(
                 f"  ✗ recover_stuck_sl({sym}): zero available balance for {base_asset} (free={free_bal})"
             )
@@ -1839,17 +2175,49 @@ class TokocryptoOrderExecutor:
 
         sell_qty = min(remaining_qty, free_bal)
 
-        # Step 6: Execute MARKET SELL
+        # Step 6: Execute MARKET SELL (handles round_step, min_qty, and min_notional validation)
         mkt_resp = self.execute_market_sell(sym, sell_qty)
         if not mkt_resp:
-            print(f"  ✗ recover_stuck_sl({sym}): emergency market sell failed.")
+            # Check if market sell could not proceed because remaining quantity is non-tradeable dust
+            try:
+                sym_info = self.client.get_symbol(sym)
+                qty_rounded = self.client.round_step(sell_qty, sym_info.step_size)
+                if (qty_rounded <= 0 or qty_rounded < sym_info.min_qty) and sl_exec_qty > 0:
+                    print(
+                        f"  ℹ recover_stuck_sl({sym}): remaining qty {sell_qty} is residual dust (< min_qty {sym_info.min_qty}). "
+                        f"Resolving position with filled SL quantity ({sl_exec_qty})."
+                    )
+                    return {
+                        "state": "SL_HIT",
+                        "exit_price": sl_exec_price,
+                        "exit_qty": sl_exec_qty,
+                        "exit_reason": "OCO_TRIGGERED",
+                        "raw_sl": sl_detail_post,
+                        "slippage_flagged": False,
+                    }
+            except Exception:
+                pass
+
+            print(f"  ✗ recover_stuck_sl({sym}): emergency market sell failed or ambiguous.")
             return None
 
         mkt_exec_price = float(mkt_resp.get("executedPrice", 0) or 0)
         mkt_exec_qty = float(mkt_resp.get("executedQty", 0) or sell_qty)
 
-        # Step 7: Blended price calculation
+        # Step 8: Post-Execution Reconciliation (Risk 3 Guard)
         total_exit_qty = sl_exec_qty + mkt_exec_qty
+        unresolved_qty = max(0.0, entry_qty - total_exit_qty)
+        try:
+            sym_info = self.client.get_symbol(sym)
+            if unresolved_qty >= sym_info.min_qty and (unresolved_qty * mkt_exec_price >= 20000.0):
+                print(
+                    f"  🚨 recover_stuck_sl({sym}): substantial position ({unresolved_qty}) remains unsold! Requiring reconciliation."
+                )
+                return None
+        except Exception:
+            pass
+
+        # Step 9: Blended price calculation
         if total_exit_qty > 0:
             blended_price = (
                 sl_exec_qty * sl_exec_price + mkt_exec_qty * mkt_exec_price
