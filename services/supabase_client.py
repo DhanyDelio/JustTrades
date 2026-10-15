@@ -445,12 +445,37 @@ def upsert_tokocrypto(record: dict) -> None:
 def update_tokocrypto_by_order_id(entry_order_id: str, fields: dict) -> None:
     _assert_safe_write_environment("update_tokocrypto_by_order_id")
     try:
-        (
+        res = (
             get_client()
             .table(TABLE_TOKOCRYPTO)
             .update(fields)
             .eq("entry_order_id", entry_order_id)
             .execute()
+        )
+        data = getattr(res, "data", None)
+        count = getattr(res, "count", None)
+
+        # 1. PostgREST standard response with returned representation (list)
+        if data is not None and isinstance(data, list):
+            if len(data) == 0:
+                raise RuntimeError(
+                    f"update_tokocrypto_by_order_id: 0 rows updated for entry_order_id='{entry_order_id}'. "
+                    "Record not found or update matched no rows."
+                )
+            return
+
+        # 2. PostgREST count response without representation
+        if count is not None and isinstance(count, int):
+            if count == 0:
+                raise RuntimeError(
+                    f"update_tokocrypto_by_order_id: 0 rows updated for entry_order_id='{entry_order_id}'."
+                )
+            return
+
+        # 3. Unverified response — cannot confirm row was updated
+        raise RuntimeError(
+            f"update_tokocrypto_by_order_id: update verification failed for entry_order_id='{entry_order_id}'. "
+            f"Response cannot be verified (data={data!r}, count={count!r})."
         )
     except Exception as e:
         print(f"⚠️ update_tokocrypto_by_order_id failed: {e}")

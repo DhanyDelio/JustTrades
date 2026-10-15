@@ -152,7 +152,8 @@ class TestTokocryptoStaleStateRecovery(unittest.TestCase):
         with patch.object(self.executor, "place_oco") as place:
             self.monitor._check_one(trade, verbose=False)
         place.assert_not_called()
-        self.assertTrue(
+        # Transient failure must not permanently lock into RECONCILIATION_REQUIRED
+        self.assertFalse(
             any(
                 call.args[1].get("oco_state") == "RECONCILIATION_REQUIRED"
                 for call in update.call_args_list

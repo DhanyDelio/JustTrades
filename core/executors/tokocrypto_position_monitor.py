@@ -20,6 +20,7 @@ Safety invariants:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 
 from core.clients.tokocrypto_client import TokocryptoClient, TokocryptoError
 from core.clients.tokocrypto_order_executor import (
@@ -39,6 +40,23 @@ from services.supabase_client import (
     TABLE_TOKOCRYPTO,
 )
 from core.paper_trade_executor import _send_toko_telegram
+
+
+_RECONCILIATION_WARN_COOLDOWN_SEC = 300.0  # 5 minutes
+_last_reconciliation_warning_ts: dict[str, float] = {}
+
+
+def _notify_transient_reconciliation_failure(sym: str, error_msg: str) -> None:
+    """Send throttled Telegram notification on transient exchange reconciliation query failure."""
+    now = time.time()
+    last = _last_reconciliation_warning_ts.get(sym, 0.0)
+    if now - last >= _RECONCILIATION_WARN_COOLDOWN_SEC:
+        _last_reconciliation_warning_ts[sym] = now
+        _send_toko_telegram(
+            f"⚠️ OCO RECONCILIATION TRANSIENT ERROR: {sym}\n"
+            f"Failed to query open orders from exchange: {error_msg[:120]}\n"
+            "Skipping OCO placement this cycle. Will retry exchange inspection next cycle."
+        )
 
 
 class TokocryptoPositionMonitor:
@@ -172,10 +190,26 @@ class TokocryptoPositionMonitor:
         sym = trade.get("symbol", "?")
         entry_oid = str(trade.get("entry_order_id", ""))
         entry_status = (trade.get("entry_status") or "").upper()
+        exit_status_raw = trade.get("exit_status")
+        exit_status = (exit_status_raw or "").upper()
         b_order_list = str(trade.get("b_order_list_id") or "").strip()
         tp_oid = str(trade.get("tp_order_id") or "").strip()
         sl_oid = str(trade.get("sl_order_id") or "").strip()
         has_oco = bool(tp_oid and sl_oid)
+
+        CLOSED_EXIT_STATES = {
+            "TP_HIT",
+            "SL_HIT",
+            "CANCELED",
+            "REJECTED",
+            "EXPIRED",
+            "MANUAL_CLOSED",
+            "CLOSED",
+        }
+        if exit_status in CLOSED_EXIT_STATES:
+            if verbose:
+                print(f"  [{sym}] trade is closed (exit_status={exit_status}); skipping.")
+            return
 
         if verbose:
             print(
@@ -403,40 +437,63 @@ class TokocryptoPositionMonitor:
         # ----------------------------------------------------------------
         if entry_status == "FILLED" and not has_oco:
             # Retry guard — stop retrying after MAX_OCO_RETRIES to avoid
-            # Telegram spam.  The counter persists in Supabase.
+            # Telegram spam. The counter persists in Supabase.
             MAX_OCO_RETRIES = 3
             attempts = int(trade.get("oco_placement_attempts") or 0)
             oco_state_cur = (trade.get("oco_state") or "").upper()
 
-            if oco_state_cur != "OCO_NOT_ATTEMPTED" or b_order_list or not has_oco:
-                try:
-                    discovered, safe_to_start = self.executor.inspect_open_oco_legs(
-                        sym, b_order_list
-                    )
-                except Exception as exc:
-                    discovered = None
-                    safe_to_start = False
+            # Determine if this state is eligible for initial placement or retry
+            is_initial_attempt = (oco_state_cur == "OCO_NOT_ATTEMPTED")
+            is_retryable_failure = (
+                oco_state_cur == "OCO_PLACEMENT_FAILED"
+                and attempts < MAX_OCO_RETRIES
+            )
+            is_placement_eligible = is_initial_attempt or is_retryable_failure
+
+            exchange_check_failed = False
+            try:
+                discovered, safe_to_start = self.executor.inspect_open_oco_legs(
+                    sym, b_order_list
+                )
+            except Exception as exc:
+                discovered = None
+                safe_to_start = False
+                exchange_check_failed = True
+                print(
+                    f"  [{sym}] ⚠️ OCO open-order reconciliation query failed: {exc}",
+                    flush=True,
+                )
+                _notify_transient_reconciliation_failure(sym, str(exc))
+
+            if exchange_check_failed:
+                # Transient exchange failure during open order query:
+                # Do NOT permanently lock into RECONCILIATION_REQUIRED,
+                # do NOT call place_oco(), stop processing this trade this cycle.
+                # Next cycle will re-query the exchange cleanly.
+                if verbose:
                     print(
-                        f"  [{sym}] OCO open-order reconciliation failed: {exc}",
-                        flush=True,
+                        f"  [{sym}] transient exchange query failure; aborting OCO processing this cycle."
                     )
-                if discovered:
-                    tp_oid, sl_oid = discovered
-                    trade = {**trade, "tp_order_id": tp_oid, "sl_order_id": sl_oid}
-                    update_tokocrypto_by_order_id(
-                        entry_oid,
-                        {
-                            "tp_order_id": tp_oid,
-                            "sl_order_id": sl_oid,
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    has_oco = True
-                elif (
-                    not safe_to_start
-                    or oco_state_cur != "OCO_NOT_ATTEMPTED"
-                    or b_order_list
-                ):
+                return
+
+            if discovered:
+                tp_oid, sl_oid = discovered
+                trade = {**trade, "tp_order_id": tp_oid, "sl_order_id": sl_oid}
+                update_tokocrypto_by_order_id(
+                    entry_oid,
+                    {
+                        "tp_order_id": tp_oid,
+                        "sl_order_id": sl_oid,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                has_oco = True
+            elif (
+                not safe_to_start
+                or not is_placement_eligible
+                or b_order_list
+            ):
+                if oco_state_cur != "RECONCILIATION_REQUIRED":
                     update_tokocrypto_by_order_id(
                         entry_oid,
                         {
@@ -449,26 +506,17 @@ class TokocryptoPositionMonitor:
                         "Stored state and exchange open orders do not prove a complete TP/SL pair; "
                         "automatic OCO placement stopped for manual reconciliation."
                     )
-                    return
+                else:
+                    if verbose:
+                        print(
+                            f"  [{sym}] awaiting manual reconciliation (state={oco_state_cur})"
+                        )
+                return
 
             if not has_oco and not claim_oco_submission(entry_oid):
                 if verbose:
                     print(
                         f"  [{sym}] OCO submission is already claimed or unresolved; skipping."
-                    )
-                return
-
-            if (
-                not has_oco
-                and oco_state_cur == "OCO_PLACEMENT_FAILED"
-                and attempts >= MAX_OCO_RETRIES
-            ):
-                # Already exhausted retries — do NOT retry or re-alert.
-                # One-time escalation was sent on the last attempt.
-                if verbose:
-                    print(
-                        f"  [{sym}] OCO retries exhausted ({attempts}/{MAX_OCO_RETRIES}), "
-                        f"awaiting manual intervention."
                     )
                 return
 
@@ -481,9 +529,18 @@ class TokocryptoPositionMonitor:
                             "updated_at": datetime.now(timezone.utc).isoformat(),
                         },
                     )
-                except Exception:
+                except Exception as pend_exc:
                     release_oco_submission(entry_oid)
-                    raise
+                    print(
+                        f"  [{sym}] 🚨 Failed to persist OCO_SUBMISSION_PENDING to DB: {pend_exc}",
+                        flush=True,
+                    )
+                    _send_toko_telegram(
+                        f"🚨 OCO PERSISTENCE FAILED BEFORE SUBMISSION: {sym}\n"
+                        f"{str(pend_exc)[:120]}\n"
+                        "Exchange POST aborted for safety."
+                    )
+                    return
 
                 try:
                     oco_result = self.executor.place_oco(trade)
@@ -506,20 +563,44 @@ class TokocryptoPositionMonitor:
                     )
                 else:
                     if oco_result is None:
-                        release_oco_submission(entry_oid)
                         attempts += 1
-                        update_tokocrypto_by_order_id(
-                            entry_oid,
-                            {
-                                "oco_state": "OCO_PLACEMENT_FAILED",
-                                "oco_placement_attempts": attempts,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            },
-                        )
-                        _send_toko_telegram(
-                            f"⚠️ OCO NOT PLACED: {sym} (known pre-submit rejection/abort). "
-                            "No exchange POST was made; manual review required before retry."
-                        )
+                        is_exhausted = (attempts >= MAX_OCO_RETRIES)
+                        next_state = "RECONCILIATION_REQUIRED" if is_exhausted else "OCO_PLACEMENT_FAILED"
+                        try:
+                            update_tokocrypto_by_order_id(
+                                entry_oid,
+                                {
+                                    "oco_state": next_state,
+                                    "oco_placement_attempts": attempts,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                        except Exception as db_exc:
+                            # State persistence failed: do NOT release in-memory submission claim,
+                            # keeping it flagged as unresolved. Escalate failure explicitly.
+                            print(
+                                f"  [{sym}] 🚨 Failed to persist OCO failure state to database: {db_exc}",
+                                flush=True,
+                            )
+                            _send_toko_telegram(
+                                f"🚨 OCO STATE PERSISTENCE FAILED: {sym}\n"
+                                f"Pre-submit rejected, but DB state update failed ({str(db_exc)[:120]}).\n"
+                                "Submission claim retained as unresolved; manual reconciliation required."
+                            )
+                            raise
+                        else:
+                            # DB update confirmed: release submission claim so next cycle can retry cleanly
+                            release_oco_submission(entry_oid)
+                            if is_exhausted:
+                                _send_toko_telegram(
+                                    f"🚨 OCO RETRIES EXHAUSTED: {sym} ({attempts}/{MAX_OCO_RETRIES} attempts failed).\n"
+                                    "Pre-submit checks failed repeatedly; automatic retry stopped. Manual reconciliation required."
+                                )
+                            else:
+                                _send_toko_telegram(
+                                    f"⚠️ OCO NOT PLACED: {sym} (attempt {attempts}/{MAX_OCO_RETRIES} failed pre-submit). "
+                                    "Will retry on next cycle if price/conditions recover."
+                                )
                 return
 
         # ----------------------------------------------------------------
