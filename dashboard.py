@@ -1318,6 +1318,12 @@ def render_spot_open_card(trade: dict, current_price: float | None) -> None:
             f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
             f"🟠 SL ONLY</span>"
         )
+    elif recon_status == "SL_TRIGGERED_UNFILLED":
+        oco_badge = (
+            f"<span style='background:#d97706;color:#fff;border-radius:4px;"
+            f"padding:1px 7px;font-size:0.78em;font-weight:700'>"
+            f"🟠 SL TRIGGERED (UNFILLED)</span>"
+        )
     elif recon_status == "FULLY_PROTECTED" or oco_ok:
         oco_badge = (
             f"<span style='background:#1a7a1a;color:#fff;border-radius:4px;"

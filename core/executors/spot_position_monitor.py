@@ -837,13 +837,27 @@ class SpotPositionMonitor:
                           and not _oco_missing and trade.get("oco_placed")):
                         # OCO exists on exchange (confirmed in Step 3) but SL leg
                         # has not fired yet (execution lag, testnet quirk, stuck OCO).
+                        #
+                        # ── State Handling: SL_TRIGGERED_UNFILLED ──────────────────
+                        # If already confirmed and persisted in a prior cycle, suppress
+                        # duplicate Telegram alerts. Keep exit_status=OPEN until exchange
+                        # actually executes/closes the order.
+                        if prev_recon == "SL_TRIGGERED_UNFILLED":
+                            oco_str = "🟠 SL_UNFILLED"
+                            print(
+                                f"  [{sym}] 🟠 SL_TRIGGERED_UNFILLED: resting SL order unexecuted "
+                                f"(price {current:.4f} ≤ SL {sl_level:.4f}). Position OPEN, alert suppressed."
+                            )
+                            continue
+
                         # ── 2Z-style stuck-OCO shadow detection (two-cycle gate) ────
                         # Cycle N: mark suspected, persist, do NOT resolve.
                         # Cycle N+1: if still stuck and suspected_at from a prior
-                        #            cycle → send Telegram alert, still do NOT
-                        #            auto-resolve (see OCO_STUCK_AUTO_RESOLVE_ENABLED).
+                        #            cycle → send Telegram alert, persist
+                        #            oco_reconciliation_status=SL_TRIGGERED_UNFILLED,
+                        #            keep position OPEN, suppress alerts on future cycles.
                         _raw = dict(trade.get("raw_entry_order") or {})
-                        _stuck_info = _raw.get("stuck_oco_detection") or {}
+                        _stuck_info = dict(_raw.get("stuck_oco_detection") or {})
                         _suspected_at = _stuck_info.get("suspected_at")
 
                         # A module-level set tracks IDs marked this specific run
@@ -857,7 +871,11 @@ class SpotPositionMonitor:
                         )
 
                         if _already_confirmed:
-                            # Cycle N+1: confirmed stuck OCO — send alert.
+                            # Cycle N+1: confirmed stuck OCO — format IDs cleanly and send alert.
+                            tp_id_disp = trade.get("tp_order_id") or "n/a (in oco_order_ids)"
+                            sl_id_disp = trade.get("sl_order_id") or "n/a (in oco_order_ids)"
+                            oco_ids_disp = trade.get("oco_order_ids") or "n/a"
+
                             print(
                                 f"  ⚠  [{sym}] CONFIRMED stuck-OCO: SL leg NEW, "
                                 f"price {current:.4f} ≤ SL {sl_level:.4f}, "
@@ -866,14 +884,17 @@ class SpotPositionMonitor:
                             _send_telegram(
                                 f"⚠ [SPOT] STUCK-OCO CONFIRMED: {sym}\n"
                                 f"SL leg is NEW/unexecuted with price below SL.\n"
+                                f"State: SL_TRIGGERED_UNFILLED (Position remains OPEN)\n"
                                 f"SL: {ca._fmt_price(sl_level).strip()}  "
                                 f"Current: {ca._fmt_price(current).strip()}\n"
-                                f"tp_order_id: {trade.get('tp_order_id')}  "
-                                f"sl_order_id: {trade.get('sl_order_id')}\n"
+                                f"tp_order_id: {tp_id_disp}  "
+                                f"sl_order_id: {sl_id_disp}\n"
+                                f"oco_order_ids: {oco_ids_disp}\n"
                                 f"oco_list_id: {trade.get('oco_list_id')}\n"
                                 f"suspected_at: {_suspected_at}\n"
-                                f"⚠ NO auto-resolve. Manual intervention may be needed."
+                                f"⚠ NO auto-resolve. Position remains OPEN."
                             )
+
                             _auto_resolve = os.getenv(
                                 "OCO_STUCK_AUTO_RESOLVE_ENABLED", "false"
                             ).lower() in {"1", "true", "yes", "on"}
@@ -883,10 +904,45 @@ class SpotPositionMonitor:
                                     f"  [{sym}] OCO_STUCK_AUTO_RESOLVE_ENABLED=true detected "
                                     f"but auto-resolve is NOT implemented in this version."
                                 )
+
+                            _now_iso = datetime.now(timezone.utc).isoformat()
+                            _stuck_info["confirmed_at"] = _now_iso
+                            _stuck_info["breach_price"] = current
+                            _stuck_info["state"] = "SL_TRIGGERED_UNFILLED"
+                            _stuck_info["alert_sent_at"] = _now_iso
+
+                            # Attempt to persist reconciliation status & metadata
+                            _persist_success = False
+                            _updated_raw = {**_raw, "stuck_oco_detection": {**_stuck_info, "alert_suppressed": True}}
+                            try:
+                                from services.supabase_client import update_spot_by_order_id as _usb_stuck
+                                _usb_stuck(eid, {
+                                    "oco_reconciliation_status": "SL_TRIGGERED_UNFILLED",
+                                    "raw_entry_order": _updated_raw,
+                                })
+                                _persist_success = True
+                            except Exception as _p_err:
+                                print(f"  ⚠ [{sym}] Failed to persist SL_TRIGGERED_UNFILLED: {_p_err}")
+                                _persist_success = False
+
+                            if _persist_success:
+                                # Suppress repeated alerts on future cycles only after successful persistence
+                                _stuck_info["alert_suppressed"] = True
+                                trade["oco_reconciliation_status"] = "SL_TRIGGERED_UNFILLED"
+                            else:
+                                # If persistence fails, retain unsuppressed retry path for next cycle
+                                _stuck_info.pop("alert_suppressed", None)
+
+                            _raw["stuck_oco_detection"] = _stuck_info
+                            trade["raw_entry_order"] = _raw
+                            log_dirty = True
+                            oco_str = "🟠 SL_UNFILLED"
                         else:
                             # Cycle N: first detection — mark suspected_at.
-                            _now_iso = datetime.now(timezone.utc).isoformat() + "Z"
-                            _stuck_info = {"suspected_at": _now_iso}
+                            _now_iso = datetime.now(timezone.utc).isoformat()
+                            _stuck_info["suspected_at"] = _now_iso
+                            _stuck_info["sl_price_breached_at"] = _now_iso
+                            _stuck_info["breach_price"] = current
                             _raw["stuck_oco_detection"] = _stuck_info
                             trade["raw_entry_order"] = _raw
                             # Track in module-level set so Cycle N+1 can detect.
