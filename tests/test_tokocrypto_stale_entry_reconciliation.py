@@ -180,19 +180,19 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
     def test_02b_five_audit_fixtures_monitor_evaluation(self, mock_tg, mock_update):
-        """All 5 audit fixtures are safely evaluated by the monitor without unauthorized cancellations."""
+        """All 5 audit fixtures are safely evaluated: ETH & XRP cleanup candidates, FLOKI review, ASTER & HBAR observe."""
         now = datetime.now(timezone.utc)
         fixtures = [
-            ("ETH_IDR", "919115896", 35112537.0, 43900000.0, 6.9),  # +25.03% -> STALE_SERIOUS
-            ("XRP_IDR", "919131151", 19968.0, 24265.0, 6.9),        # +21.52% -> STALE_SERIOUS
-            ("FLOKI_IDR", "919264800", 0.38, 0.44, 6.5),             # +15.79% -> REVIEW_REQUIRED
-            ("ASTER_IDR", "918525394", 12033.0, 12851.0, 9.1),       # +6.80% -> OLD_DISTANCE_INSUFFICIENT
-            ("HBAR_IDR", "919115908", 1435.1, 1501.9, 6.9),         # +4.65% -> OLD_DISTANCE_INSUFFICIENT
+            ("ETH_IDR", "919115896", 35112537.0, 43900000.0, 6.9, True),   # +25.03% -> CANCEL_CANDIDATE (>= 20%)
+            ("XRP_IDR", "919131151", 19968.0, 24265.0, 6.9, True),         # +21.52% -> CANCEL_CANDIDATE (>= 20%)
+            ("FLOKI_IDR", "919264800", 0.38, 0.44, 6.5, False),             # +15.79% -> REVIEW_REQUIRED (< 20%)
+            ("ASTER_IDR", "918525394", 12033.0, 12851.0, 9.1, False),       # +6.80% -> OLD_DISTANCE_INSUFFICIENT (< 15%)
+            ("HBAR_IDR", "919115908", 1435.1, 1501.9, 6.9, False),         # +4.65% -> OLD_DISTANCE_INSUFFICIENT (< 15%)
         ]
 
-        # Even with auto_cancel=1, none of these 5 fixtures are CANCEL_CANDIDATE (none are >= 30%)
-        env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
-        for sym, oid, entry_p, cur_p, age_d in fixtures:
+        # 1. In default shadow mode (TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=0), none of the 5 fixtures call cancel_order
+        env_shadow = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "0"}
+        for sym, oid, entry_p, cur_p, age_d, _ in fixtures:
             mock_update.reset_mock()
             trade = {
                 "symbol": sym,
@@ -210,19 +210,54 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             }
             self.mock_client.get_ticker.return_value = cur_p
 
-            with patch.dict("os.environ", env):
+            with patch.dict("os.environ", env_shadow):
                 with patch.object(self.executor, "cancel_order") as mock_cancel:
                     self.monitor._check_one(trade, verbose=True)
                     mock_cancel.assert_not_called()
                     mock_update.assert_not_called()
 
+        # 2. In auto_cancel=1 mode: ETH & XRP trigger cancel (>= 20%), while FLOKI, ASTER, HBAR do NOT.
+        env_live = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
+        for sym, oid, entry_p, cur_p, age_d, should_cancel in fixtures:
+            mock_update.reset_mock()
+            trade = {
+                "symbol": sym,
+                "entry_order_id": oid,
+                "entry_status": "NEW",
+                "exit_status": "OPEN",
+                "entry_price": entry_p,
+                "open_time": (now - timedelta(days=age_d)).isoformat(),
+            }
+            # Initial detail (status=0) followed by verified canceled detail (status=3) if canceled
+            self.mock_client.get_order_detail.side_effect = [
+                {"orderId": oid, "status": 0, "executedQty": "0", "price": str(entry_p)},
+                {"orderId": oid, "status": 3, "executedQty": "0", "price": str(entry_p)},
+            ]
+            self.mock_client.get_ticker.return_value = cur_p
+
+            with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": True, "reason": "UPTREND_HEALTHY"}):
+                with patch.dict("os.environ", env_live):
+                    with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
+                        self.monitor._check_one(trade, verbose=True)
+                        if should_cancel:
+                            mock_cancel.assert_called_once_with(sym, oid)
+                            mock_update.assert_called_once()
+                            call_payload = mock_update.call_args[0][1]
+                            self.assertEqual(call_payload["entry_status"], "CANCELED")
+                            self.assertEqual(call_payload["exit_status"], "CANCELED")
+                            self.assertTrue(call_payload["exit_reason"].startswith("STALE_ENTRY_CANCELED"))
+                            self.assertIn("raw_exit_detail", call_payload)
+                        else:
+                            mock_cancel.assert_not_called()
+                            mock_update.assert_not_called()
+
     # -------------------------------------------------------------------------
-    # 3. Cancel zero-fill yang terverifikasi (Kandidat >= 30% & zone invalid)
+    # 3. Cancel zero-fill yang terverifikasi (Kandidat >= 20% & audit Supabase lengkap)
     # -------------------------------------------------------------------------
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
     def test_03_verified_zero_fill_cancellation(self, mock_tg, mock_update):
-        """Verified cancel with 0 fill updates DB to CANCELED and releases slot."""
+        """Verified cancel with 0 fill updates DB with full audit trail and releases slot."""
         from core.clients import tokocrypto_order_executor as order_executor_module
 
         now = datetime.now(timezone.utc)
@@ -245,13 +280,13 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid, "status": 0, "executedQty": "0", "price": "40000000"},
             {"orderId": oid, "status": 3, "executedQty": "0", "price": "40000000"},
         ]
-        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 30% cancel candidate)
+        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 20% cancel candidate)
 
         env = {
             "TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1",
             "TOKO_STALE_ENTRY_MIN_DAYS": "3.0",
         }
-        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": True, "reason": "UPTREND"}):
             with patch.dict("os.environ", env):
                 with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
                     self.monitor._check_one(trade, verbose=True)
@@ -260,71 +295,105 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
         mock_update.assert_called_once()
         called_oid, payload = mock_update.call_args[0]
         self.assertEqual(called_oid, oid)
+        # 1. Compatible terminal statuses
         self.assertEqual(payload["entry_status"], "CANCELED")
         self.assertEqual(payload["exit_status"], "CANCELED")
-        self.assertEqual(payload["exit_reason"], "STALE_SETUP_TIMEOUT_CANCELED")
+        # 2. Descriptive exit_reason
+        self.assertTrue(payload["exit_reason"].startswith("STALE_ENTRY_CANCELED"))
+        self.assertIn("5.0d", payload["exit_reason"])
+        self.assertIn("+35.0%", payload["exit_reason"])
+        # 3. Rich audit trail in raw_exit_detail
+        audit = payload["raw_exit_detail"]
+        self.assertEqual(audit["reason"], "STALE_ENTRY_CANCELED")
+        self.assertEqual(audit["exchange_order_id"], oid)
+        self.assertEqual(audit["order_age_days"], 5.0)
+        self.assertEqual(audit["price_distance_pct"], 35.0)
+        self.assertEqual(audit["entry_price"], 40000000.0)
+        self.assertEqual(audit["current_price"], 54000000.0)
+        self.assertEqual(audit["stale_policy"]["min_age_days"], 3.0)
+        self.assertEqual(audit["stale_policy"]["cancel_pct"], 20.0)
+        self.assertIn("canceled_at", audit)
+        self.assertIn("chart_validation", audit)
 
         # Slot must be released in _ACTIVE_ENTRY_SUBMISSIONS
         self.assertNotIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
 
     # -------------------------------------------------------------------------
-    # 3b. Ambang >= 30% wajib validasi setup sebelum pembatalan
+    # 3b. Boundary umur (2.999d vs 3.0d) dan jarak (19.999% vs 20.0%) pada Monitor
     # -------------------------------------------------------------------------
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
-    def test_03b_cancel_candidate_requires_invalid_setup(self, mock_tg, mock_update):
-        """Threshold >= 30% is only a candidate: requires zone_valid=False to cancel."""
-        from core.clients import tokocrypto_order_executor as order_executor_module
-
+    def test_03b_monitor_age_and_distance_boundaries(self, mock_tg, mock_update):
+        """Monitor boundary testing: 2.999d vs 3.0d and 19.999% vs 20.0%."""
         now = datetime.now(timezone.utc)
-        sym = "ETH_IDR"
-        oid = "3002"
-        mark_entry_submission_active(sym)
+        env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
 
-        trade = {
-            "symbol": sym,
-            "entry_order_id": oid,
+        # Case 1: age = 2.999 days, dist = 25.0% (>= 20%) -> Under age, NO cancel!
+        trade_young = {
+            "symbol": "ETH_IDR",
+            "entry_order_id": "3101",
             "entry_status": "NEW",
             "exit_status": "OPEN",
             "entry_price": 40000000.0,
-            "open_time": (now - timedelta(days=5)).isoformat(),
+            "open_time": (now - timedelta(days=2.999)).isoformat(),
         }
         self.mock_client.get_order_detail.return_value = {
-            "orderId": oid,
+            "orderId": "3101",
             "status": 0,
             "executedQty": "0",
             "price": "40000000",
         }
-        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 30%)
+        self.mock_client.get_ticker.return_value = 50000000.0  # +25%
+        with patch.dict("os.environ", env):
+            with patch.object(self.executor, "cancel_order") as mock_cancel:
+                self.monitor._check_one(trade_young, verbose=True)
+                mock_cancel.assert_not_called()
+                mock_update.assert_not_called()
 
-        env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
+        # Case 2: age = 3.0 days, dist = 19.999% -> Just under 20%, REVIEW_REQUIRED, NO cancel!
+        trade_19pct = {
+            "symbol": "ETH_IDR",
+            "entry_order_id": "3102",
+            "entry_status": "NEW",
+            "exit_status": "OPEN",
+            "entry_price": 40000000.0,
+            "open_time": (now - timedelta(days=3.0)).isoformat(),
+        }
+        self.mock_client.get_order_detail.return_value = {
+            "orderId": "3102",
+            "status": 0,
+            "executedQty": "0",
+            "price": "40000000",
+        }
+        self.mock_client.get_ticker.return_value = 40000000.0 * (1 + 0.19999)
+        with patch.dict("os.environ", env):
+            with patch.object(self.executor, "cancel_order") as mock_cancel:
+                self.monitor._check_one(trade_19pct, verbose=True)
+                mock_cancel.assert_not_called()
+                mock_update.assert_not_called()
 
-        # Subcase 1: zone_valid == True (support zone retained) -> NO cancel!
-        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": True, "reason": "SUPPORT_ZONE_RETAINED"}):
-            with patch.dict("os.environ", env):
-                with patch.object(self.executor, "cancel_order") as mock_cancel:
-                    self.monitor._check_one(trade, verbose=True)
-                    mock_cancel.assert_not_called()
-                    mock_update.assert_not_called()
-                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
-
-        # Subcase 2: zone_valid == "unknown" (chart unavailable or error) -> NO cancel (fail-closed)!
-        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": "unknown", "reason": "ANALYSIS_UNAVAILABLE"}):
-            with patch.dict("os.environ", env):
-                with patch.object(self.executor, "cancel_order") as mock_cancel:
-                    self.monitor._check_one(trade, verbose=True)
-                    mock_cancel.assert_not_called()
-                    mock_update.assert_not_called()
-                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
-
-        # Subcase 3: zone_valid == False but shadow mode (AUTO_CANCEL=0) -> NO cancel!
-        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False, "reason": "ENTRY_ZONE_NOT_RETAINED"}):
-            with patch.dict("os.environ", {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "0"}):
-                with patch.object(self.executor, "cancel_order") as mock_cancel:
-                    self.monitor._check_one(trade, verbose=True)
-                    mock_cancel.assert_not_called()
-                    mock_update.assert_not_called()
-                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
+        # Case 3: age = 3.0 days, dist = 20.0% -> Exactly 20%, CANCEL_CANDIDATE, triggers cancel!
+        trade_20pct = {
+            "symbol": "ETH_IDR",
+            "entry_order_id": "3103",
+            "entry_status": "NEW",
+            "exit_status": "OPEN",
+            "entry_price": 40000000.0,
+            "open_time": (now - timedelta(days=3.0)).isoformat(),
+        }
+        self.mock_client.get_order_detail.side_effect = [
+            {"orderId": "3103", "status": 0, "executedQty": "0", "price": "40000000"},
+            {"orderId": "3103", "status": 3, "executedQty": "0", "price": "40000000"},
+        ]
+        self.mock_client.get_ticker.return_value = 40000000.0 * 1.20  # +20.0%
+        with patch.dict("os.environ", env):
+            with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
+                self.monitor._check_one(trade_20pct, verbose=True)
+                mock_cancel.assert_called_once_with("ETH_IDR", "3103")
+                mock_update.assert_called_once()
+                call_payload = mock_update.call_args[0][1]
+                self.assertEqual(call_payload["entry_status"], "CANCELED")
+                self.assertEqual(call_payload["exit_status"], "CANCELED")
 
     # -------------------------------------------------------------------------
     # 4. Cancel raced dengan partial fill atau full fill

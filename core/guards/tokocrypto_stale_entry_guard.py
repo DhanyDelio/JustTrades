@@ -5,8 +5,8 @@ Conservative stale-entry classification and decision policy for Tokocrypto IDR S
 
 This module provides pure-function decision helpers without exchange mutations or database side-effects.
 
-POLICY TIERS (Umur >= 3 hari):
------------------------------
+POLICY TIERS (Umur >= 3 hari, kapasitas 5 slot Tokocrypto):
+-----------------------------------------------------------
 1. NORMAL:
    Umur < 3 hari (atau data tidak valid / jarak < 15% pada order muda).
    Tidak ada tindakan stale.
@@ -19,13 +19,11 @@ POLICY TIERS (Umur >= 3 hari):
    Umur >= 3 hari dan 15% <= Jarak < 20%.
    Tandai untuk review berkala.
 
-4. STALE_SERIOUS:
-   Umur >= 3 hari dan 20% <= Jarak < 30%.
-   Prioritas review tinggi karena slot Tokocrypto sangat terbatas (maksimal 5 posisi).
-
-5. CANCEL_CANDIDATE:
-   Umur >= 3 hari dan Jarak >= 30%.
-   Kandidat pembatalan; WAJIB validasi setup struktur chart sebelum boleh dieksekusi.
+4. CANCEL_CANDIDATE:
+   Umur >= 3 hari dan Jarak >= 20%.
+   Kandidat pembatalan untuk melepaskan slot Tokocrypto yang terbatas (5 slot);
+   WAJIB validasi setup struktur chart sebelum boleh dieksekusi.
+   (STALE_SERIOUS tetap tersedia jika TOKO_STALE_ENTRY_CANCEL_PCT dinaikkan di atas 20% via env var).
 """
 
 from __future__ import annotations
@@ -51,7 +49,7 @@ class TokoStaleThresholds:
     min_age_days: float = 3.0
     review_pct: float = 15.0
     serious_pct: float = 20.0
-    cancel_pct: float = 30.0
+    cancel_pct: float = 20.0
 
     @classmethod
     def from_env(cls) -> "TokoStaleThresholds":
@@ -74,7 +72,7 @@ class TokoStaleThresholds:
         review_dist = _parse_float(review_val, 15.0, min_val=0.0)
 
         serious_dist = _parse_float(os.environ.get("TOKO_STALE_ENTRY_SERIOUS_PCT"), 20.0, min_val=review_dist)
-        cancel_dist = _parse_float(os.environ.get("TOKO_STALE_ENTRY_CANCEL_PCT"), 30.0, min_val=serious_dist)
+        cancel_dist = _parse_float(os.environ.get("TOKO_STALE_ENTRY_CANCEL_PCT"), 20.0, min_val=review_dist)
 
         return cls(
             min_age_days=min_age,

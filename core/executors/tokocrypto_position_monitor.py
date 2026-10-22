@@ -230,19 +230,20 @@ class TokocryptoPositionMonitor:
 
     def _evaluate_and_cancel_stale_entry(
         self, trade: dict, detail: dict, sym: str, entry_oid: str, verbose: bool
-    ) -> dict | None:
+    ) -> tuple[dict | None, dict | None]:
         """
-        Evaluate if an unfilled limit buy (status=0) is stale using the agreed 4-tier policy:
+        Evaluate if an unfilled limit buy (status=0) is stale.
+        Policy:
         1. NORMAL: (< 3d or < 15%) -> No action.
         2. OLD_DISTANCE_INSUFFICIENT: (>= 3d, < 15%) -> Aged, kept for observation, setup valid.
         3. REVIEW_REQUIRED: (>= 3d, 15% <= dist < 20%) -> Flagged for review.
-        4. STALE_SERIOUS: (>= 3d, 20% <= dist < 30%) -> Priority review due to limited 5 slots.
-        5. CANCEL_CANDIDATE: (>= 3d, dist >= 30%) -> Setup validation mandatory before cancel.
+        4. STALE_SERIOUS: (>= 3d, 20% <= dist < cancel_pct if cancel_pct > 20%) -> Priority review.
+        5. CANCEL_CANDIDATE: (>= 3d, dist >= cancel_pct, default 20.0%) -> Eligible for stale cleanup.
 
-        If CANCEL_CANDIDATE, validated broken (zone_valid=False), and TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=1,
-        attempts cancel and re-queries detail.
-        Returns the re-queried detail dict if cancel was executed and post-cancel verified; None otherwise.
-        Fail-closed: On any parsing, network, validation, or verification error, returns None without mutating state.
+        If CANCEL_CANDIDATE and TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=1:
+        Attempts cancel and re-queries detail for exchange verification.
+        Returns (re_queried_detail, stale_audit_meta) if cancel was executed and verified; (None, None) otherwise.
+        Fail-closed: On any parsing, network, validation, or verification error, returns (None, None) without mutating state.
         """
         auto_cancel = os.environ.get("TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED", "0") == "1"
         thr = TokoStaleThresholds.from_env()
@@ -250,7 +251,7 @@ class TokocryptoPositionMonitor:
         # Parse order age from open_time or created_at
         open_time_str = trade.get("open_time") or trade.get("created_at")
         if not open_time_str:
-            return None
+            return None, None
 
         try:
             open_dt = datetime.fromisoformat(str(open_time_str).replace("Z", "+00:00"))
@@ -258,36 +259,36 @@ class TokocryptoPositionMonitor:
                 open_dt = open_dt.replace(tzinfo=timezone.utc)
             age_days = (datetime.now(timezone.utc) - open_dt).total_seconds() / 86400.0
             if age_days < 0 or math.isnan(age_days) or math.isinf(age_days):
-                return None
+                return None, None
         except Exception:
-            return None
+            return None, None
 
         # Parse entry price
         try:
             entry_price = float(trade.get("entry_price") or detail.get("price") or 0.0)
             if entry_price <= 0 or math.isnan(entry_price) or math.isinf(entry_price):
-                return None
+                return None, None
         except (ValueError, TypeError):
-            return None
+            return None, None
 
         # Fetch current ticker
         try:
             cur_price = float(self.client.get_ticker(sym))
             if cur_price <= 0 or math.isnan(cur_price) or math.isinf(cur_price):
-                return None
+                return None, None
             dist_pct = ((cur_price - entry_price) / entry_price) * 100.0
             if math.isnan(dist_pct) or math.isinf(dist_pct):
-                return None
+                return None, None
         except Exception as exc:
             if verbose:
                 print(f"  [{sym}] stale check: get_ticker failed: {exc}", flush=True)
-            return None
+            return None, None
 
         # Evaluate tiered classification
         stale_state = classify_tokocrypto_stale_entry(age_days, dist_pct, thr)
 
         if stale_state == TokoStaleState.NORMAL:
-            return None
+            return None, None
 
         if stale_state == TokoStaleState.OLD_DISTANCE_INSUFFICIENT:
             if verbose:
@@ -296,7 +297,7 @@ class TokocryptoPositionMonitor:
                     f"but price near entry (dist={dist_pct:+.1f}% < {thr.review_pct:.1f}%). Setup retained.",
                     flush=True,
                 )
-            return None
+            return None, None
 
         if stale_state == TokoStaleState.REVIEW_REQUIRED:
             if verbose:
@@ -305,7 +306,7 @@ class TokocryptoPositionMonitor:
                     f"dist={dist_pct:+.1f}% in [{thr.review_pct:.1f}%, {thr.serious_pct:.1f}%). Setup flagged for review.",
                     flush=True,
                 )
-            return None
+            return None, None
 
         if stale_state == TokoStaleState.STALE_SERIOUS:
             # High priority log because Tokocrypto slots are limited to 5
@@ -314,41 +315,48 @@ class TokocryptoPositionMonitor:
                 f"dist={dist_pct:+.1f}% in [{thr.serious_pct:.1f}%, {thr.cancel_pct:.1f}%).",
                 flush=True,
             )
-            return None
+            return None, None
 
-        # CANCEL_CANDIDATE: age >= min_age_days and dist >= cancel_pct (30%)
+        # CANCEL_CANDIDATE: age >= min_age_days and dist >= cancel_pct (default 20.0%)
+        # Primary objective: free up the limited 5 Tokocrypto slots when price has runaway.
+        verdict = self._validate_stale_setup(trade)
+        chart_reason = verdict.get("reason", "unknown")
+        zone_valid = verdict.get("zone_valid")
         print(
-            f"  [{sym}] ⚠️ [STALE CANCEL CANDIDATE] Candidate for cancellation: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
-            f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}%. Validating setup...",
+            f"  [{sym}] ⚠️ [STALE CANCEL CANDIDATE] Stale cleanup eligible: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+            f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}% (chart: {chart_reason}, zone_valid={zone_valid}).",
             flush=True,
         )
 
-        verdict = self._validate_stale_setup(trade)
-        zone_valid = verdict.get("zone_valid")
-        if zone_valid is not False:
-            reason = verdict.get("reason", "unknown")
-            if verbose:
-                print(
-                    f"  [{sym}] ℹ [STALE SETUP] Setup not invalidated (zone_valid={zone_valid!r}, reason={reason}); retaining slot.",
-                    flush=True,
-                )
-            return None
-
-        # Setup confirmed broken on chart (zone_valid=False)
-        print(f"  [{sym}] ⚠️ [STALE SETUP] Setup confirmed broken on chart (zone_valid=False).", flush=True)
+        stale_meta = {
+            "reason": "STALE_ENTRY_CANCELED",
+            "stale_policy": {
+                "min_age_days": thr.min_age_days,
+                "cancel_pct": thr.cancel_pct,
+                "review_pct": thr.review_pct,
+                "serious_pct": thr.serious_pct,
+            },
+            "order_age_days": round(age_days, 2),
+            "price_distance_pct": round(dist_pct, 2),
+            "entry_price": entry_price,
+            "current_price": cur_price,
+            "exchange_order_id": entry_oid,
+            "chart_validation": verdict,
+            "canceled_at": datetime.now(timezone.utc).isoformat(),
+        }
 
         if not auto_cancel:
             if verbose:
                 print(
-                    f"  [{sym}] ℹ [STALE SHADOW] Would cancel: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
-                    f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}%, zone invalid. (auto-cancel disabled)",
+                    f"  [{sym}] ℹ [STALE SHADOW] Would cleanup stale entry: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+                    f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}%. (auto-cancel disabled)",
                     flush=True,
                 )
-            return None
+            return None, None
 
         # Auto-cancel enabled — execute cancel
         print(
-            f"  [{sym}] ⚠️ Stale entry validated broken. Initiating cancel...",
+            f"  [{sym}] ⚠️ Initiating stale entry cancel on exchange...",
             flush=True,
         )
         try:
@@ -364,13 +372,13 @@ class TokocryptoPositionMonitor:
                     f"  [{sym}] ✗ post-cancel detail not a dict: {post_detail!r}; retaining slot.",
                     flush=True,
                 )
-                return None
+                return None, None
             if "status" not in post_detail or post_detail.get("status") is None:
                 print(
                     f"  [{sym}] ✗ post-cancel detail missing status: {post_detail!r}; retaining slot.",
                     flush=True,
                 )
-                return None
+                return None, None
             try:
                 _ = int(post_detail["status"])
             except (ValueError, TypeError):
@@ -378,7 +386,7 @@ class TokocryptoPositionMonitor:
                     f"  [{sym}] ✗ post-cancel detail invalid status format: {post_detail!r}; retaining slot.",
                     flush=True,
                 )
-                return None
+                return None, None
 
             # Verify executedQty is present, parseable as finite, non-negative float
             if "executedQty" not in post_detail or post_detail.get("executedQty") is None:
@@ -386,7 +394,7 @@ class TokocryptoPositionMonitor:
                     f"  [{sym}] ✗ post-cancel detail missing executedQty: {post_detail!r}; retaining slot.",
                     flush=True,
                 )
-                return None
+                return None, None
             try:
                 parsed_exec = float(post_detail["executedQty"])
                 if math.isnan(parsed_exec) or math.isinf(parsed_exec) or parsed_exec < 0:
@@ -394,18 +402,18 @@ class TokocryptoPositionMonitor:
                         f"  [{sym}] ✗ post-cancel detail invalid executedQty ({parsed_exec!r}); retaining slot.",
                         flush=True,
                     )
-                    return None
+                    return None, None
             except (ValueError, TypeError):
                 print(
                     f"  [{sym}] ✗ post-cancel detail unparseable executedQty ({post_detail.get('executedQty')!r}); retaining slot.",
                     flush=True,
                 )
-                return None
+                return None, None
 
-            return post_detail
+            return post_detail, stale_meta
         except Exception as exc:
             print(f"  [{sym}] ✗ post-cancel verification failed: {exc}; retaining slot.", flush=True)
-            return None
+            return None, None
 
     def _check_one(self, trade: dict, verbose: bool) -> None:
         with lifecycle_lock(str(trade.get("symbol", "?"))):
@@ -550,12 +558,14 @@ class TokocryptoPositionMonitor:
                 import time as _time
 
             is_stale_cancel = False
+            stale_meta = None
             if d_status == 0 and exec_qty == 0:
-                post_detail = self._evaluate_and_cancel_stale_entry(
+                post_detail, maybe_stale_meta = self._evaluate_and_cancel_stale_entry(
                     trade, detail, sym, entry_oid, verbose
                 )
                 if post_detail is not None:
                     detail = post_detail
+                    stale_meta = maybe_stale_meta
                     try:
                         d_status = int(detail.get("status", -99))
                     except (ValueError, TypeError):
@@ -623,11 +633,18 @@ class TokocryptoPositionMonitor:
                 # Terminal unfilled: CANCELED (3), REJECTED (5), EXPIRED (6)
                 status_names = {3: "CANCELED", 5: "REJECTED", 6: "EXPIRED"}
                 terminal_name = status_names.get(d_status, "CANCELED")
-                exit_reason = (
-                    "STALE_SETUP_TIMEOUT_CANCELED"
-                    if is_stale_cancel
-                    else f"ENTRY_{terminal_name}"
-                )
+                if is_stale_cancel and stale_meta:
+                    exit_reason = (
+                        f"STALE_ENTRY_CANCELED (age={stale_meta.get('order_age_days')}d, "
+                        f"dist={stale_meta.get('price_distance_pct'):+}%)"
+                    )
+                    raw_exit_detail = {
+                        **(trade.get("raw_exit_detail") or {}),
+                        **stale_meta,
+                    }
+                else:
+                    exit_reason = f"ENTRY_{terminal_name}"
+                    raw_exit_detail = detail
 
                 update_tokocrypto_by_order_id(
                     entry_oid,
@@ -635,13 +652,14 @@ class TokocryptoPositionMonitor:
                         "entry_status": terminal_name,
                         "exit_status": terminal_name,
                         "exit_reason": exit_reason,
+                        "raw_exit_detail": raw_exit_detail,
                         "updated_at": now_iso,
                     },
                 )
                 release_entry_submission(sym)
 
                 _send_toko_telegram(
-                    f"ℹ️ Entry {terminal_name}: {sym}  orderId={entry_oid}  (0 fill, slot released)"
+                    f"ℹ️ Entry {terminal_name}: {sym}  orderId={entry_oid}  (0 fill, slot released, reason={exit_reason})"
                 )
                 if verbose:
                     print(

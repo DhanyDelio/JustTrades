@@ -30,11 +30,12 @@ from core.guards.tokocrypto_stale_entry_guard import (
 
 class TestTokocryptoStaleEntryGuard(unittest.TestCase):
     def setUp(self):
+        # Default policy: cancel_pct=20.0 for Tokocrypto 5-slot capacity
         self.default_thr = TokoStaleThresholds(
             min_age_days=3.0,
             review_pct=15.0,
             serious_pct=20.0,
-            cancel_pct=30.0,
+            cancel_pct=20.0,
         )
 
     # -------------------------------------------------------------------------
@@ -61,27 +62,44 @@ class TestTokocryptoStaleEntryGuard(unittest.TestCase):
             TokoStaleState.REVIEW_REQUIRED,
         )
 
-        # Exactly 20.0% -> STALE_SERIOUS
+        # Exactly 20.0% -> CANCEL_CANDIDATE (default 20.0% threshold)
         self.assertEqual(
             classify_tokocrypto_stale_entry(age, 20.0, self.default_thr),
-            TokoStaleState.STALE_SERIOUS,
-        )
-
-        # Just below 30.0% -> STALE_SERIOUS
-        self.assertEqual(
-            classify_tokocrypto_stale_entry(age, 29.999, self.default_thr),
-            TokoStaleState.STALE_SERIOUS,
-        )
-
-        # Exactly 30.0% -> CANCEL_CANDIDATE
-        self.assertEqual(
-            classify_tokocrypto_stale_entry(age, 30.0, self.default_thr),
             TokoStaleState.CANCEL_CANDIDATE,
         )
 
-        # Well above 30.0% -> CANCEL_CANDIDATE
+        # Well above 20.0% -> CANCEL_CANDIDATE
+        self.assertEqual(
+            classify_tokocrypto_stale_entry(age, 25.0, self.default_thr),
+            TokoStaleState.CANCEL_CANDIDATE,
+        )
         self.assertEqual(
             classify_tokocrypto_stale_entry(age, 45.0, self.default_thr),
+            TokoStaleState.CANCEL_CANDIDATE,
+        )
+
+    def test_distance_boundaries_with_loose_30pct_override(self):
+        """When cancel_pct is explicitly configured to 30%, STALE_SERIOUS tier activates."""
+        loose_thr = TokoStaleThresholds(
+            min_age_days=3.0,
+            review_pct=15.0,
+            serious_pct=20.0,
+            cancel_pct=30.0,
+        )
+        age = 3.0
+        # Exactly 20.0% -> STALE_SERIOUS under 30% cancel threshold
+        self.assertEqual(
+            classify_tokocrypto_stale_entry(age, 20.0, loose_thr),
+            TokoStaleState.STALE_SERIOUS,
+        )
+        # Just below 30.0% -> STALE_SERIOUS
+        self.assertEqual(
+            classify_tokocrypto_stale_entry(age, 29.999, loose_thr),
+            TokoStaleState.STALE_SERIOUS,
+        )
+        # Exactly 30.0% -> CANCEL_CANDIDATE
+        self.assertEqual(
+            classify_tokocrypto_stale_entry(age, 30.0, loose_thr),
             TokoStaleState.CANCEL_CANDIDATE,
         )
 
@@ -89,10 +107,10 @@ class TestTokocryptoStaleEntryGuard(unittest.TestCase):
     # 2. Age Boundaries Tests (< 3.0 days vs >= 3.0 days)
     # -------------------------------------------------------------------------
     def test_age_boundaries_under_min_age(self):
-        # Order younger than 3.0 days is always NORMAL regardless of distance
-        young_age = 2.99
+        # Order younger than 3.0 days (e.g. 2.999 days) is always NORMAL regardless of distance
+        young_age = 2.999
 
-        for dist in [5.0, 15.0, 20.0, 30.0, 50.0]:
+        for dist in [5.0, 15.0, 19.999, 20.0, 30.0, 50.0]:
             with self.subTest(dist=dist):
                 self.assertEqual(
                     classify_tokocrypto_stale_entry(young_age, dist, self.default_thr),
@@ -110,11 +128,11 @@ class TestTokocryptoStaleEntryGuard(unittest.TestCase):
             TokoStaleState.REVIEW_REQUIRED,
         )
         self.assertEqual(
-            classify_tokocrypto_stale_entry(3.0, 25.0, self.default_thr),
-            TokoStaleState.STALE_SERIOUS,
+            classify_tokocrypto_stale_entry(3.0, 20.0, self.default_thr),
+            TokoStaleState.CANCEL_CANDIDATE,
         )
         self.assertEqual(
-            classify_tokocrypto_stale_entry(3.0, 35.0, self.default_thr),
+            classify_tokocrypto_stale_entry(3.0, 25.0, self.default_thr),
             TokoStaleState.CANCEL_CANDIDATE,
         )
 
@@ -123,9 +141,9 @@ class TestTokocryptoStaleEntryGuard(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_five_audit_fixture_classifications(self):
         fixtures = [
-            # symbol, age_days, dist_pct, expected_state
-            ("ETH_IDR", 6.9, 25.03, TokoStaleState.STALE_SERIOUS),
-            ("XRP_IDR", 6.9, 21.52, TokoStaleState.STALE_SERIOUS),
+            # symbol, age_days, dist_pct, expected_state (under default 20% cancel threshold)
+            ("ETH_IDR", 6.9, 25.03, TokoStaleState.CANCEL_CANDIDATE),
+            ("XRP_IDR", 6.9, 21.52, TokoStaleState.CANCEL_CANDIDATE),
             ("FLOKI_IDR", 6.5, 15.79, TokoStaleState.REVIEW_REQUIRED),
             ("ASTER_IDR", 9.1, 6.80, TokoStaleState.OLD_DISTANCE_INSUFFICIENT),
             ("HBAR_IDR", 6.9, 4.65, TokoStaleState.OLD_DISTANCE_INSUFFICIENT),
@@ -167,7 +185,7 @@ class TestTokocryptoStaleEntryGuard(unittest.TestCase):
             self.assertEqual(thr.min_age_days, 3.0)
             self.assertEqual(thr.review_pct, 15.0)
             self.assertEqual(thr.serious_pct, 20.0)
-            self.assertEqual(thr.cancel_pct, 30.0)
+            self.assertEqual(thr.cancel_pct, 20.0)
 
     def test_thresholds_from_env_custom_overrides(self):
         env = {
