@@ -20,6 +20,8 @@ Safety invariants:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
+import os
 import time
 
 from core.clients.tokocrypto_client import TokocryptoClient, TokocryptoError
@@ -177,9 +179,140 @@ class TokocryptoPositionMonitor:
             if verbose:
                 print(f"  [Toko Dust] Non-fatal check error: {exc}", flush=True)
 
-    # ------------------------------------------------------------------
-    # Internal: single trade check
-    # ------------------------------------------------------------------
+    def _evaluate_and_cancel_stale_entry(
+        self, trade: dict, detail: dict, sym: str, entry_oid: str, verbose: bool
+    ) -> dict | None:
+        """
+        Evaluate if an unfilled limit buy (status=0) is stale.
+        If stale and TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=1, attempts cancel and re-queries detail.
+        Returns the re-queried detail dict if cancel was executed and post-cancel verified; None otherwise.
+        Fail-closed: On any parsing, network, or verification error, returns None without mutating state.
+        """
+        auto_cancel = os.environ.get("TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED", "0") == "1"
+        try:
+            min_days = float(os.environ.get("TOKO_STALE_ENTRY_MIN_DAYS", "3.0"))
+            if math.isnan(min_days) or math.isinf(min_days) or min_days <= 0:
+                min_days = 3.0
+        except (ValueError, TypeError):
+            min_days = 3.0
+        try:
+            min_dist_pct = float(os.environ.get("TOKO_STALE_ENTRY_MIN_DISTANCE_PCT", "15.0"))
+            if math.isnan(min_dist_pct) or math.isinf(min_dist_pct):
+                min_dist_pct = 15.0
+        except (ValueError, TypeError):
+            min_dist_pct = 15.0
+
+        # Parse order age from open_time or created_at
+        open_time_str = trade.get("open_time") or trade.get("created_at")
+        if not open_time_str:
+            return None
+
+        try:
+            open_dt = datetime.fromisoformat(str(open_time_str).replace("Z", "+00:00"))
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - open_dt).total_seconds() / 86400.0
+            if age_days < 0 or math.isnan(age_days) or math.isinf(age_days):
+                return None
+        except Exception:
+            return None
+
+        # Parse entry price
+        try:
+            entry_price = float(trade.get("entry_price") or detail.get("price") or 0.0)
+            if entry_price <= 0 or math.isnan(entry_price) or math.isinf(entry_price):
+                return None
+        except (ValueError, TypeError):
+            return None
+
+        # Fetch current ticker
+        try:
+            cur_price = float(self.client.get_ticker(sym))
+            if cur_price <= 0 or math.isnan(cur_price) or math.isinf(cur_price):
+                return None
+            dist_pct = ((cur_price - entry_price) / entry_price) * 100.0
+            if math.isnan(dist_pct) or math.isinf(dist_pct):
+                return None
+        except Exception as exc:
+            if verbose:
+                print(f"  [{sym}] stale check: get_ticker failed: {exc}", flush=True)
+            return None
+
+        # Evaluate conjunctive criteria
+        if age_days < min_days or dist_pct < min_dist_pct:
+            return None
+
+        # Stale criteria met!
+        if not auto_cancel:
+            if verbose:
+                print(
+                    f"  [{sym}] ℹ [STALE SHADOW] Would cancel: age={age_days:.1f}d >= {min_days}d, "
+                    f"dist={dist_pct:+.1f}% >= {min_dist_pct}%. (auto-cancel disabled)",
+                    flush=True,
+                )
+            return None
+
+        # Auto-cancel enabled — execute cancel
+        print(
+            f"  [{sym}] ⚠️ Stale entry detected (age={age_days:.1f}d >= {min_days}d, "
+            f"dist={dist_pct:+.1f}% >= {min_dist_pct}%). Initiating cancel...",
+            flush=True,
+        )
+        try:
+            self.executor.cancel_order(sym, entry_oid)
+        except Exception as exc:
+            print(f"  [{sym}] ✗ cancel_order failed with exception: {exc}", flush=True)
+
+        # Mandatory post-cancel verification from exchange
+        try:
+            post_detail = self.client.get_order_detail(sym, entry_oid)
+            if not isinstance(post_detail, dict):
+                print(
+                    f"  [{sym}] ✗ post-cancel detail not a dict: {post_detail!r}; retaining slot.",
+                    flush=True,
+                )
+                return None
+            if "status" not in post_detail or post_detail.get("status") is None:
+                print(
+                    f"  [{sym}] ✗ post-cancel detail missing status: {post_detail!r}; retaining slot.",
+                    flush=True,
+                )
+                return None
+            try:
+                _ = int(post_detail["status"])
+            except (ValueError, TypeError):
+                print(
+                    f"  [{sym}] ✗ post-cancel detail invalid status format: {post_detail!r}; retaining slot.",
+                    flush=True,
+                )
+                return None
+
+            # Verify executedQty is present, parseable as finite, non-negative float
+            if "executedQty" not in post_detail or post_detail.get("executedQty") is None:
+                print(
+                    f"  [{sym}] ✗ post-cancel detail missing executedQty: {post_detail!r}; retaining slot.",
+                    flush=True,
+                )
+                return None
+            try:
+                parsed_exec = float(post_detail["executedQty"])
+                if math.isnan(parsed_exec) or math.isinf(parsed_exec) or parsed_exec < 0:
+                    print(
+                        f"  [{sym}] ✗ post-cancel detail invalid executedQty ({parsed_exec!r}); retaining slot.",
+                        flush=True,
+                    )
+                    return None
+            except (ValueError, TypeError):
+                print(
+                    f"  [{sym}] ✗ post-cancel detail unparseable executedQty ({post_detail.get('executedQty')!r}); retaining slot.",
+                    flush=True,
+                )
+                return None
+
+            return post_detail
+        except Exception as exc:
+            print(f"  [{sym}] ✗ post-cancel verification failed: {exc}; retaining slot.", flush=True)
+            return None
 
     def _check_one(self, trade: dict, verbose: bool) -> None:
         with lifecycle_lock(str(trade.get("symbol", "?"))):
@@ -305,7 +438,16 @@ class TokocryptoPositionMonitor:
                 return
 
             d_status = int(detail.get("status", -99))
-            exec_qty = float(detail.get("executedQty") or 0)
+            try:
+                raw_exec = detail.get("executedQty")
+                if raw_exec is None:
+                    exec_qty = -1.0
+                else:
+                    exec_qty = float(raw_exec)
+                    if math.isnan(exec_qty) or math.isinf(exec_qty) or exec_qty < 0:
+                        exec_qty = -1.0
+            except (ValueError, TypeError):
+                exec_qty = -1.0
             fill_price = float(detail.get("executedPrice") or detail.get("price") or 0)
             now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -314,7 +456,37 @@ class TokocryptoPositionMonitor:
             if fill_time_ms == 0:
                 import time as _time
 
-                fill_time_ms = int(_time.time() * 1000)
+            is_stale_cancel = False
+            if d_status == 0 and exec_qty == 0:
+                post_detail = self._evaluate_and_cancel_stale_entry(
+                    trade, detail, sym, entry_oid, verbose
+                )
+                if post_detail is not None:
+                    detail = post_detail
+                    try:
+                        d_status = int(detail.get("status", -99))
+                    except (ValueError, TypeError):
+                        d_status = -99
+                    try:
+                        raw_post_exec = detail.get("executedQty")
+                        if raw_post_exec is None:
+                            exec_qty = -1.0
+                        else:
+                            exec_qty = float(raw_post_exec)
+                            if math.isnan(exec_qty) or math.isinf(exec_qty) or exec_qty < 0:
+                                exec_qty = -1.0
+                    except (ValueError, TypeError):
+                        exec_qty = -1.0
+                    try:
+                        fill_price = float(
+                            detail.get("executedPrice") or detail.get("price") or fill_price
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                    fill_time_ms = int(
+                        detail.get("createTime") or detail.get("time") or fill_time_ms
+                    )
+                    is_stale_cancel = True
 
             if d_status == 2:  # FILLED
                 fill_qty = (
@@ -358,13 +530,18 @@ class TokocryptoPositionMonitor:
                 # Terminal unfilled: CANCELED (3), REJECTED (5), EXPIRED (6)
                 status_names = {3: "CANCELED", 5: "REJECTED", 6: "EXPIRED"}
                 terminal_name = status_names.get(d_status, "CANCELED")
+                exit_reason = (
+                    "STALE_SETUP_TIMEOUT_CANCELED"
+                    if is_stale_cancel
+                    else f"ENTRY_{terminal_name}"
+                )
 
                 update_tokocrypto_by_order_id(
                     entry_oid,
                     {
                         "entry_status": terminal_name,
                         "exit_status": terminal_name,
-                        "exit_reason": f"ENTRY_{terminal_name}",
+                        "exit_reason": exit_reason,
                         "updated_at": now_iso,
                     },
                 )
@@ -379,10 +556,10 @@ class TokocryptoPositionMonitor:
                     )
                 return
 
-            elif d_status in (1, 3, 6) and exec_qty > 0:
+            elif d_status in (1, 3, 5, 6) and exec_qty > 0:
                 # Partially filled terminal or active partial fill:
                 # Reconcile actual fills first — do NOT treat as zero-fill cancellation!
-                is_terminal = d_status in (3, 6)
+                is_terminal = d_status in (3, 5, 6)
                 new_entry_status = "PARTIALLY_FILLED" if not is_terminal else "FILLED"
 
                 update_tokocrypto_by_order_id(
