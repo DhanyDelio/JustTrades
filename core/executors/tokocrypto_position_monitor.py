@@ -25,6 +25,11 @@ import os
 import time
 
 from core.clients.tokocrypto_client import TokocryptoClient, TokocryptoError
+from core.guards.tokocrypto_stale_entry_guard import (
+    TokoStaleState,
+    TokoStaleThresholds,
+    classify_tokocrypto_stale_entry,
+)
 from core.clients.tokocrypto_order_executor import (
     TokocryptoOrderExecutor,
     claim_oco_submission,
@@ -179,28 +184,68 @@ class TokocryptoPositionMonitor:
             if verbose:
                 print(f"  [Toko Dust] Non-fatal check error: {exc}", flush=True)
 
+    def _validate_stale_setup(self, trade: dict) -> dict:
+        """
+        Validate whether the original entry zone is still structurally intact.
+        Uses chart_analyzer on the corresponding Binance USDT pair if available.
+        Fails closed: Any error, unavailable chart data, or unparseable zone yields
+        zone_valid='unknown', which NEVER permits cancellation.
+        """
+        sym = str(trade.get("symbol", ""))
+        try:
+            from core.scanners.tokocrypto_candidate_scanner import _to_binance_symbol
+            import services.chart_analyzer as ca
+
+            binance_sym = _to_binance_symbol(sym)
+            result = ca.analyze_symbol(binance_sym, save_chart=False)
+            if not result:
+                return {"zone_valid": "unknown", "reason": "ANALYSIS_UNAVAILABLE"}
+
+            entry_idr = float(trade.get("entry_price") or 0.0)
+            if entry_idr <= 0 or math.isnan(entry_idr) or math.isinf(entry_idr):
+                return {"zone_valid": "unknown", "reason": "INVALID_ENTRY_PRICE"}
+
+            try:
+                usdt_idr = float(self.client.get_ticker("USDT_IDR"))
+                if usdt_idr <= 0 or math.isnan(usdt_idr) or math.isinf(usdt_idr):
+                    return {"zone_valid": "unknown", "reason": "INVALID_USDT_RATE"}
+            except Exception as exc:
+                return {"zone_valid": "unknown", "reason": f"USDT_RATE_FETCH_FAILED: {exc}"}
+
+            entry_usd = entry_idr / usdt_idr
+            for zone in result.get("support_zones", []):
+                try:
+                    low, high = float(zone.get("low", 0)), float(zone.get("high", 0))
+                    if low <= entry_usd <= high * 1.003:
+                        return {
+                            "zone_valid": True,
+                            "reason": "SUPPORT_ZONE_RETAINED",
+                            "zone": {"low": low, "high": high},
+                        }
+                except (ValueError, TypeError):
+                    continue
+            return {"zone_valid": False, "reason": "ENTRY_ZONE_NOT_RETAINED"}
+        except Exception as exc:
+            return {"zone_valid": "unknown", "reason": f"ANALYSIS_ERROR: {exc}"}
+
     def _evaluate_and_cancel_stale_entry(
         self, trade: dict, detail: dict, sym: str, entry_oid: str, verbose: bool
     ) -> dict | None:
         """
-        Evaluate if an unfilled limit buy (status=0) is stale.
-        If stale and TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=1, attempts cancel and re-queries detail.
+        Evaluate if an unfilled limit buy (status=0) is stale using the agreed 4-tier policy:
+        1. NORMAL: (< 3d or < 15%) -> No action.
+        2. OLD_DISTANCE_INSUFFICIENT: (>= 3d, < 15%) -> Aged, kept for observation, setup valid.
+        3. REVIEW_REQUIRED: (>= 3d, 15% <= dist < 20%) -> Flagged for review.
+        4. STALE_SERIOUS: (>= 3d, 20% <= dist < 30%) -> Priority review due to limited 5 slots.
+        5. CANCEL_CANDIDATE: (>= 3d, dist >= 30%) -> Setup validation mandatory before cancel.
+
+        If CANCEL_CANDIDATE, validated broken (zone_valid=False), and TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED=1,
+        attempts cancel and re-queries detail.
         Returns the re-queried detail dict if cancel was executed and post-cancel verified; None otherwise.
-        Fail-closed: On any parsing, network, or verification error, returns None without mutating state.
+        Fail-closed: On any parsing, network, validation, or verification error, returns None without mutating state.
         """
         auto_cancel = os.environ.get("TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED", "0") == "1"
-        try:
-            min_days = float(os.environ.get("TOKO_STALE_ENTRY_MIN_DAYS", "3.0"))
-            if math.isnan(min_days) or math.isinf(min_days) or min_days <= 0:
-                min_days = 3.0
-        except (ValueError, TypeError):
-            min_days = 3.0
-        try:
-            min_dist_pct = float(os.environ.get("TOKO_STALE_ENTRY_MIN_DISTANCE_PCT", "15.0"))
-            if math.isnan(min_dist_pct) or math.isinf(min_dist_pct):
-                min_dist_pct = 15.0
-        except (ValueError, TypeError):
-            min_dist_pct = 15.0
+        thr = TokoStaleThresholds.from_env()
 
         # Parse order age from open_time or created_at
         open_time_str = trade.get("open_time") or trade.get("created_at")
@@ -238,24 +283,72 @@ class TokocryptoPositionMonitor:
                 print(f"  [{sym}] stale check: get_ticker failed: {exc}", flush=True)
             return None
 
-        # Evaluate conjunctive criteria
-        if age_days < min_days or dist_pct < min_dist_pct:
+        # Evaluate tiered classification
+        stale_state = classify_tokocrypto_stale_entry(age_days, dist_pct, thr)
+
+        if stale_state == TokoStaleState.NORMAL:
             return None
 
-        # Stale criteria met!
+        if stale_state == TokoStaleState.OLD_DISTANCE_INSUFFICIENT:
+            if verbose:
+                print(
+                    f"  [{sym}] ℹ [STALE OBSERVE] Order is old (age={age_days:.1f}d >= {thr.min_age_days:.1f}d) "
+                    f"but price near entry (dist={dist_pct:+.1f}% < {thr.review_pct:.1f}%). Setup retained.",
+                    flush=True,
+                )
+            return None
+
+        if stale_state == TokoStaleState.REVIEW_REQUIRED:
+            if verbose:
+                print(
+                    f"  [{sym}] ℹ [STALE REVIEW] Review required: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+                    f"dist={dist_pct:+.1f}% in [{thr.review_pct:.1f}%, {thr.serious_pct:.1f}%). Setup flagged for review.",
+                    flush=True,
+                )
+            return None
+
+        if stale_state == TokoStaleState.STALE_SERIOUS:
+            # High priority log because Tokocrypto slots are limited to 5
+            print(
+                f"  [{sym}] ⚠️ [STALE SERIOUS] Priority review (limited slots): age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+                f"dist={dist_pct:+.1f}% in [{thr.serious_pct:.1f}%, {thr.cancel_pct:.1f}%).",
+                flush=True,
+            )
+            return None
+
+        # CANCEL_CANDIDATE: age >= min_age_days and dist >= cancel_pct (30%)
+        print(
+            f"  [{sym}] ⚠️ [STALE CANCEL CANDIDATE] Candidate for cancellation: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+            f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}%. Validating setup...",
+            flush=True,
+        )
+
+        verdict = self._validate_stale_setup(trade)
+        zone_valid = verdict.get("zone_valid")
+        if zone_valid is not False:
+            reason = verdict.get("reason", "unknown")
+            if verbose:
+                print(
+                    f"  [{sym}] ℹ [STALE SETUP] Setup not invalidated (zone_valid={zone_valid!r}, reason={reason}); retaining slot.",
+                    flush=True,
+                )
+            return None
+
+        # Setup confirmed broken on chart (zone_valid=False)
+        print(f"  [{sym}] ⚠️ [STALE SETUP] Setup confirmed broken on chart (zone_valid=False).", flush=True)
+
         if not auto_cancel:
             if verbose:
                 print(
-                    f"  [{sym}] ℹ [STALE SHADOW] Would cancel: age={age_days:.1f}d >= {min_days}d, "
-                    f"dist={dist_pct:+.1f}% >= {min_dist_pct}%. (auto-cancel disabled)",
+                    f"  [{sym}] ℹ [STALE SHADOW] Would cancel: age={age_days:.1f}d >= {thr.min_age_days:.1f}d, "
+                    f"dist={dist_pct:+.1f}% >= {thr.cancel_pct:.1f}%, zone invalid. (auto-cancel disabled)",
                     flush=True,
                 )
             return None
 
         # Auto-cancel enabled — execute cancel
         print(
-            f"  [{sym}] ⚠️ Stale entry detected (age={age_days:.1f}d >= {min_days}d, "
-            f"dist={dist_pct:+.1f}% >= {min_dist_pct}%). Initiating cancel...",
+            f"  [{sym}] ⚠️ Stale entry validated broken. Initiating cancel...",
             flush=True,
         )
         try:

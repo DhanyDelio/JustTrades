@@ -175,7 +175,49 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
                     mock_update.assert_not_called()
 
     # -------------------------------------------------------------------------
-    # 3. Cancel zero-fill yang terverifikasi
+    # 2b. Evaluasi 5 fixture audit melalui monitor
+    # -------------------------------------------------------------------------
+    @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
+    @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
+    def test_02b_five_audit_fixtures_monitor_evaluation(self, mock_tg, mock_update):
+        """All 5 audit fixtures are safely evaluated by the monitor without unauthorized cancellations."""
+        now = datetime.now(timezone.utc)
+        fixtures = [
+            ("ETH_IDR", "919115896", 35112537.0, 43900000.0, 6.9),  # +25.03% -> STALE_SERIOUS
+            ("XRP_IDR", "919131151", 19968.0, 24265.0, 6.9),        # +21.52% -> STALE_SERIOUS
+            ("FLOKI_IDR", "919264800", 0.38, 0.44, 6.5),             # +15.79% -> REVIEW_REQUIRED
+            ("ASTER_IDR", "918525394", 12033.0, 12851.0, 9.1),       # +6.80% -> OLD_DISTANCE_INSUFFICIENT
+            ("HBAR_IDR", "919115908", 1435.1, 1501.9, 6.9),         # +4.65% -> OLD_DISTANCE_INSUFFICIENT
+        ]
+
+        # Even with auto_cancel=1, none of these 5 fixtures are CANCEL_CANDIDATE (none are >= 30%)
+        env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
+        for sym, oid, entry_p, cur_p, age_d in fixtures:
+            mock_update.reset_mock()
+            trade = {
+                "symbol": sym,
+                "entry_order_id": oid,
+                "entry_status": "NEW",
+                "exit_status": "OPEN",
+                "entry_price": entry_p,
+                "open_time": (now - timedelta(days=age_d)).isoformat(),
+            }
+            self.mock_client.get_order_detail.return_value = {
+                "orderId": oid,
+                "status": 0,
+                "executedQty": "0",
+                "price": str(entry_p),
+            }
+            self.mock_client.get_ticker.return_value = cur_p
+
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order") as mock_cancel:
+                    self.monitor._check_one(trade, verbose=True)
+                    mock_cancel.assert_not_called()
+                    mock_update.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # 3. Cancel zero-fill yang terverifikasi (Kandidat >= 30% & zone invalid)
     # -------------------------------------------------------------------------
     @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
     @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
@@ -203,17 +245,17 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid, "status": 0, "executedQty": "0", "price": "40000000"},
             {"orderId": oid, "status": 3, "executedQty": "0", "price": "40000000"},
         ]
-        self.mock_client.get_ticker.return_value = 50000000.0  # +25%
+        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 30% cancel candidate)
 
         env = {
             "TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1",
             "TOKO_STALE_ENTRY_MIN_DAYS": "3.0",
-            "TOKO_STALE_ENTRY_MIN_DISTANCE_PCT": "15.0",
         }
-        with patch.dict("os.environ", env):
-            with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
-                self.monitor._check_one(trade, verbose=True)
-                mock_cancel.assert_called_once_with(sym, oid)
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
+                    self.monitor._check_one(trade, verbose=True)
+                    mock_cancel.assert_called_once_with(sym, oid)
 
         mock_update.assert_called_once()
         called_oid, payload = mock_update.call_args[0]
@@ -224,6 +266,65 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
 
         # Slot must be released in _ACTIVE_ENTRY_SUBMISSIONS
         self.assertNotIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
+
+    # -------------------------------------------------------------------------
+    # 3b. Ambang >= 30% wajib validasi setup sebelum pembatalan
+    # -------------------------------------------------------------------------
+    @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
+    @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
+    def test_03b_cancel_candidate_requires_invalid_setup(self, mock_tg, mock_update):
+        """Threshold >= 30% is only a candidate: requires zone_valid=False to cancel."""
+        from core.clients import tokocrypto_order_executor as order_executor_module
+
+        now = datetime.now(timezone.utc)
+        sym = "ETH_IDR"
+        oid = "3002"
+        mark_entry_submission_active(sym)
+
+        trade = {
+            "symbol": sym,
+            "entry_order_id": oid,
+            "entry_status": "NEW",
+            "exit_status": "OPEN",
+            "entry_price": 40000000.0,
+            "open_time": (now - timedelta(days=5)).isoformat(),
+        }
+        self.mock_client.get_order_detail.return_value = {
+            "orderId": oid,
+            "status": 0,
+            "executedQty": "0",
+            "price": "40000000",
+        }
+        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 30%)
+
+        env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
+
+        # Subcase 1: zone_valid == True (support zone retained) -> NO cancel!
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": True, "reason": "SUPPORT_ZONE_RETAINED"}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order") as mock_cancel:
+                    self.monitor._check_one(trade, verbose=True)
+                    mock_cancel.assert_not_called()
+                    mock_update.assert_not_called()
+                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
+
+        # Subcase 2: zone_valid == "unknown" (chart unavailable or error) -> NO cancel (fail-closed)!
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": "unknown", "reason": "ANALYSIS_UNAVAILABLE"}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order") as mock_cancel:
+                    self.monitor._check_one(trade, verbose=True)
+                    mock_cancel.assert_not_called()
+                    mock_update.assert_not_called()
+                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
+
+        # Subcase 3: zone_valid == False but shadow mode (AUTO_CANCEL=0) -> NO cancel!
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False, "reason": "ENTRY_ZONE_NOT_RETAINED"}):
+            with patch.dict("os.environ", {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "0"}):
+                with patch.object(self.executor, "cancel_order") as mock_cancel:
+                    self.monitor._check_one(trade, verbose=True)
+                    mock_cancel.assert_not_called()
+                    mock_update.assert_not_called()
+                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
 
     # -------------------------------------------------------------------------
     # 4. Cancel raced dengan partial fill atau full fill
@@ -255,15 +356,16 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid, "status": 0, "executedQty": "0", "price": "2.0"},
             {"orderId": oid, "status": 3, "executedQty": "50000", "executedPrice": "2.0"},
         ]
-        self.mock_client.get_ticker.return_value = 2.4  # +20%
+        self.mock_client.get_ticker.return_value = 2.8  # +40% (>= 30% cancel candidate)
 
-        with patch.dict("os.environ", env):
-            with patch.object(self.executor, "cancel_order", return_value=True):
-                with patch.object(self.executor, "place_oco", return_value={"orderListId": 888}) as mock_oco:
-                    self.monitor._check_one(trade_partial, verbose=True)
-                    # place_oco must be called to protect partial fill
-                    mock_oco.assert_called_once()
-                    self.assertEqual(mock_oco.call_args[0][0]["entry_qty"], 50000.0)
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order", return_value=True):
+                    with patch.object(self.executor, "place_oco", return_value={"orderListId": 888}) as mock_oco:
+                        self.monitor._check_one(trade_partial, verbose=True)
+                        # place_oco must be called to protect partial fill
+                        mock_oco.assert_called_once()
+                        self.assertEqual(mock_oco.call_args[0][0]["entry_qty"], 50000.0)
 
         # Slot must NOT be zero-fill released since position is open!
         # First call updates entry_status="FILLED" for partial fill
@@ -288,12 +390,13 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid_full, "status": 0, "executedQty": "0", "price": "2.0"},
             {"orderId": oid_full, "status": 2, "executedQty": "100000", "executedPrice": "2.0"},
         ]
-        with patch.dict("os.environ", env):
-            with patch.object(self.executor, "cancel_order", return_value=True):
-                with patch.object(self.executor, "place_oco", return_value={"orderListId": 889}) as mock_oco:
-                    self.monitor._check_one(trade_full, verbose=True)
-                    mock_oco.assert_called_once()
-                    self.assertEqual(mock_oco.call_args[0][0]["entry_qty"], 100000.0)
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order", return_value=True):
+                    with patch.object(self.executor, "place_oco", return_value={"orderListId": 889}) as mock_oco:
+                        self.monitor._check_one(trade_full, verbose=True)
+                        mock_oco.assert_called_once()
+                        self.assertEqual(mock_oco.call_args[0][0]["entry_qty"], 100000.0)
 
         first_db_call = mock_update.call_args_list[0][0][1]
         self.assertEqual(first_db_call["entry_status"], "FILLED")
@@ -326,12 +429,13 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid, "status": 0, "executedQty": "0", "price": "1000"},
             TokocryptoError("Verification connection timeout"),
         ]
-        self.mock_client.get_ticker.return_value = 1300.0  # +30%
+        self.mock_client.get_ticker.return_value = 1350.0  # +35% (>= 30% cancel candidate)
 
         env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
-        with patch.dict("os.environ", env):
-            with patch.object(self.executor, "cancel_order", side_effect=TokocryptoError("Timeout")):
-                self.monitor._check_one(trade, verbose=True)
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order", side_effect=TokocryptoError("Timeout")):
+                    self.monitor._check_one(trade, verbose=True)
 
         # Fail closed: DB update must NOT be called for terminal cancel
         mock_update.assert_not_called()
@@ -377,9 +481,10 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             ]
             self.mock_client.get_ticker.return_value = 700.0  # +40%
 
-            with patch.dict("os.environ", env):
-                with patch.object(self.executor, "cancel_order", return_value=True):
-                    self.monitor._check_one(trade, verbose=True)
+            with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+                with patch.dict("os.environ", env):
+                    with patch.object(self.executor, "cancel_order", return_value=True):
+                        self.monitor._check_one(trade, verbose=True)
 
             mock_update.assert_not_called()
             self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
@@ -424,9 +529,10 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             ]
             self.mock_client.get_ticker.return_value = 700.0
 
-            with patch.dict("os.environ", env):
-                with patch.object(self.executor, "cancel_order", return_value=True):
-                    self.monitor._check_one(trade, verbose=True)
+            with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+                with patch.dict("os.environ", env):
+                    with patch.object(self.executor, "cancel_order", return_value=True):
+                        self.monitor._check_one(trade, verbose=True)
 
             # Must NEVER update DB as zero-fill cancel and must NEVER release slot!
             mock_update.assert_not_called()
@@ -456,12 +562,13 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             self.mock_client.get_order_detail.side_effect = [initial_payload]
             self.mock_client.get_ticker.return_value = 700.0
 
-            with patch.dict("os.environ", env):
-                with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
-                    self.monitor._check_one(trade, verbose=True)
-                    mock_cancel.assert_not_called()
-                    mock_update.assert_not_called()
-                    self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
+            with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+                with patch.dict("os.environ", env):
+                    with patch.object(self.executor, "cancel_order", return_value=True) as mock_cancel:
+                        self.monitor._check_one(trade, verbose=True)
+                        mock_cancel.assert_not_called()
+                        mock_update.assert_not_called()
+                        self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
 
     # -------------------------------------------------------------------------
     # 7. Update database gagal setelah cancel terkonfirmasi
@@ -489,15 +596,16 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             {"orderId": oid, "status": 0, "executedQty": "0", "price": "40000000"},
             {"orderId": oid, "status": 3, "executedQty": "0", "price": "40000000"},
         ]
-        self.mock_client.get_ticker.return_value = 50000000.0
+        self.mock_client.get_ticker.return_value = 54000000.0  # +35% (>= 30%)
 
         mock_update.side_effect = RuntimeError("Supabase connection dropped (PGRST 500)")
 
         env = {"TOKO_STALE_ENTRY_AUTO_CANCEL_ENABLED": "1"}
-        with patch.dict("os.environ", env):
-            with patch.object(self.executor, "cancel_order", return_value=True):
-                with self.assertRaises(RuntimeError):
-                    self.monitor._check_one(trade, verbose=True)
+        with patch.object(self.monitor, "_validate_stale_setup", return_value={"zone_valid": False}):
+            with patch.dict("os.environ", env):
+                with patch.object(self.executor, "cancel_order", return_value=True):
+                    with self.assertRaises(RuntimeError):
+                        self.monitor._check_one(trade, verbose=True)
 
         # Slot MUST NOT be released when DB update failed
         self.assertIn(sym, order_executor_module._ACTIVE_ENTRY_SUBMISSIONS)
@@ -511,6 +619,7 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
         """Terminal statuses 5 (REJECTED) and 6 (EXPIRED) with executedQty > 0 route to fill/OCO."""
         from core.clients import tokocrypto_order_executor as order_executor_module
 
+        now = datetime.now(timezone.utc)
         for code, expected_name in [(5, "REJECTED"), (6, "EXPIRED")]:
             mock_update.reset_mock()
             sym = f"SOL_IDR_{code}"
@@ -524,10 +633,10 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
                 "exit_status": "OPEN",
                 "entry_price": 2000000.0,
                 "entry_qty": 0.05,
-                "tp_price": 2200000.0,
-                "sl_price": 1900000.0,
+                "open_time": (now - timedelta(days=5)).isoformat(),
+                "tp_price": 2400000.0,
+                "sl_price": 1800000.0,
             }
-            # Order detail has status 5 or 6, but executedQty is 0.02
             self.mock_client.get_order_detail.return_value = {
                 "orderId": oid,
                 "status": code,
@@ -535,7 +644,6 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
                 "executedPrice": "2000000",
                 "time": 1700000000000,
             }
-
             with patch.object(self.executor, "place_oco", return_value={"orderListId": 999}) as mock_oco:
                 self.monitor._check_one(trade, verbose=True)
                 mock_oco.assert_called_once()
@@ -546,6 +654,37 @@ class TestTokocryptoStaleEntryReconciliation(unittest.TestCase):
             self.assertEqual(first_db_payload["entry_status"], "FILLED")
             self.assertEqual(first_db_payload["entry_qty"], 0.02)
             self.assertNotIn("exit_status", first_db_payload)
+
+    # -------------------------------------------------------------------------
+    # 8b. Slot penuh (5/5) tidak memicu cancel paksa atau double submit
+    # -------------------------------------------------------------------------
+    @patch("core.executors.tokocrypto_position_monitor.update_tokocrypto_by_order_id")
+    @patch("core.executors.tokocrypto_position_monitor._send_toko_telegram")
+    def test_08b_full_slots_does_not_force_cancel_or_duplicate(self, mock_tg, mock_update):
+        """Full position slots (5/5 open) never forces order cancellation or triggers duplicate submissions."""
+        now = datetime.now(timezone.utc)
+        sym = "ETH_IDR"
+        oid = "8801"
+        trade = {
+            "symbol": sym,
+            "entry_order_id": oid,
+            "entry_status": "NEW",
+            "exit_status": "OPEN",
+            "entry_price": 40000000.0,
+            "open_time": (now - timedelta(days=5)).isoformat(),
+        }
+        self.mock_client.get_order_detail.return_value = {
+            "orderId": oid,
+            "status": 0,
+            "executedQty": "0",
+            "price": "40000000",
+        }
+        self.mock_client.get_ticker.return_value = 42000000.0  # +5%
+
+        with patch.object(self.executor, "cancel_order") as mock_cancel:
+            self.monitor._check_one(trade, verbose=True)
+            mock_cancel.assert_not_called()
+            mock_update.assert_not_called()
 
     # -------------------------------------------------------------------------
     # 9. Pencegahan cancel berulang dan pelepasan slot ganda
